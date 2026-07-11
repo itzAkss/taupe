@@ -1,0 +1,25 @@
+# Database
+messenger.db
+messenger.db-wal
+messenger.db-shm
+
+# secret
+.jwt_secret
+
+# userdata
+uploads/
+
+# SSL
+cert/
+
+# Dependencies
+node_modules/
+.package-lock.json
+
+# Logs
+*.log
+.env
+
+# os
+.DS_Store
+Thumbs.db
