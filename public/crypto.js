@@ -249,23 +249,39 @@ export async function decryptMsg(payload, peerChatNumber, peerPubB64OrKeys) {
   return '[unable to decrypt — key mismatch or corrupted]';
 }
 
-export async function encryptFile(blob, peerChatNumber, peerPubB64) {
-  const key  = await getSessionKey(peerChatNumber, peerPubB64);
-  const iv   = crypto.getRandomValues(new Uint8Array(12));
-  const buf  = await blob.arrayBuffer();
-  const ct   = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, buf);
-  return {
-    iv:         btoa(String.fromCharCode(...iv)),
-    ciphertext: btoa(String.fromCharCode(...new Uint8Array(ct))),
-  };
+export async function encryptFile(blob, peerChatNumber, peerPubB64OrKeys) {
+  const keys = Array.isArray(peerPubB64OrKeys) ? peerPubB64OrKeys : [{ deviceId: 0, key: peerPubB64OrKeys }];
+  const { deviceId, key } = keys[0];
+  if (!key) throw new Error("No key");
+
+  const sessionKey = await getSessionKey(peerChatNumber + ':' + deviceId, key);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const buf = await blob.arrayBuffer();
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sessionKey, buf);
+
+  const combined = new Uint8Array(iv.length + ct.byteLength);
+  combined.set(iv);
+  combined.set(new Uint8Array(ct), iv.length);
+
+  return new Blob([combined], { type: 'application/octet-stream' });
 }
 
-export async function decryptFile(ivB64, ciphertextB64, mimeType, senderChatNumber, senderPubB64) {
-  const key = await getSessionKey(senderChatNumber, senderPubB64);
-  const iv  = Uint8Array.from(atob(ivB64),         c => c.charCodeAt(0));
-  const ct  = Uint8Array.from(atob(ciphertextB64), c => c.charCodeAt(0));
-  const pt  = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
-  return new Blob([pt], { type: mimeType });
+export async function decryptFile(encryptedBlob, peerChatNumber, peerPubB64OrKeys) {
+  const keys = Array.isArray(peerPubB64OrKeys) ? peerPubB64OrKeys : [{ deviceId: 0, key: peerPubB64OrKeys }];
+  const buf = await encryptedBlob.arrayBuffer();
+  const combined = new Uint8Array(buf);
+  const iv = combined.slice(0, 12);
+  const ct = combined.slice(12);
+
+  for (const { deviceId, key } of keys) {
+    if (!key) continue;
+    try {
+      const sessionKey = await getSessionKey(peerChatNumber + ':' + deviceId, key);
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sessionKey, ct);
+      return new Blob([pt]);
+    } catch {}
+  }
+  throw new Error("Decryption failed");
 }
 
 export function isEncrypted(s) {

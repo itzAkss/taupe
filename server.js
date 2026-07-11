@@ -421,10 +421,12 @@ app.delete('/api/messages/:id', authMiddleware, (req, res) => {
 
 app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
-  const mime = req.file.mimetype;
+  
+  const isEncrypted = req.file.originalname.endsWith('.bin');
+  const mime = (isEncrypted && req.body.originalType) ? req.body.originalType : req.file.mimetype;
   const isImage = mime.startsWith('image/');
 
-  if (isImage && !validateFileMagic(req.file.path, mime)) {
+  if (isImage && !isEncrypted && !validateFileMagic(req.file.path, mime)) {
     try { fs.unlinkSync(req.file.path); } catch {}
     return res.status(400).json({ error: 'Invalid image format' });
   }
@@ -432,8 +434,7 @@ app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) 
   let filePath = req.file.path;
   let fileName = req.file.originalname;
 
-  if (isImage && !isAnimated && sharp) {
-
+  if (isImage && !isAnimated && !isEncrypted && sharp) {
     const outPath = filePath.replace(/\.[^.]+$/, '.webp');
     await sharp(filePath)
       .resize({ width: 2048, height: 2048, fit: 'inside', withoutEnlargement: true })

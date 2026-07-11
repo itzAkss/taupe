@@ -466,7 +466,6 @@ async function openChat(uid) {
 
   const b = $('badge-' + uid); if (b) { hide(b); b.textContent = ''; }
 
-  const c     = S.chats.find(x => x.uid === uid);
   const myId  = S.account.accountId;
   const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
 
@@ -507,7 +506,6 @@ async function openChat(uid) {
   S.hasMoreHistory = true;
   S.isLoadingHistory = false;
   
-  const cont = $('messages-container');
   cont.onscroll = async () => {
     if (!S.hasMoreHistory || S.isLoadingHistory || cont.scrollTop > 50) return;
     
@@ -605,10 +603,8 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
 
     if (isMe) {
 
-      if (msg.file_type === 'image' && msg.file_path) {
-        content = `<img class="msg-img" src="${msg.file_path}" loading="lazy" data-msg-id="${msg.id}">`;
-      } else if (msg.file_type === 'file' && msg.file_path) {
-        content = `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
+      if ((msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path) {
+        content = await buildFileHtml(msg, decryptChatNum, decryptKeys);
       } else if (msg.content) {
         let text = msg._plaintext || msg.content;
         if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
@@ -624,10 +620,8 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       const burnLabel = formatBurnSecs(msg.burn_seconds);
       content = `<button class="msg-spoiler" data-msg-id="${msg.id}" data-chat-uid="${S.activeChatUid}" data-burn-secs="${msg.burn_seconds}">Show (${burnLabel})</button>`;
     }
-  } else if (msg.file_type === 'image' && msg.file_path) {
-    content = `<img class="msg-img" src="${msg.file_path}" loading="lazy" data-msg-id="${msg.id}">`;
-  } else if (msg.file_type === 'file' && msg.file_path) {
-    content = `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
+  } else if ((msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path) {
+    content = await buildFileHtml(msg, decryptChatNum, decryptKeys);
   } else if (msg.content) {
     let text = msg._plaintext || msg.content;
     if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
@@ -641,7 +635,8 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
 
   const time = new Date(msg.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const tick = isMe ? `<span class="read-tick ${msg.is_read ? 'read' : ''}">✓✓</span>` : '';
-  const lockIcon = isEncrypted(msg.content) ? '<span class="e2e-lock" title="E2E encrypted">#</span>' : '';
+  const isEncryptedPayload = isEncrypted(msg.content) || (msg.file_path && msg.file_path.endsWith('.bin'));
+  const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted">#</span>' : '';
 
   inner += `
     <div class="msg-bubble ${isMe ? 'me' : 'them'}" data-msg-id="${msg.id}">${content}</div>
@@ -700,6 +695,35 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   }
   wrap.classList.add('grouped-last');
   wrap.dataset.ts = msg.created_at || Math.floor(Date.now() / 1000);
+}
+
+async function buildFileHtml(msg, decryptChatNum, decryptKeys) {
+  if (!msg.file_path) return '';
+  const isEncryptedFile = msg.file_path.endsWith('.bin');
+
+  if (isEncryptedFile) {
+    if (!decryptKeys) return `<span style="color:var(--warn)">[encrypted file]</span>`;
+    try {
+      const resp = await fetch(msg.file_path, { credentials: 'include' });
+      const encBlob = await resp.blob();
+      const decBlob = await decryptFile(encBlob, decryptChatNum, decryptKeys);
+      const blobUrl = URL.createObjectURL(decBlob);
+      
+      if (msg.file_type === 'image') {
+        return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}" onload="URL.revokeObjectURL(this.src)">`;
+      } else {
+        const dlName = (msg.file_name || 'file').replace('.bin', '');
+        return `<div class="msg-file">[ <a href="${blobUrl}" download="${esc(dlName)}" target="_blank" rel="noreferrer">${esc(dlName)}</a> ]</div>`;
+      }
+    } catch (e) {
+      return `<span style="color:var(--danger)">[decryption failed]</span>`;
+    }
+  }
+  
+  if (msg.file_type === 'image') {
+    return `<img class="msg-img" src="${msg.file_path}" loading="lazy" data-msg-id="${msg.id}">`;
+  }
+  return `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
 }
 
 function markAllRead() { document.querySelectorAll('.read-tick').forEach(t => t.classList.add('read')); }
@@ -813,7 +837,25 @@ $('file-input').onchange = async e => {
   const file = e.target.files[0]; if (!file) return;
   if (file.type.startsWith('video/')) { toast('No video', 'Video files are not supported', 'warn'); return; }
   const rm = toast('Uploading...', file.name, 'info', 0);
-  const fd = new FormData(); fd.append('file', file);
+  let fileToUpload = file;
+  let finalName = file.name;
+
+  const peerChatNum = await getActivePeerChatNum();
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+
+  if (peerPub) {
+    try {
+      fileToUpload = await encryptFile(file, peerChatNum, peerPub);
+      finalName = file.name + '.bin';
+    } catch (e) {
+      console.warn('[E2E] File encryption failed', e);
+      toast('E2E Error', 'File sent unencrypted', 'warn');
+    }
+  }
+
+  const fd = new FormData(); 
+  fd.append('file', fileToUpload, finalName);
+  if (peerPub) fd.append('originalType', file.type);
   const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
   const d = await r.json(); rm();
   if (d.error) { toast('Upload failed', d.error, 'err'); return; }
@@ -997,8 +1039,17 @@ function openCropEditor(file) {
       const VSIZE   = 280;
       canvas.width  = VSIZE;
       canvas.height = VSIZE;
+      
+      const minDim = Math.min(img.width, img.height);
+      const initialScale = VSIZE / minDim;
+      const scaleInput = $('crop-scale');
+      scaleInput.min = initialScale;
+      scaleInput.max = initialScale * 3;
+      scaleInput.step = 0.01;
+      scaleInput.value = initialScale;
+
       _cropState = {
-        img, scale: 1, offsetX: 0, offsetY: 0,
+        img, scale: initialScale, offsetX: 0, offsetY: 0,
         dragging: false, lastX: 0, lastY: 0,
       };
       drawCrop();
