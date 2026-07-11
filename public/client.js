@@ -251,8 +251,12 @@ function connectSocket() {
       scrollBottom();
       if (!isMyMsg) S.socket.emit('msg:read', { chatUid });
     } else {
-      bumpUnread(chatUid);
       const c = S.chats.find(x => x.uid === chatUid);
+      if (c) {
+        c.unread = (c.unread || 0) + 1;
+        const b = $('badge-' + chatUid);
+        if (b) { show(b); b.textContent = c.unread; }
+      }
       let preview2 = msg.content || (msg.file_type === 'image' ? '[image]' : '[file]');
       if (isEncrypted(preview2)) preview2 = '[encrypted]';
       toast(c ? chatLabel(c) : 'New message', preview2, 'msg', 6000, () => openChat(chatUid));
@@ -413,7 +417,7 @@ function renderChatList() {
         </div>
         <div class="chat-item-preview" id="preview-${c.uid}">${esc(preview)}</div>
       </div>
-      <span class="chat-item-badge hidden" id="badge-${c.uid}"></span>
+            <span class="chat-item-badge ${(c.unread || 0) > 0 ? '' : 'hidden'}" id="badge-${c.uid}">${c.unread || 0}</span>
     `;
     div.onclick = () => openChat(c.uid);
     if (c.uid === S.activeChatUid) div.classList.add('active-chat');
@@ -454,6 +458,8 @@ function updateChatPreviewUI(uid, preview) {
 async function openChat(uid) {
   S.activeChatUid = uid;
   hide($('empty-state'));
+  const c = S.chats.find(x => x.uid === uid);
+  if (c) c.unread = 0;
   const cv = $('chat-view');
   cv.classList.remove('hidden'); cv.style.display = 'flex';
   showChatArea();
