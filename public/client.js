@@ -18,6 +18,8 @@ const S = {
   isMobile:   () => window.innerWidth <= 640,
   burnSeconds: null,
   activeBurnTimers: new Map(),
+  isLoadingHistory: false,
+  hasMoreHistory: true,
 };
 
 const $   = id => document.getElementById(id);
@@ -493,8 +495,43 @@ async function openChat(uid) {
   if (Array.isArray(msgs)) {
     for (const m of msgs) await renderMessage(m, peerChatNum, peerPub);
   }
-  scrollBottom();
+    scrollBottom();
   S.socket?.emit('msg:read', { chatUid: uid });
+
+  S.hasMoreHistory = true;
+  S.isLoadingHistory = false;
+  
+  const cont = $('messages-container');
+  cont.onscroll = async () => {
+    if (!S.hasMoreHistory || S.isLoadingHistory || cont.scrollTop > 50) return;
+    
+    const firstMsg = cont.querySelector('[data-msg-id]');
+    if (!firstMsg) return;
+    
+    S.isLoadingHistory = true;
+    
+    const oldScrollHeight = cont.scrollHeight;
+    const olderMsgs = await api('GET', `/api/chats/${uid}/messages?beforeId=${firstMsg.dataset.msgId}`);
+    
+    if (!Array.isArray(olderMsgs) || olderMsgs.length === 0) {
+      S.hasMoreHistory = false;
+      S.isLoadingHistory = false;
+      return;
+    }
+    
+    const peerChatNum = await getActivePeerChatNum();
+    const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+    
+    for (const m of olderMsgs) {
+      m._prepend = true;
+      await renderMessage(m, peerChatNum, peerPub);
+    }
+    
+    const newScrollHeight = cont.scrollHeight;
+    cont.scrollTop = newScrollHeight - oldScrollHeight;
+    
+    S.isLoadingHistory = false;
+  };
 }
 
 function closeChat() {
@@ -636,7 +673,11 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     }
   }
 
-  cont.appendChild(wrap);
+  if (msg._prepend) {
+    cont.prepend(wrap);
+  } else {
+    cont.appendChild(wrap);
+  }
 
   const allWraps = [...cont.querySelectorAll('.msg-wrap')];
   const idx = allWraps.indexOf(wrap);
