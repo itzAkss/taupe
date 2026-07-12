@@ -1,7 +1,11 @@
 # Taupe — Secure messenger (ig)
 
-## i am too lazy to type the features and stuffs so just download and test it by yourself.
+## i am too lazy and tired to type the features and stuffs so just download and test it by yourself pls.
 
+> install node 26
+> install git
+> copy repo and npm install
+> then just 'npm start'
 
 # To do:
 - [x] E2E messages
@@ -15,9 +19,12 @@
 - [ ] add reactions
 - [ ] add gifs scroller
 - [ ] video support
-- [ ] split database layers (wow, hard work)
 - [ ] favicon.ico
 
 ## majors
 - [ ] Develop a mobile app
-- [ ] same for linux/windows
+- [ ] same for linux/windows (and even macOS), electron desktop app
+- [ ] split database layers (wow, hard work)
+
+
+###btw contact: tg @rdsrsgenius
