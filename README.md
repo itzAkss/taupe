@@ -19,5 +19,5 @@
 - [ ] favicon.ico
 
 ## majors
-- [] Develop a mobile app
-- [] same for linux/windows
+- [ ] Develop a mobile app
+- [ ] same for linux/windows
