@@ -1,7 +1,7 @@
 import {
   getMyPublicKeyB64, encryptMsg, decryptMsg,
   encryptFile, decryptFile, isEncrypted, cryptoSupported, invalidateSession,
-  setMyDeviceId,
+  setMyDeviceId, getSafetyNumber,
 } from './crypto.js';
 
 const S = {
@@ -145,6 +145,9 @@ async function bootApp(me, isNewAccount = false) {
   await loadChats();
   connectSocket();
   startPolling();
+  
+  const savedChat = localStorage.getItem('taupe_active_chat');
+  if (savedChat) openChat(savedChat);
 }
 
 function switchScreen(name) {
@@ -457,6 +460,7 @@ function updateChatPreviewUI(uid, preview) {
 
 async function openChat(uid) {
   S.activeChatUid = uid;
+  localStorage.setItem('taupe_active_chat', uid);
   hide($('empty-state'));
   const c = S.chats.find(x => x.uid === uid);
   if (c) c.unread = 0;
@@ -466,6 +470,7 @@ async function openChat(uid) {
 
   const b = $('badge-' + uid); if (b) { hide(b); b.textContent = ''; }
 
+  if (!c) return;
   const myId  = S.account.accountId;
   const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
 
@@ -475,32 +480,53 @@ async function openChat(uid) {
     navigator.clipboard.writeText(peerChatNum);
     toast('Copied', fmtNum(peerChatNum), 'ok', 1500);
   };
-  $('chat-subtitle').textContent = fmtNum(peerChatNum);
-  $('chat-subtitle').style.cursor = 'pointer';
-  $('chat-subtitle').onclick = () => { navigator.clipboard.writeText(peerChatNum); toast('Copied', fmtNum(peerChatNum), 'ok', 1500); };
-  updateBurnBtn();
-
-  document.querySelectorAll('.chat-item').forEach(el =>
-    el.classList.toggle('active', el.dataset.uid === uid));
-
-  S.peerKeys.delete(peerChatNum);
 
   let peerPub = await getPeerKey(peerChatNum);
   if (!peerPub) {
     await new Promise(r => setTimeout(r, 800));
     peerPub = await getPeerKey(peerChatNum);
   }
-  if (!peerPub) {
-    toast('No E2E key', 'Peer has not set up encryption yet — messages sent unencrypted', 'warn', 5000);
+
+  let subtitleText = fmtNum(peerChatNum);
+  if (peerPub?.[0]?.key) {
+    try {
+      const myPub = await getMyPublicKeyB64();
+      const safetyNum = await getSafetyNumber(myPub, peerPub[0].key);
+      if (safetyNum) subtitleText += ` · ${safetyNum}`;
+    } catch {}
+  } else {
+    toast('No E2E key', 'Peer has not set up encryption yet', 'warn', 5000);
   }
+
+  $('chat-subtitle').textContent = subtitleText;
+  $('chat-subtitle').style.cursor = 'pointer';
+  $('chat-subtitle').onclick = () => {
+    const fpPart = subtitleText.includes('·') ? subtitleText.split('·')[1].trim() : '';
+    if (fpPart) {
+      navigator.clipboard.writeText(fpPart);
+      toast('Fingerprint copied', fpPart, 'ok', 3000);
+    } else {
+      navigator.clipboard.writeText(peerChatNum);
+      toast('Copied', fmtNum(peerChatNum), 'ok', 1500);
+    }
+  };
+  
+  updateBurnBtn();
+  document.querySelectorAll('.chat-item').forEach(el =>
+    el.classList.toggle('active', el.dataset.uid === uid));
+
+  S.peerKeys.delete(peerChatNum);
 
   const msgs = await api('GET', `/api/chats/${uid}/messages`);
   const cont = $('messages-container');
   cont.innerHTML = '';
   if (Array.isArray(msgs)) {
-    for (const m of msgs) await renderMessage(m, peerChatNum, peerPub);
+    for (const m of msgs) {
+      try { await renderMessage(m, peerChatNum, peerPub); }
+      catch (e) { console.error('[render error]', e); }
+    }
   }
-    scrollBottom();
+  scrollBottom();
   S.socket?.emit('msg:read', { chatUid: uid });
 
   S.hasMoreHistory = true;
@@ -508,12 +534,10 @@ async function openChat(uid) {
   
   cont.onscroll = async () => {
     if (!S.hasMoreHistory || S.isLoadingHistory || cont.scrollTop > 50) return;
-    
     const firstMsg = cont.querySelector('[data-msg-id]');
     if (!firstMsg) return;
     
     S.isLoadingHistory = true;
-    
     const oldScrollHeight = cont.scrollHeight;
     const olderMsgs = await api('GET', `/api/chats/${uid}/messages?beforeId=${firstMsg.dataset.msgId}`);
     
@@ -523,23 +547,24 @@ async function openChat(uid) {
       return;
     }
     
-    const peerChatNum = await getActivePeerChatNum();
-    const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+    const scrollPeerNum = await getActivePeerChatNum();
+    const scrollPeerPub = scrollPeerNum ? await getPeerKey(scrollPeerNum) : null;
     
     for (const m of olderMsgs) {
       m._prepend = true;
-      await renderMessage(m, peerChatNum, peerPub);
+      try { await renderMessage(m, scrollPeerNum, scrollPeerPub); }
+      catch (e) { console.error('[render error]', e); }
     }
     
     const newScrollHeight = cont.scrollHeight;
     cont.scrollTop = newScrollHeight - oldScrollHeight;
-    
     S.isLoadingHistory = false;
   };
 }
 
 function closeChat() {
   S.activeChatUid = null;
+  localStorage.removeItem('taupe_active_chat');
   hide($('chat-view'));
   show($('empty-state'));
   if (S.isMobile()) showSidebar();

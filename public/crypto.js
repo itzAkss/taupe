@@ -288,6 +288,21 @@ export function isEncrypted(s) {
   return typeof s === 'string' && s.startsWith(ENC_PREFIX);
 }
 
+export async function getSafetyNumber(myPubB64, peerPubB64) {
+  if (!myPubB64 || !peerPubB64) return null;
+  try {
+    const str1 = myPubB64 < peerPubB64 ? myPubB64 : peerPubB64;
+    const str2 = myPubB64 < peerPubB64 ? peerPubB64 : myPubB64;
+    const raw = new TextEncoder().encode(str1 + str2);
+    
+    const hash = await crypto.subtle.digest('SHA-256', raw);
+    const bytes = new Uint8Array(hash);
+    return Array.from(bytes.slice(0, 8))
+      .map(b => b.toString(16).padStart(2, '0').toUpperCase())
+      .join(':');
+  } catch { return null; }
+}
+
 export function cryptoSupported() {
   return !!(window.crypto?.subtle && window.indexedDB);
 }
