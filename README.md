@@ -18,5 +18,6 @@
 - [ ] split database layers (wow, hard work)
 - [ ] favicon.ico
 
-## - [] Develop a mobile app
-## - [] same for linux/windows
+## majors
+- [] Develop a mobile app
+- [] same for linux/windows
