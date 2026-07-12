@@ -334,7 +334,7 @@ function addMessage(chatId, senderId, content, filePath, fileType, fileName, bur
     VALUES (?,?,?,?,?,?,?)
   `).run(chatId, senderId, content||null, filePath||null, fileType||null, fileName||null, burnSeconds||null);
 
-  const preview = content ? content.slice(0,60) : (fileType==='image'?'📷 Image':'📎 File');
+    const preview = content ? (content.startsWith('e2e:') ? '[encrypted]' : content.slice(0,60)) : (fileType==='image'?'📷 Image':'📎 File');
   updateChatPreview(chatId, preview);
   return db.prepare('SELECT * FROM messages WHERE id=?').get(r.lastInsertRowid);
 }
