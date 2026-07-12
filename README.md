@@ -2,10 +2,10 @@
 
 ## i am too lazy and tired to type the features and stuffs so just download and test it by yourself pls.
 
-> install node 26
-> install git
-> copy repo and npm install
-> then just 'npm start'
+> install node 26 | 
+> install git | 
+> copy repo and npm install | 
+> then just 'npm start' |
 
 # To do:
 - [x] E2E messages
