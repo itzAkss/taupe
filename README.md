@@ -43,6 +43,7 @@ npm start
 - [ ] add gifs scroller
 - [ ] video support
 - [ ] favicon.ico
+- [x] PWA
 
 ## majors
 - [ ] Develop a mobile app
