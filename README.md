@@ -1,12 +1,35 @@
 # Taupe — Secure messenger (ig)
 
-## i am too lazy and tired to type the features and stuffs so just download and test it by yourself pls.
+# How to setup
+### Archlinux
+```bash
+sudo pacman -Sy
+sudo pacman -S nodejs git
+```
 
-> install node 26 | 
-> install git | 
-> copy repo and npm install | 
-> then just 'npm start' |
+### Ubuntu/Debian
+```bash
+sudo apt update -y
+sudo apt install git nodejs
+```
 
+### MacOS
+```bash
+brew install git node
+```
+### Windows (WSL)
+```bash
+wsl --install
+```
+(restart and open ubuntu terminal, use Ubuntu/Debian commands)
+
+## Run
+```bash
+git clone https://github.com/itzAkss/taupe.git
+cd taupe
+npm install
+npm start
+```
 # To do:
 - [x] E2E messages
 - [x] E2E files and media
