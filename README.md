@@ -42,7 +42,7 @@ npm start
 - [ ] add reactions
 - [ ] add gifs scroller
 - [ ] video support
-- [ ] favicon.ico
+- [x] favicon.ico
 - [x] PWA
 
 ## majors
