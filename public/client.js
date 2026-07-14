@@ -726,6 +726,14 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys) {
   if (!msg.file_path) return '';
   const isEncryptedFile = msg.file_path.endsWith('.bin');
 
+  let isImageType = msg.file_type === 'image';
+  if (isEncryptedFile && !isImageType && msg.file_name) {
+    const baseName = msg.file_name.replace(/\.bin$/, '').toLowerCase();
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/.test(baseName)) {
+      isImageType = true;
+    }
+  }
+
   if (isEncryptedFile) {
     if (!decryptKeys) return `<span style="color:var(--warn)">[encrypted file]</span>`;
     try {
@@ -734,7 +742,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys) {
       const decBlob = await decryptFile(encBlob, decryptChatNum, decryptKeys);
       const blobUrl = URL.createObjectURL(decBlob);
       
-      if (msg.file_type === 'image') {
+      if (isImageType) {
         return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}" onload="URL.revokeObjectURL(this.src)">`;
       } else {
         const dlName = (msg.file_name || 'file').replace('.bin', '');
@@ -745,7 +753,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys) {
     }
   }
   
-  if (msg.file_type === 'image') {
+  if (isImageType) {
     return `<img class="msg-img" src="${msg.file_path}" loading="lazy" data-msg-id="${msg.id}">`;
   }
   return `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
