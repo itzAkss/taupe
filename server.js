@@ -423,14 +423,14 @@ app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) 
   if (!req.file) return res.status(400).json({ error: 'No file' });
   
   const isEncrypted = req.file.originalname.endsWith('.bin');
-  const mime = (isEncrypted && req.body.originalType) ? req.body.originalType : req.file.mimetype;
-  const isImage = mime.startsWith('image/');
+  const mime = isEncrypted ? 'application/octet-stream' : req.file.mimetype;
+  const isImage = !isEncrypted && mime.startsWith('image/');
 
-  if (isImage && !isEncrypted && !validateFileMagic(req.file.path, mime)) {
+  if (isImage && !validateFileMagic(req.file.path, mime)) {
     try { fs.unlinkSync(req.file.path); } catch {}
     return res.status(400).json({ error: 'Invalid image format' });
   }
-  const isAnimated = mime === 'image/gif' || mime === 'image/webp';
+  const isAnimated = !isEncrypted && (mime === 'image/gif' || mime === 'image/webp');
   let filePath = req.file.path;
   let fileName = req.file.originalname;
 
