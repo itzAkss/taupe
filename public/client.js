@@ -1064,16 +1064,15 @@ function openCropEditor(file) {
   img.onload = () => {
     const canvas  = $('crop-canvas');
     const VSIZE   = 280;
-    const CROP_SIZE = 220;
     canvas.width  = VSIZE;
     canvas.height = VSIZE;
     
     const maxDim = Math.max(img.width, img.height);
-    const initialScale = (CROP_SIZE / maxDim) * 0.7;
+    const initialScale = VSIZE / maxDim; 
 
     const scaleInput = $('crop-scale');
-    scaleInput.min = initialScale * 0.5;
-    scaleInput.max = initialScale * 5;
+    scaleInput.min = initialScale * 0.8;
+    scaleInput.max = initialScale * 4;
     scaleInput.step = 0.01;
     scaleInput.value = initialScale;
 
