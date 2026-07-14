@@ -284,19 +284,44 @@ app.patch('/api/me/username', authMiddleware, (req, res) => {
 app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
   const outPath = req.file.path;
+  
   if (!validateFileMagic(outPath, req.file.mimetype)) {
     try { fs.unlinkSync(outPath); } catch {}
     return res.status(400).json({ error: 'Invalid image format' });
   }
+
   if (sharp) {
-    await sharp(req.file.path)
-      .resize(128, 128, { fit: 'cover' })
-      .webp({ quality: 85 })
-      .toFile(outPath + '.webp');
-    fs.unlinkSync(req.file.path);
-    const rel = '/uploads/avatars/' + path.basename(outPath + '.webp');
-    DB.setAvatar(req.account.id, rel);
-    return res.json({ avatarPath: rel });
+    try {
+      let pipeline = sharp(outPath);
+      
+      if (req.body.crop) {
+        try {
+          const { x, y, w, h } = JSON.parse(req.body.crop);
+          pipeline = pipeline.extract({ 
+            left: parseInt(x), 
+            top: parseInt(y), 
+            width: parseInt(w), 
+            height: parseInt(h) 
+          });
+        } catch (e) {
+          console.warn('[Avatar] Invalid crop data, falling back to center crop');
+        }
+      }
+      
+      await pipeline
+        .resize(128, 128, { fit: 'cover' })
+        .webp({ quality: 85 })
+        .toFile(outPath + '.webp');
+        
+      fs.unlinkSync(outPath);
+      const rel = '/uploads/avatars/' + path.basename(outPath + '.webp');
+      DB.setAvatar(req.account.id, rel);
+      return res.json({ avatarPath: rel });
+    } catch (e) {
+      console.error('[Avatar] Sharp processing failed:', e.message);
+      try { fs.unlinkSync(outPath); } catch {}
+      return res.status(500).json({ error: 'Image processing failed' });
+    }
   }
 
   const rel = '/uploads/avatars/' + path.basename(outPath);

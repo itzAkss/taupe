@@ -1,11 +1,12 @@
-const CACHE_NAME = 'taupe-v1';
+const CACHE_NAME = 'taupe-v1.1.8';
 
 const ALLOWED_ASSETS = [
   '/',
   '/style.css',
   '/client.js',
   '/crypto.js',
-  '/manifest.json'
+  '/manifest.json',
+  '/favicon.png'
 ];
 
 self.addEventListener('install', event => {

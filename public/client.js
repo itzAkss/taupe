@@ -1054,38 +1054,48 @@ $('avatar-file-input').onchange = e => {
 };
 
 let _cropState = null;
+let _cropOriginalFile = null;
 
 function openCropEditor(file) {
-  const reader = new FileReader();
-  reader.onload = ev => {
-    const img = new Image();
-    img.onload = () => {
-      const canvas  = $('crop-canvas');
-      const VSIZE   = 280;
-      canvas.width  = VSIZE;
-      canvas.height = VSIZE;
-      
-      const minDim = Math.min(img.width, img.height);
-      const initialScale = VSIZE / minDim;
-      const scaleInput = $('crop-scale');
-      scaleInput.min = initialScale;
-      scaleInput.max = initialScale * 3;
-      scaleInput.step = 0.01;
-      scaleInput.value = initialScale;
+  _cropOriginalFile = file;
+  const objectUrl = URL.createObjectURL(file);
+  const img = new Image();
+  
+  img.onload = () => {
+    const canvas  = $('crop-canvas');
+    const VSIZE   = 280;
+    const CROP_SIZE = 220;
+    canvas.width  = VSIZE;
+    canvas.height = VSIZE;
+    
+    const maxDim = Math.max(img.width, img.height);
+    const initialScale = (CROP_SIZE / maxDim) * 0.7;
 
-      _cropState = {
-        img, scale: initialScale, offsetX: 0, offsetY: 0,
-        dragging: false, lastX: 0, lastY: 0,
-      };
-      drawCrop();
-      show($('modal-crop'));
+    const scaleInput = $('crop-scale');
+    scaleInput.min = initialScale * 0.5;
+    scaleInput.max = initialScale * 5;
+    scaleInput.step = 0.01;
+    scaleInput.value = initialScale;
+
+    _cropState = {
+      img, scale: initialScale, offsetX: 0, offsetY: 0,
+      dragging: false, lastX: 0, lastY: 0,
     };
-    img.src = ev.target.result;
+    drawCrop();
+    show($('modal-crop'));
+    URL.revokeObjectURL(objectUrl);
   };
-  reader.readAsDataURL(file);
+  
+  img.onerror = () => {
+     toast('Error', 'Failed to load image', 'err');
+     URL.revokeObjectURL(objectUrl);
+  };
+  
+  img.src = objectUrl;
 }
 
 function drawCrop() {
+  if (!_cropState) return;
   const { img, scale, offsetX, offsetY } = _cropState;
   const canvas = $('crop-canvas');
   const ctx = canvas.getContext('2d');
@@ -1096,8 +1106,8 @@ function drawCrop() {
 }
 
 const cropCanvas = $('crop-canvas');
-cropCanvas.addEventListener('mousedown',  e => { _cropState.dragging=true; _cropState.lastX=e.clientX; _cropState.lastY=e.clientY; });
-cropCanvas.addEventListener('touchstart', e => { _cropState.dragging=true; _cropState.lastX=e.touches[0].clientX; _cropState.lastY=e.touches[0].clientY; }, { passive:true });
+cropCanvas.addEventListener('mousedown',  e => { if(_cropState){ _cropState.dragging=true; _cropState.lastX=e.clientX; _cropState.lastY=e.clientY; }});
+cropCanvas.addEventListener('touchstart', e => { if(_cropState){ _cropState.dragging=true; _cropState.lastX=e.touches[0].clientX; _cropState.lastY=e.touches[0].clientY; }}, { passive:true });
 document.addEventListener('mouseup',  () => { if (_cropState) _cropState.dragging=false; });
 document.addEventListener('touchend', () => { if (_cropState) _cropState.dragging=false; });
 document.addEventListener('mousemove', e => {
@@ -1115,40 +1125,61 @@ document.addEventListener('touchmove', e => {
   drawCrop();
 }, { passive:true });
 
-$('crop-scale').addEventListener('input', e => {
+ $('crop-scale').addEventListener('input', e => {
   if (!_cropState) return;
   _cropState.scale = parseFloat(e.target.value);
   drawCrop();
 });
 
-$('crop-cancel').onclick = () => { hide($('modal-crop')); _cropState = null; };
+ $('crop-cancel').onclick = () => { hide($('modal-crop')); _cropState = null; };
 
-$('crop-apply').onclick = async () => {
-  if (!_cropState) return;
+  $('crop-apply').onclick = async () => {
+  if (!_cropState || !_cropOriginalFile) return;
 
-  const SIZE = 256;
-  const out  = document.createElement('canvas');
-  out.width  = SIZE; out.height = SIZE;
-  const octx = out.getContext('2d');
+  const VSIZE = 280;
+  const CROP_SIZE = 220;
+  const CROP_OFFSET = (VSIZE - CROP_SIZE) / 2;
 
-  octx.beginPath(); octx.arc(SIZE/2, SIZE/2, SIZE/2, 0, Math.PI*2); octx.clip();
+  const scale = _cropState.scale;
+  const offX = _cropState.offsetX;
+  const offY = _cropState.offsetY;
+  const imgW = _cropState.img.width;
+  const imgH = _cropState.img.height;
 
-  const srcX = (280 - 220) / 2, srcY = (280 - 220) / 2;
-  octx.drawImage($('crop-canvas'), srcX, srcY, 220, 220, 0, 0, SIZE, SIZE);
+  const drawX = offX + (VSIZE - imgW * scale) / 2;
+  const drawY = offY + (VSIZE - imgH * scale) / 2;
+
+  let cropX = Math.round((CROP_OFFSET - drawX) / scale);
+  let cropY = Math.round((CROP_OFFSET - drawY) / scale);
+  let cropW = Math.round(CROP_SIZE / scale);
+  let cropH = Math.round(CROP_SIZE / scale);
+
+  cropX = Math.max(0, cropX);
+  cropY = Math.max(0, cropY);
+  cropW = Math.min(imgW - cropX, cropW);
+  cropH = Math.min(imgH - cropY, cropH);
+
   hide($('modal-crop'));
 
-  out.toBlob(async blob => {
-    const rm = toast('Uploading...', '', 'info', 0);
-    const fd = new FormData();
-    fd.append('avatar', blob, 'avatar.png');
-    const r = await fetch('/api/me/avatar', { method:'POST', body:fd, credentials:'include' });
-    const d = await r.json(); rm();
+  const rm = toast('Uploading...', '', 'info', 0);
+  const fd = new FormData();
+  
+  fd.append('avatar', _cropOriginalFile); 
+  fd.append('crop', JSON.stringify({ x: cropX, y: cropY, w: cropW, h: cropH }));
+
+  try {
+    const r = await fetch('/api/me/avatar', { method: 'POST', body: fd, credentials: 'include' });
+    const d = await r.json();
+    rm();
     if (d.error) { toast('Error', d.error, 'err'); return; }
     S.account.avatarPath = d.avatarPath;
     $('my-avatar-preview').innerHTML = `<img src="${d.avatarPath}?t=${Date.now()}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`;
     toast('Avatar updated', '', 'ok');
-    _cropState = null;
-  }, 'image/png');
+  } catch (err) {
+    rm();
+    toast('Network Error', 'Upload failed', 'err');
+  }
+  _cropState = null;
 };
 
 $('btn-logout').onclick = async () => {
