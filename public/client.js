@@ -242,6 +242,8 @@ function connectSocket() {
   S.socket.on('msg:new', async ({ chatUid, msg, preview }) => {
     updateChatPreviewUI(chatUid, preview);
     if (S.activeChatUid === chatUid) {
+      if (document.querySelector(`[data-msg-id="${msg.id}"]`)) return;
+
       const peerChatNum = await getActivePeerChatNum();
       const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
       const isMyMsg = msg.sender_id == S.account.accountId;
@@ -526,39 +528,53 @@ async function openChat(uid) {
       catch (e) { console.error('[render error]', e); }
     }
   }
+  cont.style.scrollBehavior = 'auto';
   scrollBottom();
+  cont.style.scrollBehavior = '';
   S.socket?.emit('msg:read', { chatUid: uid });
 
   S.hasMoreHistory = true;
   S.isLoadingHistory = false;
-  
+
   cont.onscroll = async () => {
-    if (!S.hasMoreHistory || S.isLoadingHistory || cont.scrollTop > 50) return;
+    if (!S.hasMoreHistory || S.isLoadingHistory) return;
+    if (cont.scrollTop > 80) return;
+
     const firstMsg = cont.querySelector('[data-msg-id]');
     if (!firstMsg) return;
-    
+
     S.isLoadingHistory = true;
+    const savedHandler = cont.onscroll;
+    cont.onscroll = null;
+
     const oldScrollHeight = cont.scrollHeight;
+    const oldScrollTop    = cont.scrollTop;
+
     const olderMsgs = await api('GET', `/api/chats/${uid}/messages?beforeId=${firstMsg.dataset.msgId}`);
-    
+
     if (!Array.isArray(olderMsgs) || olderMsgs.length === 0) {
       S.hasMoreHistory = false;
       S.isLoadingHistory = false;
+      cont.onscroll = savedHandler;
       return;
     }
-    
+
     const scrollPeerNum = await getActivePeerChatNum();
     const scrollPeerPub = scrollPeerNum ? await getPeerKey(scrollPeerNum) : null;
-    
-    for (const m of olderMsgs) {
+
+    for (const m of [...olderMsgs].reverse()) {
       m._prepend = true;
       try { await renderMessage(m, scrollPeerNum, scrollPeerPub); }
       catch (e) { console.error('[render error]', e); }
     }
-    
+
     const newScrollHeight = cont.scrollHeight;
-    cont.scrollTop = newScrollHeight - oldScrollHeight;
+    cont.style.scrollBehavior = 'auto';
+    cont.scrollTop = newScrollHeight - oldScrollHeight + oldScrollTop;
+    cont.style.scrollBehavior = '';
+
     S.isLoadingHistory = false;
+    setTimeout(() => { cont.onscroll = savedHandler; }, 100);
   };
 }
 
