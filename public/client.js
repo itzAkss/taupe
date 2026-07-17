@@ -312,13 +312,24 @@ function connectSocket() {
     if (S.activeChatUid) updateChatPreviewUI(S.activeChatUid, myPreview ?? '');
   });
 
-  S.socket.on('chat:deleted', ({ chatUid, forWhom, by }) => {
+      S.socket.on('chat:deleted', ({ chatUid, forWhom, by }) => {
     const isMe = String(by) === String(S.account.accountId);
     if (forWhom === 'both' || (forWhom === 'peer' && !isMe)) {
-      S.chats = S.chats.filter(c => c.uid !== chatUid);
-      renderChatList();
-      if (S.activeChatUid === chatUid) closeChat();
-      if (!isMe) toast('Chat deleted', 'The other party deleted this chat', 'warn');
+      const chatEl = document.querySelector(`.chat-item[data-uid="${chatUid}"]`);
+      
+      if (chatEl) {
+        chatEl.classList.add('removing');
+        setTimeout(() => {
+          chatEl.remove();
+          S.chats = S.chats.filter(c => c.uid !== chatUid);
+          if (S.activeChatUid === chatUid) closeChat();
+          if (!isMe) toast('Chat deleted', 'The other party deleted this chat', 'warn');
+        }, 200);
+      } else {
+        S.chats = S.chats.filter(c => c.uid !== chatUid);
+        renderChatList();
+        if (S.activeChatUid === chatUid) closeChat();
+      }
     }
   });
 
@@ -409,7 +420,6 @@ function renderChatList() {
       : `<span class="mono">${fmtNum(peerChatNum)}</span>`;
     const avatarSrc  = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
     const preview    = c.last_message_preview || '';
-    const burnBadge  = burnBadgeHtml(c.burn_mode);
 
     div.innerHTML = `
       <div class="chat-avatar">${avatarSrc
@@ -418,7 +428,6 @@ function renderChatList() {
       <div class="chat-item-info">
         <div class="chat-item-top">
           <span class="chat-item-name">${nameHtml}</span>
-          ${burnBadge}
         </div>
         <div class="chat-item-preview" id="preview-${c.uid}">${esc(preview)}</div>
       </div>
@@ -759,7 +768,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys) {
       const blobUrl = URL.createObjectURL(decBlob);
       
       if (isImageType) {
-        return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}" onload="URL.revokeObjectURL(this.src)">`;
+        return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded'); URL.revokeObjectURL(this.src)">`;
       } else {
         const dlName = (msg.file_name || 'file').replace('.bin', '');
         return `<div class="msg-file">[ <a href="${blobUrl}" download="${esc(dlName)}" target="_blank" rel="noreferrer">${esc(dlName)}</a> ]</div>`;

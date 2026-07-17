@@ -509,3 +509,30 @@ main#chat-area.mob-hidden { opacity: 0; }
 .msg-wrap.them.same-sender .msg-bubble { border-top-left-radius:4px; }
 .msg-wrap.me:not(.grouped-last):not(:last-child) .msg-bubble { border-bottom-right-radius:4px; }
 .msg-wrap.them:not(.grouped-last):not(:last-child) .msg-bubble { border-bottom-left-radius:4px; }
+
+.msg-img {
+  background: var(--bg3);
+  opacity: 0;
+  transition: opacity .3s ease;
+}
+.msg-img.loaded {
+  opacity: 1;
+}
+
+@keyframes spoilerReveal { 
+  from { opacity: 0; transform: scale(0.95); } 
+  to { opacity: 1; transform: scale(1); } 
+}
+.msg-burn-open {
+  animation: spoilerReveal .2s ease;
+}
+
+@keyframes slideOutLeft { 
+  to { opacity: 0; transform: translateX(-40px); } 
+}
+.chat-item.removing { 
+  animation: slideOutLeft .2s ease forwards; 
+  pointer-events: none; 
+}
+
+.tab-content { animation: fadeIn .2s ease; }
