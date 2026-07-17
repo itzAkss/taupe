@@ -36,7 +36,7 @@ npm start
 - [x] sum animations
 - [ ] more animations
 - [ ] host public, on vps (maybe oracle freetier cuz i have no mony)
-- [ ] fix avatar editor
+- [x] fix avatar editor
 - [x] add reply to msg
 - [ ] add voice messages
 - [ ] add reactions
@@ -44,6 +44,8 @@ npm start
 - [ ] video support
 - [x] favicon.ico
 - [x] PWA (deleted for now)
+- [ ] add password on register and login
+- [ ] add lockscreen
 
 ## majors
 - [ ] Develop a mobile app
