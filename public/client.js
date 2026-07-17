@@ -449,6 +449,15 @@ function chatLabel(c) {
   return lbl || fmtNum(peerChatNum);
 }
 
+function getPeerDisplayName(c) {
+  if (!c) return 'Peer';
+  const myId = S.account.accountId;
+  if (c.initiator_id == myId) {
+    return c.peer_alias || c.peer_username || fmtNum(c.peer_chat_number);
+  } 
+  return c.initiator_username || fmtNum(c.initiator_chat_number);
+}
+
 function burnBadgeHtml(mode) {
   const labels = { baf: 'BAF', '1min': '1m', '5min': '5m', '10min': '10m', custom: '?m', never: 'keep' };
   const cls    = mode === 'never' ? 'burn-badge burn-badge-red' : 'burn-badge';
@@ -645,6 +654,36 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     inner += `<button class="msg-sender-label" data-num="${peerChatNum}" title="Copy number">${lbl}</button>`;
   }
 
+    let replyHtml = '';
+  if (msg.reply_to_id) {
+    try {
+      const origMsg = await api('GET', `/api/messages/${msg.reply_to_id}`);
+      if (origMsg && !origMsg.error) {
+        let origText = '';
+        if (origMsg.file_path) {
+          origText = origMsg.file_type === 'image' ? '📷 Photo' : '📎 File';
+        } else {
+          origText = origMsg.content || '';
+        }
+        if (origText && isEncrypted(origText) && decryptKeys) {
+          try { origText = await decryptMsg(origText, decryptChatNum, decryptKeys); }
+          catch { origText = '[decryption failed]'; }
+        }
+        const c = S.chats.find(x => x.uid === S.activeChatUid);
+        let senderName = 'Peer';
+        if (String(origMsg.sender_id) === String(S.account.accountId)) {
+          senderName = 'You';
+        } else {
+          senderName = getPeerDisplayName(c);
+        }
+        
+        replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${esc(origText || '[Media]')}</div></div>`;
+      } else {
+        replyHtml = `<div class="msg-reply"><div class="msg-reply-text">[Deleted message]</div></div>`;
+      }
+    } catch (e) { console.error('[reply fetch]', e); }
+  }
+
   let content = '';
   const hasBurn = !!msg.burn_seconds;
   const isFile  = (msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path;
@@ -689,10 +728,19 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted">#</span>' : '';
 
   inner += `
-    <div class="msg-bubble ${isMe ? 'me' : 'them'}" data-msg-id="${msg.id}">${content}</div>
+    <div class="msg-bubble ${isMe ? 'me' : 'them'}" data-msg-id="${msg.id}">${replyHtml}${content}</div>
     <div class="msg-meta ${isMe ? 'me' : 'them'}">${lockIcon}<span>${time}</span>${tick}</div>
   `;
   wrap.innerHTML = inner;
+
+  const replyDiv = wrap.querySelector('.msg-reply');
+  if (replyDiv && msg.reply_to_id) {
+    replyDiv.style.cursor = 'pointer';
+    replyDiv.addEventListener('click', (e) => {
+      e.stopPropagation();
+      scrollToMessage(msg.reply_to_id);
+    });
+  }
 
   wrap.querySelector('.msg-sender-label')?.addEventListener('click', () => {
     navigator.clipboard.writeText(peerChatNum);
@@ -816,16 +864,26 @@ function showMsgCtx(e, msgId, isMe) {
   removeCtx();
   const menu = document.createElement('div');
   menu.className = 'ctx-menu'; menu.id = 'ctx-menu';
+  
   const items = isMe
-    ? [['Delete for me', 'self', false], ['Delete for peer', 'peer', false], ['Delete for both', 'both', true]]
-    : [['Delete for me', 'self', false], ['Delete for both', 'both', true]];
-  items.forEach(([lbl, fw, danger]) => {
+    ? [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for peer', 'peer', false], ['Delete for both', 'both', true]]
+    : [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for both', 'both', true]];
+    
+  items.forEach(([lbl, action, danger]) => {
     const d = document.createElement('div');
     d.className = 'ctx-item' + (danger ? ' danger' : '');
     d.textContent = lbl;
-    d.onclick = () => { S.socket.emit('msg:delete', { msgId, forWhom: fw }); removeCtx(); };
+    d.onclick = () => {
+      if (action === 'reply') {
+        setReplyTo(msgId);
+      } else {
+        S.socket.emit('msg:delete', { msgId, forWhom: action });
+      }
+      removeCtx();
+    };
     menu.appendChild(d);
   });
+  
   const x = Math.min(e.clientX ?? 100, window.innerWidth - 190);
   const y = Math.min(e.clientY ?? 100, window.innerHeight - 130);
   menu.style.left = x + 'px'; menu.style.top = y + 'px';
@@ -857,6 +915,65 @@ $('msg-input').addEventListener('input', () => {
   ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
 });
 
+function scrollToMessage(msgId) {
+  const container = $('messages-container');
+  const targetBubble = container.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`);
+  
+  if (!targetBubble) {
+    toast('Message not found', 'It might be too old or deleted', 'warn', 2000);
+    return;
+  }
+  targetBubble.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  targetBubble.classList.remove('msg-highlight');
+  targetBubble.classList.add('msg-highlight');
+  setTimeout(() => targetBubble.classList.remove('msg-highlight'), 1500);
+}
+
+let replyTo = null;
+
+function setReplyTo(msgId) {
+  const bubble = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`);
+  if (!bubble) return;
+  let text = bubble.innerText;
+  if (bubble.querySelector('.msg-img')) text = '📷 Photo';
+  else if (bubble.querySelector('.msg-file')) text = '📎 File';
+
+  const wrap = bubble.closest('.msg-wrap');
+  const isMe = wrap.classList.contains('me');
+  let senderName = 'Peer';
+  
+  if (isMe) {
+    senderName = 'You';
+  } else {
+    const label = wrap.querySelector('.msg-sender-label');
+    if (label) {
+      senderName = label.textContent.split(' ')[0];
+    } else {
+      const c = S.chats.find(x => x.uid === S.activeChatUid);
+      senderName = getPeerDisplayName(c);
+    }
+  }
+
+  replyTo = { id: msgId, text };
+
+  const preview = document.getElementById('reply-preview');
+  if (preview) {
+    preview.querySelector('.reply-preview-name').textContent = senderName;
+    preview.querySelector('.reply-preview-text').textContent = text;
+    preview.classList.remove('hidden');
+    document.getElementById('msg-input').focus();
+  }
+}
+
+function cancelReply() {
+  replyTo = null;
+  document.getElementById('reply-preview')?.classList.add('hidden');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('reply-close')?.addEventListener('click', cancelReply);
+});
+
 async function sendMsg() {
   if (!S.activeChatUid) return;
   if (!S.socket?.connected) { toast('Not connected', 'Waiting...', 'warn'); return; }
@@ -886,9 +1003,11 @@ async function sendMsg() {
     fileType:    file?.type || null,
     fileName:    file?.name || null,
     burnSeconds: S.burnSeconds || null,
+    replyToId:   replyTo?.id || null,
   });
 
   if (text) S._pendingPlaintext = text;
+  cancelReply();
 }
 
 $('file-input').onchange = async e => {

@@ -132,8 +132,10 @@ try {
     db.exec('ALTER TABLE messages ADD COLUMN burn_seconds INTEGER');
   if (!cols.some(c => c.name === 'burn_at'))
     db.exec('ALTER TABLE messages ADD COLUMN burn_at INTEGER');
+  if (!cols.some(c => c.name === 'reply_to_id'))
+    db.exec('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER');
 } catch (e) {
-  console.error('[migration] burn columns check failed:', e.message);
+  console.error('[migration] columns check failed:', e.message);
 }
 
 try {
@@ -328,13 +330,13 @@ function getMessages(chatId, accountId, { beforeId = null, limit = 200 } = {}) {
 
   return db.prepare(sql).all(...params).reverse();
 }
-function addMessage(chatId, senderId, content, filePath, fileType, fileName, burnSeconds) {
+function addMessage(chatId, senderId, content, filePath, fileType, fileName, burnSeconds, replyToId) {
   const r = db.prepare(`
-    INSERT INTO messages (chat_id,sender_id,content,file_path,file_type,file_name,burn_seconds)
-    VALUES (?,?,?,?,?,?,?)
-  `).run(chatId, senderId, content||null, filePath||null, fileType||null, fileName||null, burnSeconds||null);
+    INSERT INTO messages (chat_id,sender_id,content,file_path,file_type,file_name,burn_seconds,reply_to_id)
+    VALUES (?,?,?,?,?,?,?,?)
+  `).run(chatId, senderId, content||null, filePath||null, fileType||null, fileName||null, burnSeconds||null, replyToId||null);
 
-    const preview = content ? (content.startsWith('e2e:') ? '[encrypted]' : content.slice(0,60)) : (fileType==='image'?'📷 Image':'📎 File');
+  const preview = content ? (content.startsWith('e2e:') ? '[encrypted]' : content.slice(0,60)) : (fileType==='image'?'📷 Image':'📎 File');
   updateChatPreview(chatId, preview);
   return db.prepare('SELECT * FROM messages WHERE id=?').get(r.lastInsertRowid);
 }

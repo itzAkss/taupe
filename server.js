@@ -411,6 +411,21 @@ app.get('/api/chats/:uid/messages', authMiddleware, (req, res) => {
   res.json(DB.getMessages(chat.id, req.account.id, { beforeId }));
 });
 
+app.get('/api/messages/:id', authMiddleware, (req, res) => {
+  try {
+    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(parseInt(req.params.id));
+    if (!msg) return res.status(404).json({ error: 'Not found' });
+    
+    const chat = DB.getChatById(msg.chat_id);
+    if (!chat || (chat.initiator_id !== req.account.id && chat.peer_id !== req.account.id)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    res.json(msg);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.patch('/api/chats/:uid/label', authMiddleware, (req, res) => {
   const chat = DB.getChatByUid(req.params.uid);
   if (!chat) return res.status(404).json({ error: 'Not found' });
@@ -516,7 +531,7 @@ io.on('connection', socket => {
     if (s) { s.delete(socket.id); if (!s.size) online.delete(aid); }
   });
 
-  socket.on('msg:send', ({ chatUid, content, fileUrl, fileType, fileName, burnSeconds }) => {
+    socket.on('msg:send', ({ chatUid, content, fileUrl, fileType, fileName, burnSeconds, replyToId }) => {
     const chat = DB.getChatByUid(chatUid);
     if (!chat) return;
     const isInit = chat.initiator_id === aid;
@@ -526,7 +541,7 @@ io.on('connection', socket => {
     if (isInit && chat.deleted_by_initiator) return;
     if (isPeer && chat.deleted_by_peer) return;
     const secs = burnSeconds > 0 ? Math.max(5, Math.min(3600, parseInt(burnSeconds))) : null;
-    const msg = DB.addMessage(chat.id, aid, content, fileUrl||null, fileType||null, fileName||null, secs);
+    const msg = DB.addMessage(chat.id, aid, content, fileUrl||null, fileType||null, fileName||null, secs, replyToId);
     const preview = secs ? '[burns after read]' : (content ? content.slice(0,60) : (fileType==='image'?'[image]':'[file]'));
     io.to(roomForChat(chatUid)).emit('msg:new', { chatUid, msg, preview });
 
