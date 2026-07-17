@@ -37,7 +37,7 @@ npm start
 - [ ] more animations
 - [ ] host public, on vps (maybe oracle freetier cuz i have no mony)
 - [ ] fix avatar editor
-- [ ] add reply to msg
+- [x] add reply to msg
 - [ ] add voice messages
 - [ ] add reactions
 - [ ] add gifs scroller
