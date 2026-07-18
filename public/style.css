@@ -189,6 +189,13 @@ main#chat-area { flex:1; display:flex; flex-direction:column; overflow:hidden; m
 .eg-emoji { font-size: 26px; cursor: pointer; text-align: center; padding: 4px; border-radius: 4px; }
 .eg-emoji:hover { background: var(--bg3); }
 
+.eg-emoji img.emoji {
+  height: 26px;
+  width: 26px;
+  margin: 0;
+  vertical-align: middle;
+}
+
 #eg-gif-grid .eg-grid { 
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); 
@@ -226,6 +233,15 @@ main#chat-area { flex:1; display:flex; flex-direction:column; overflow:hidden; m
   border-radius: 7px;
   margin: 0;
   opacity: 1 !important;
+}
+
+.msg-bubble img.emoji,
+.msg-reply-text img.emoji,
+#reply-preview img.emoji {
+  height: 1.2em;
+  width: 1.2em;
+  margin: 0 .05em 0 .1em;
+  vertical-align: -0.2em;
 }
 
 #chat-view {

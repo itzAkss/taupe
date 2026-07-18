@@ -678,7 +678,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
           senderName = getPeerDisplayName(c);
         }
         
-        replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${esc(origText || '[Media]')}</div></div>`;
+        replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${twemoji.parse(esc(origText || '[Media]'))}</div></div>`;
       } else {
         replyHtml = `<div class="msg-reply"><div class="msg-reply-text">[Deleted message]</div></div>`;
       }
@@ -708,7 +708,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
                 const gifUrl = text.slice(4);
                 content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
               } else {
-                content = esc(text).replace(/\n/g, '<br>');
+                content = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
               }
             }
       const burnLabel = formatBurnSecs(msg.burn_seconds);
@@ -732,7 +732,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       const gifUrl = text.slice(4);
       content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
     } else {
-      content = esc(text).replace(/\n/g, '<br>');
+      content = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
     }
   }
 
@@ -1513,6 +1513,7 @@ function formatBurnSecs(secs) {
 })();
 
 let EMOJIS = [];
+let allEmojisData = {};
 const egPanel = $('emoji-gif-panel');
 const egSearch = $('eg-search-input');
 const emojiGrid = $('eg-emoji-grid');
@@ -1520,10 +1521,30 @@ const gifGrid = $('eg-gif-grid');
 
 async function loadEmojis() {
   try {
-    const res = await fetch('https://raw.githubusercontent.com/muan/emojilib/master/dist/emoji-en-US.json');
-    const data = await res.json();
-    allEmojisData = data;
-    EMOJIS = Object.keys(data);
+    const enRes = await fetch('https://raw.githubusercontent.com/muan/emojilib/master/dist/emoji-en-US.json');
+    const enData = await enRes.json();
+    
+    let ruData = {};
+    try {
+      const ruRes = await fetch('https://raw.githubusercontent.com/emoji-gen/emoji-short-ru/master/emoji.json');
+      if (ruRes.ok) {
+        const ruRaw = await ruRes.json();
+        for (const key in ruRaw) {
+          const words = ruRaw[key].keywords || [];
+          ruData[ruRaw[key].char] = words;
+        }
+      }
+    } catch (e) { console.warn('RU dict failed, using EN only'); }
+
+    allEmojisData = {};
+    
+    for (const emoji in enData) {
+      const enWords = enData[emoji] || [];
+      const ruWords = ruData[emoji] || [];
+      allEmojisData[emoji] = [...new Set([...enWords, ...ruWords])];
+    }
+    
+    EMOJIS = Object.keys(allEmojisData);
     renderEmojis(EMOJIS);
   } catch (e) { 
     console.error('Emoji load failed', e); 
@@ -1536,7 +1557,7 @@ function renderEmojis(emojiList = EMOJIS) {
   emojiList.forEach(e => {
     const span = document.createElement('span');
     span.className = 'eg-emoji';
-    span.textContent = e;
+    span.innerHTML = twemoji.parse(e);
     span.onclick = () => {
       const inp = $('msg-input');
       inp.value += e;
@@ -1578,7 +1599,6 @@ document.querySelectorAll('.eg-tab').forEach(tab => {
 });
 
 let gifSearchTimer;
-let allEmojisData = {};
 
 egSearch.oninput = () => {
   clearTimeout(gifSearchTimer);
@@ -1697,7 +1717,7 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
           const gifUrl = text.slice(4);
           html = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" onload="this.classList.add('loaded')">`;
         } else {
-          html = esc(text).replace(/\n/g, '<br>');
+          html = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
         }
       }
       bubble.innerHTML = `<div class="msg-burn-open" data-msg-id="${msgId}">${html}<span class="burn-countdown"></span></div>`;
