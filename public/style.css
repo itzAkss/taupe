@@ -161,6 +161,73 @@ main#chat-area { flex:1; display:flex; flex-direction:column; overflow:hidden; m
   border-radius: 10px;
 }
 
+#emoji-gif-panel {
+  position: absolute;
+  bottom: 65px;
+  left: 10px;
+  right: 10px;
+  max-width: 360px;
+  height: 320px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  z-index: 50;
+  overflow: hidden;
+  box-shadow: 0 4px 24px rgba(0,0,0,.6);
+}
+#emoji-gif-panel.hidden { display: none !important; }
+
+.eg-tabs { display: flex; border-bottom: 1px solid var(--border); }
+.eg-tab { flex: 1; padding: 10px; background: none; border: none; color: var(--text2); cursor: pointer; font-size: 13px; }
+.eg-tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); font-weight: 600; }
+
+.eg-search { padding: 8px; }
+.eg-search input { width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 6px 10px; font-size: 13px; }
+
+.eg-emoji { font-size: 26px; cursor: pointer; text-align: center; padding: 4px; border-radius: 4px; }
+.eg-emoji:hover { background: var(--bg3); }
+
+#eg-gif-grid .eg-grid { 
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); 
+  gap: 6px; 
+}
+
+.eg-content { 
+  flex: 1; 
+  min-height: 0;
+  overflow-y: auto; 
+  padding: 8px; 
+}
+
+.eg-gif-item { 
+  width: 100%; 
+  height: 80px;
+  object-fit: cover;
+  border-radius: 6px; 
+  cursor: pointer; 
+  background: var(--bg3); 
+  transition: transform .1s; 
+} 
+.eg-gif-item:hover { transform: scale(1.03); }
+
+.msg-bubble:has(.msg-gif) {
+  padding: 3px !important;
+}
+
+.msg-gif {
+  width: 100%;
+  max-width: 220px;
+  max-height: 250px;
+  object-fit: cover;
+  display: block;
+  border-radius: 7px;
+  margin: 0;
+  opacity: 1 !important;
+}
+
 #chat-view {
   display: flex;
   flex-direction: column;

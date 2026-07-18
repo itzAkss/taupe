@@ -40,7 +40,7 @@ npm start
 - [x] add reply to msg
 - [ ] add voice messages
 - [ ] add reactions
-- [ ] add gifs scroller
+- [x] add gifs scroller (+ emojis)
 - [ ] video support
 - [x] favicon.ico
 - [x] PWA (deleted for now)

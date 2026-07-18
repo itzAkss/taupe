@@ -664,6 +664,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
           origText = origMsg.file_type === 'image' ? '📷 Photo' : '📎 File';
         } else {
           origText = origMsg.content || '';
+          if (origText && origText.startsWith('gif:')) origText = '🎞️ GIF';
         }
         if (origText && isEncrypted(origText) && decryptKeys) {
           try { origText = await decryptMsg(origText, decryptChatNum, decryptKeys); }
@@ -694,14 +695,22 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
 
       if ((msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path) {
         content = await buildFileHtml(msg, decryptChatNum, decryptKeys);
-      } else if (msg.content) {
-        let text = msg._plaintext || msg.content;
-        if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
-          try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
-          catch { text = '[decryption failed]'; }
-        } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted — no key]'; }
-        content = esc(text).replace(/\n/g, '<br>');
-      }
+            } else if (msg.content) {
+              let text = msg._plaintext || msg.content;
+              if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
+                try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
+                catch { text = '[decryption failed]'; }
+              } else if (!msg._plaintext && isEncrypted(text)) {
+                text = '[encrypted — no key]';
+              }
+
+              if (typeof text === 'string' && text.startsWith('gif:')) {
+                const gifUrl = text.slice(4);
+                content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+              } else {
+                content = esc(text).replace(/\n/g, '<br>');
+              }
+            }
       const burnLabel = formatBurnSecs(msg.burn_seconds);
       content = `<div class="msg-burn-open" data-msg-id="${msg.id}">${content}<span class="burn-countdown">${burnLabel}</span></div>`;
     } else {
@@ -711,7 +720,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     }
   } else if ((msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path) {
     content = await buildFileHtml(msg, decryptChatNum, decryptKeys);
-  } else if (msg.content) {
+    } else if (msg.content) {
     let text = msg._plaintext || msg.content;
     if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
       try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
@@ -719,7 +728,12 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     } else if (!msg._plaintext && isEncrypted(text)) {
       text = '[encrypted — no key]';
     }
-    content = esc(text).replace(/\n/g, '<br>');
+    if (typeof text === 'string' && text.startsWith('gif:')) {
+      const gifUrl = text.slice(4);
+      content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+    } else {
+      content = esc(text).replace(/\n/g, '<br>');
+    }
   }
 
   const time = new Date(msg.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -934,8 +948,10 @@ let replyTo = null;
 function setReplyTo(msgId) {
   const bubble = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`);
   if (!bubble) return;
-  let text = bubble.innerText;
-  if (bubble.querySelector('.msg-img')) text = '📷 Photo';
+    let text = bubble.innerText;
+  if (bubble.querySelector('.msg-img')) {
+    text = '🎞️ GIF';
+  }
   else if (bubble.querySelector('.msg-file')) text = '📎 File';
 
   const wrap = bubble.closest('.msg-wrap');
@@ -1448,11 +1464,11 @@ function formatBurnSecs(secs) {
     });
 
     if (secs) {
-      btn.textContent = `(${formatBurnSecs(secs)})`;
+      btn.textContent = `${formatBurnSecs(secs)}`;
       btn.classList.add('active');
       localStorage.setItem('taupe_burn_secs', secs);
     } else {
-      btn.textContent = '(o)';
+      btn.textContent = 'ⴵ';
       btn.classList.remove('active');
       localStorage.removeItem('taupe_burn_secs');
     }
@@ -1496,6 +1512,156 @@ function formatBurnSecs(secs) {
   });
 })();
 
+let EMOJIS = [];
+const egPanel = $('emoji-gif-panel');
+const egSearch = $('eg-search-input');
+const emojiGrid = $('eg-emoji-grid');
+const gifGrid = $('eg-gif-grid');
+
+async function loadEmojis() {
+  try {
+    const res = await fetch('https://raw.githubusercontent.com/muan/emojilib/master/dist/emoji-en-US.json');
+    const data = await res.json();
+    allEmojisData = data;
+    EMOJIS = Object.keys(data);
+    renderEmojis(EMOJIS);
+  } catch (e) { 
+    console.error('Emoji load failed', e); 
+  }
+}
+
+function renderEmojis(emojiList = EMOJIS) {
+  const grid = document.createElement('div');
+  grid.className = 'eg-grid';
+  emojiList.forEach(e => {
+    const span = document.createElement('span');
+    span.className = 'eg-emoji';
+    span.textContent = e;
+    span.onclick = () => {
+      const inp = $('msg-input');
+      inp.value += e;
+      inp.focus();
+    };
+    grid.appendChild(span);
+  });
+  emojiGrid.innerHTML = '';
+  emojiGrid.appendChild(grid);
+}
+
+loadEmojis();
+
+ $('btn-emoji-gif').onclick = (e) => {
+  e.stopPropagation();
+  egPanel.classList.toggle('hidden');
+};
+
+document.addEventListener('click', (e) => {
+  if (!egPanel.classList.contains('hidden') && !egPanel.contains(e.target) && e.target.id !== 'btn-emoji-gif') {
+    egPanel.classList.add('hidden');
+  }
+});
+
+document.querySelectorAll('.eg-tab').forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll('.eg-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    egSearch.placeholder = tab.dataset.tab === 'emoji' ? 'Search...' : 'Search GIFs...';
+    if (tab.dataset.tab === 'emoji') {
+      emojiGrid.classList.remove('hidden');
+      gifGrid.classList.add('hidden');
+    } else {
+      emojiGrid.classList.add('hidden');
+      gifGrid.classList.remove('hidden');
+      if (!gifGrid.innerHTML) loadGifs('hello');
+    }
+  };
+});
+
+let gifSearchTimer;
+let allEmojisData = {};
+
+egSearch.oninput = () => {
+  clearTimeout(gifSearchTimer);
+  const q = egSearch.value.trim().toLowerCase();
+  const activeTab = document.querySelector('.eg-tab.active').dataset.tab;
+  
+  if (activeTab === 'emoji') {
+    const filtered = Object.keys(allEmojisData).filter(emoji => {
+      const keywords = allEmojisData[emoji].join(' ');
+      return keywords.includes(q);
+    });
+    renderEmojis(filtered);
+    return;
+  }
+
+  gifSearchTimer = setTimeout(() => {
+    if (q) loadGifs(q);
+    else loadGifs('hello');
+  }, 400);
+};
+
+let currentGifReqId = 0;
+async function loadGifs(query) {
+  const reqId = ++currentGifReqId;
+  gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Loading...</div>';
+  
+  try {
+    const res = await fetch(`/api/gifs?q=${encodeURIComponent(query)}`);
+    const data = await res.json();
+    
+    if (reqId !== currentGifReqId) return; 
+    
+    if (data.error) throw new Error(data.error);
+    
+    const grid = document.createElement('div');
+    grid.className = 'eg-grid';
+    
+    (data.gifs || []).forEach(url => {
+      const img = document.createElement('img');
+      img.className = 'eg-gif-item';
+      img.src = url;
+      img.loading = 'lazy';
+      img.onclick = () => {
+        sendGif(url);
+        egPanel.classList.add('hidden');
+      };
+      grid.appendChild(img);
+    });
+    
+    gifGrid.innerHTML = '';
+    gifGrid.appendChild(grid);
+  } catch (e) {
+    if (reqId !== currentGifReqId) return;
+    console.error('[GIF]', e);
+    gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Failed to load GIFs.</div>';
+  }
+}
+
+async function sendGif(url) {
+  if (!S.activeChatUid) return;
+  const peerChatNum = await getActivePeerChatNum();
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+  
+  let content = 'gif:' + url;
+  if (peerPub) {
+    try { content = await encryptMsg(content, peerChatNum, peerPub); }
+    catch (e) { console.warn('[E2E] encrypt failed', e); }
+  }
+  
+  S.socket.emit('msg:send', {
+    chatUid: S.activeChatUid,
+    content,
+    fileUrl: null,
+    fileType: null,
+    fileName: null,
+    burnSeconds: S.burnSeconds || null,
+    replyToId: replyTo?.id || null,
+  });
+  
+  S._pendingPlaintext = 'gif:' + url;
+  cancelReply();
+}
+
 async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) {
   if (S.activeBurnTimers.has(msgId)) return;
 
@@ -1515,6 +1681,7 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
         html = `<img class="msg-img" src="${payload.filePath}" loading="lazy">`;
       } else if (payload.fileType === 'file' && payload.filePath) {
         html = `<div class="msg-file">[ <a href="${payload.filePath}" target="_blank" rel="noreferrer">${esc(payload.fileName || 'file')}</a> ]</div>`;
+              
       } else if (payload.content) {
         let text = payload.content;
         if (isEncrypted(text)) {
@@ -1525,7 +1692,13 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
             catch { text = '[decryption failed]'; }
           } else { text = '[encrypted — no key]'; }
         }
-        html = esc(text).replace(/\n/g, '<br>');
+
+        if (typeof text === 'string' && text.startsWith('gif:')) {
+          const gifUrl = text.slice(4);
+          html = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" onload="this.classList.add('loaded')">`;
+        } else {
+          html = esc(text).replace(/\n/g, '<br>');
+        }
       }
       bubble.innerHTML = `<div class="msg-burn-open" data-msg-id="${msgId}">${html}<span class="burn-countdown"></span></div>`;
     }

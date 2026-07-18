@@ -81,13 +81,34 @@
         </div>
 
         <div id="msg-input-area">
-          <label id="btn-attach" class="icon-btn" title="Attach">+
-            <input id="file-input" type="file" accept="image/*,.gif,.webp,.pdf,.txt,.zip" hidden>
-          </label>
-          <button id="btn-burn-timer" class="icon-btn burn-timer-btn" title="Burn timer">(o)</button>
-          <div id="file-preview" class="hidden"></div>
-          <textarea id="msg-input" placeholder="Message" rows="1"></textarea>
-          <button id="btn-send" class="icon-btn send-btn">&#10148;</button>
+          <div id="reply-preview" class="hidden">
+            <div class="reply-preview-name"></div>
+            <div class="reply-preview-text"></div>
+            <button id="reply-close">×</button>
+          </div>
+
+          <div style="display:flex; align-items:flex-end; gap:6px; width:100%;">
+            <button id="btn-emoji-gif" class="icon-btn" style="font-size: 18px; display: flex; align-items: center; justify-content: center;">☺︎</button>
+            
+            <div id="emoji-gif-panel" class="hidden">
+              <div class="eg-tabs">
+                <button class="eg-tab active" data-tab="emoji">Emoji</button>
+                <button class="eg-tab" data-tab="gif">GIF</button>
+              </div>
+              <div class="eg-search">
+                <input type="text" id="eg-search-input" placeholder="Search...">
+              </div>
+              <div class="eg-content" id="eg-emoji-grid"></div>
+              <div class="eg-content hidden" id="eg-gif-grid"></div>
+            </div>
+
+            <button id="btn-burn-timer" class="icon-btn burn-timer-btn" style="font-size: 18px; display: flex; align-items: center; justify-content: center;">ⴵ</button>
+
+            <textarea id="msg-input" rows="1" placeholder="Message..."></textarea>
+            <label class="icon-btn" for="file-input">+</label>
+            <input type="file" id="file-input" class="hidden" />
+            <button id="btn-send" class="icon-btn send-btn">➤</button>
+          </div>
         </div>
         <div id="burn-timer-panel" class="hidden">
           <div class="burn-panel-header">
