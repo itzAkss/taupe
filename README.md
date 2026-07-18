@@ -46,6 +46,8 @@ npm start
 - [x] PWA (deleted for now)
 - [ ] add password on register and login
 - [ ] add lockscreen
+- [ ] add more themes/styles
+- [ ] additional safety checks
 
 ## majors
 - [ ] Develop a mobile app

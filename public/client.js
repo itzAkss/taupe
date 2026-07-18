@@ -1593,48 +1593,66 @@ document.querySelectorAll('.eg-tab').forEach(tab => {
     } else {
       emojiGrid.classList.add('hidden');
       gifGrid.classList.remove('hidden');
-      if (!gifGrid.innerHTML) loadGifs('hello');
+      if (!gifGrid.innerHTML) loadGifs('speed', true);
     }
   };
 });
 
-let gifSearchTimer;
+let currentGifReqId = 0;
+let gifSearchOffset = 0;
+let currentGifQuery = 'speed';
+let isFetchingGifs = false;
 
+let gifSearchTimer;
 egSearch.oninput = () => {
   clearTimeout(gifSearchTimer);
-  const q = egSearch.value.trim().toLowerCase();
+  const q = egSearch.value.trim();
   const activeTab = document.querySelector('.eg-tab.active').dataset.tab;
+  if (activeTab !== 'gif') return;
   
-  if (activeTab === 'emoji') {
-    const filtered = Object.keys(allEmojisData).filter(emoji => {
-      const keywords = allEmojisData[emoji].join(' ');
-      return keywords.includes(q);
-    });
-    renderEmojis(filtered);
-    return;
-  }
-
   gifSearchTimer = setTimeout(() => {
-    if (q) loadGifs(q);
-    else loadGifs('hello');
+    if (q) loadGifs(q, true);
+    else loadGifs('speed', true);
   }, 400);
 };
 
-let currentGifReqId = 0;
-async function loadGifs(query) {
+gifGrid.addEventListener('scroll', () => {
+  if (gifGrid.scrollTop + gifGrid.clientHeight >= gifGrid.scrollHeight - 50) {
+    if (!isFetchingGifs && gifSearchOffset > 0) {
+      loadGifs(currentGifQuery, false);
+    }
+  }
+});
+
+async function loadGifs(query, isNewSearch) {
+  if (isFetchingGifs) return;
+  
+  if (isNewSearch) {
+    currentGifQuery = query;
+    gifSearchOffset = 0;
+    gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Loading...</div>';
+  }
+  
+  isFetchingGifs = true;
   const reqId = ++currentGifReqId;
-  gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Loading...</div>';
   
   try {
-    const res = await fetch(`/api/gifs?q=${encodeURIComponent(query)}`);
+    const res = await fetch(`/api/gifs?q=${encodeURIComponent(currentGifQuery)}&offset=${gifSearchOffset}`);
     const data = await res.json();
     
     if (reqId !== currentGifReqId) return; 
-    
     if (data.error) throw new Error(data.error);
     
-    const grid = document.createElement('div');
-    grid.className = 'eg-grid';
+    if (isNewSearch) {
+      gifGrid.innerHTML = '';
+    }
+    
+    let grid = gifGrid.querySelector('.eg-grid');
+    if (!grid) {
+      grid = document.createElement('div');
+      grid.className = 'eg-grid';
+      gifGrid.appendChild(grid);
+    }
     
     (data.gifs || []).forEach(url => {
       const img = document.createElement('img');
@@ -1648,12 +1666,20 @@ async function loadGifs(query) {
       grid.appendChild(img);
     });
     
-    gifGrid.innerHTML = '';
-    gifGrid.appendChild(grid);
+    gifSearchOffset += (data.gifs || []).length;
+    
+    if ((data.gifs || []).length === 0 && isNewSearch) {
+       gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">No GIFs found.</div>';
+    }
+    
   } catch (e) {
     if (reqId !== currentGifReqId) return;
     console.error('[GIF]', e);
-    gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Failed to load GIFs.</div>';
+    if (isNewSearch) {
+      gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Failed to load GIFs.</div>';
+    }
+  } finally {
+    isFetchingGifs = false;
   }
 }
 

@@ -343,11 +343,12 @@ app.delete('/api/aliases/:number', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-const GIPHY_API_KEY = process.env.GIPHY_KEY || 'API key from giphy';
+const GIPHY_API_KEY = process.env.GIPHY_KEY || 'api';
 
 app.get('/api/gifs', authMiddleware, (req, res) => {
-  const q = req.query.q || 'hello';
-  const url = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(q)}&limit=24&rating=pg`;
+  const q = req.query.q || 'speed';
+  const offset = req.query.offset || 0;
+  const url = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(q)}&limit=30&rating=pg-13&offset=${offset}`;
   
   https.get(url, (apiRes) => {
     let data = '';
