@@ -1,14 +1,29 @@
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-:root {
+:root, [data-theme="dark"] {
   --bg: #0f0f0f; --bg2: #161616; --bg3: #1e1e1e;
   --border: #2a2a2a; --text: #e8e8e8; --text2: #888;
   --accent: #4f8ef7; --accent2: #2d5cc7;
   --danger: #e04444; --warn: #e09a22; --green: #3ecf72;
-  --r: 10px;
-  --sidebar-w: 300px;
+  --r: 10px; --sidebar-w: 300px;
 }
+
+[data-theme="light"] {
+  --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e4e6eb;
+  --border: #ccd0d5; --text: #050505; --text2: #65676b;
+  --accent: #1877f2; --accent2: #166fe5;
+  --danger: #e4263a; --warn: #f0a500; --green: #42b72a;
+}
+
+[data-theme="taupe"] {
+  --bg: #2b2622; --bg2: #38322c; --bg3: #463e36;
+  --border: #574c42; --text: #e6dcd2; --text2: #a8978a;
+  --accent: #d4a373; --accent2: #b08562;
+  --danger: #c75c4e; --warn: #e0a06b; --green: #8ab17d;
+}
+
+[data-theme="custom"] {}
 
 html { height: 100%; font-size: clamp(13px, 1.5vw, 15px); }
 body { height: 100%; background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; overflow: hidden; }
@@ -711,3 +726,12 @@ main#chat-area.mob-hidden { opacity: 0; }
   font-family: monospace;
 }
 .verify-input-row input:focus { outline: none; border-color: var(--accent); }
+
+.theme-btn {
+  padding: 10px; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); cursor: pointer; font-size: 13px; transition: .1s;
+}
+.theme-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.custom-color-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--text2); }
+.custom-color-row input { width: 40px; height: 28px; border: 1px solid var(--border); border-radius: 4px; cursor: pointer; background: none; padding: 0; }

@@ -1809,6 +1809,58 @@ document.querySelectorAll('.skip-btn').forEach(btn => {
   };
 });
 
+function applyTheme(theme) {
+  localStorage.setItem('taupe_theme', theme);
+  
+  if (theme === 'system') {
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+  } else if (theme === 'custom') {
+    document.documentElement.setAttribute('data-theme', 'custom');
+    const custom = JSON.parse(localStorage.getItem('taupe_custom_theme') || '{}');
+    const root = document.documentElement.style;
+    root.setProperty('--bg', custom.bg || '#0f0f0f');
+    root.setProperty('--bg2', custom.bg2 || '#161616');
+    root.setProperty('--bg3', custom.bg3 || '#1e1e1e');
+    root.setProperty('--accent', custom.accent || '#4f8ef7');
+    root.setProperty('--text', custom.text || '#e8e8e8');
+    root.setProperty('--border', custom.border || '#2a2a2a');
+  } else {
+    document.documentElement.setAttribute('data-theme', theme);
+  }
+
+  document.querySelectorAll('.theme-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.setTheme === theme);
+  });
+  
+  $('custom-theme-editor').classList.toggle('hidden', theme !== 'custom');
+}
+
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if (localStorage.getItem('taupe_theme') === 'system') applyTheme('system');
+});
+
+ $('btn-theme').onclick = () => {
+  applyTheme(localStorage.getItem('taupe_theme') || 'dark');
+  show($('modal-theme'));
+};
+ $('theme-close').onclick = () => hide($('modal-theme'));
+
+document.querySelectorAll('.theme-btn').forEach(btn => {
+  btn.onclick = () => applyTheme(btn.dataset.setTheme);
+});
+
+document.querySelectorAll('#custom-theme-editor input').forEach(inp => {
+  inp.oninput = () => {
+    const custom = JSON.parse(localStorage.getItem('taupe_custom_theme') || '{}');
+    custom[inp.id.replace('c-', '')] = inp.value;
+    localStorage.setItem('taupe_custom_theme', JSON.stringify(custom));
+    applyTheme('custom');
+  };
+});
+
+applyTheme(localStorage.getItem('taupe_theme') || 'dark');
+
 async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) {
   if (S.activeBurnTimers.has(msgId)) return;
 

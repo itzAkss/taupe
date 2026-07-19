@@ -5,6 +5,7 @@ messenger.db-shm
 
 # secret
 .jwt_secret
+.env
 
 # userdata
 uploads/
@@ -14,7 +15,6 @@ cert/
 
 # Dependencies
 node_modules/
-package-lock.json
 
 # Logs
 *.log
