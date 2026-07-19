@@ -17,6 +17,7 @@ try {
 }
 const selfsigned = require('selfsigned');
 const DB = require('./db');
+require('dotenv').config();
 
 function validateFileMagic(filePath, mimetype) {
   if (!mimetype.startsWith('image/')) return true;
