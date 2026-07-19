@@ -664,3 +664,50 @@ main#chat-area.mob-hidden { opacity: 0; }
 }
 
 .tab-content { animation: fadeIn .2s ease; }
+
+.blur-number span { 
+  filter: blur(10px); 
+  transition: filter 0.2s; 
+  user-select: none;
+}
+.blur-number.revealed span { 
+  filter: none; 
+  user-select: text;
+}
+
+.skip-btn {
+  position: absolute;
+  top: 12px;
+  right: 15px;
+  background: none; 
+  border: none; 
+  color: var(--text2);
+  cursor: pointer; 
+  font-size: 11px; 
+  opacity: 0.6;
+  text-decoration: underline;
+}
+.skip-btn:hover { color: var(--text); opacity: 1; }
+
+.verify-input-row {
+  display: flex; 
+  align-items: center; 
+  gap: 15px;
+}
+.verify-input-row label { 
+  font-size: 13px; 
+  color: var(--text2); 
+  width: 90px; 
+}
+.verify-input-row input {
+  background: var(--bg3); 
+  border: 1px solid var(--border); 
+  border-radius: 6px;
+  color: var(--text); 
+  padding: 10px; 
+  width: 50px; 
+  text-align: center; 
+  font-size: 18px;
+  font-family: monospace;
+}
+.verify-input-row input:focus { outline: none; border-color: var(--accent); }

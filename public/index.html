@@ -36,6 +36,39 @@
     </div>
   </div>
 
+  <div id="modal-save-number" class="modal hidden">
+    <div class="modal-box">
+      <button class="skip-btn" id="btn-skip-check-1">>></button>
+      <h2>Save your Private Number</h2>
+      <p class="hint" style="margin-bottom: 15px;">This 16-digit number is your only password. Store it safely. You will need it to log in. Click to reveal</p>
+      
+      <div class="number-display-box blur-number" id="save-number-box" style="cursor: pointer; margin-bottom: 20px; font-size: 18px; letter-spacing: 2px; justify-content: center;">
+        <span id="save-number-text"></span>
+      </div>
+      
+      <div style="display: flex; gap: 8px; margin-bottom: 20px;">
+        <button class="btn-ghost" style="flex:1" id="btn-copy-save-number">Copy</button>
+        <button class="btn-ghost" style="flex:1" id="btn-download-save-number">Download .txt</button>
+      </div>
+      
+      <button class="btn-primary full" id="btn-proceed-check">Proceed</button>
+    </div>
+  </div>
+
+  <div id="modal-verify-number" class="modal hidden">
+    <div class="modal-box">
+      <button class="skip-btn" id="btn-skip-check-2">>></button>
+      <h2>Verify your Number</h2>
+      <p class="hint" style="margin-bottom: 15px;">Enter the digits at the requested positions.</p>
+      
+      <div id="verify-inputs-container" style="display: flex; flex-direction: column; gap: 12px; margin-bottom: 15px;">
+      </div>
+      
+      <div id="verify-error" class="error-msg" style="margin-bottom: 15px;"></div>
+      
+      <button class="btn-primary full" id="btn-verify-check">Confirm</button>
+    </div>
+  </div>
 
   <div id="screen-main" class="screen">
 

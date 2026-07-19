@@ -47,7 +47,7 @@ npm start
 - [ ] add password on register and login
 - [ ] add lockscreen
 - [ ] add more themes/styles
-- [ ] additional safety checks
+- [x] additional safety checks
 
 ## majors
 - [ ] Develop a mobile app

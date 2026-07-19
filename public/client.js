@@ -87,13 +87,23 @@ async function api(method, path, body) {
   }
 }
 
-$('btn-register').onclick = async () => {
+let pendingAccountData = null;
+
+ $('btn-register').onclick = async () => {
   $('auth-error').textContent = '';
   const d = await api('POST', '/api/register');
   if (d.error) { $('auth-error').textContent = d.error; return; }
-  localStorage.setItem('lastNumber', d.accountNumber);
-  await bootApp(d, true);
-  toast('Account created', `Private: ${fmtPrivate(d.accountNumber)}  Chat: ${fmtNum(d.chatNumber)}`, 'key', 0);
+  
+  if (localStorage.getItem('taupe_check_done') === 'true') {
+    localStorage.setItem('lastNumber', d.accountNumber);
+    await bootApp(d, true);
+    toast('Welcome to taupe', '', 'ok', 5000);
+    return;
+  }
+
+  pendingAccountData = d;
+  $('save-number-text').textContent = fmtPrivate(d.accountNumber);
+  show($('modal-save-number'));
 };
 
 $('btn-login').onclick = async () => {
@@ -1707,6 +1717,97 @@ async function sendGif(url) {
   S._pendingPlaintext = 'gif:' + url;
   cancelReply();
 }
+
+ $('save-number-box').onclick = () => {
+  $('save-number-box').classList.toggle('revealed');
+};
+
+ $('btn-copy-save-number').onclick = () => {
+  navigator.clipboard.writeText(pendingAccountData.accountNumber);
+  toast('Copied', 'Private number copied to clipboard', 'warn', 2000);
+};
+
+ $('btn-download-save-number').onclick = () => {
+  const text = `Taupe Private Number: ${pendingAccountData.accountNumber}\nDO NOT SHARE THIS WITH ANYONE.`;
+  const blob = new Blob([text], {type: "text/plain"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'taupe_keys.txt';
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('Downloaded', 'Save this file in a safe place', 'ok', 2000);
+};
+
+ $('btn-proceed-check').onclick = () => {
+  hide($('modal-save-number'));
+  startVerificationStep();
+};
+
+let verifyPositions = [];
+
+function startVerificationStep() {
+  verifyPositions = [];
+  while(verifyPositions.length < 3) {
+    let r = Math.floor(Math.random() * 16) + 1;
+    if(!verifyPositions.includes(r)) verifyPositions.push(r);
+  }
+  verifyPositions.sort((a,b) => a-b);
+
+  const container = $('verify-inputs-container');
+  container.innerHTML = '';
+  
+  verifyPositions.forEach(pos => {
+    const row = document.createElement('div');
+    row.className = 'verify-input-row';
+    row.innerHTML = `<label>Digit ${pos}:</label><input type="text" maxlength="1" inputmode="numeric" data-pos="${pos}">`;
+    container.appendChild(row);
+  });
+  
+  $('verify-error').textContent = '';
+  show($('modal-verify-number'));
+}
+
+ $('btn-verify-check').onclick = () => {
+  const inputs = $('verify-inputs-container').querySelectorAll('input');
+  let isValid = true;
+  
+  inputs.forEach(inp => {
+    const pos = parseInt(inp.dataset.pos);
+    const expectedDigit = pendingAccountData.accountNumber[pos - 1];
+    if (inp.value.trim() !== expectedDigit) {
+      isValid = false;
+    }
+  });
+
+  if (isValid) {
+    finishSecurityCheck();
+  } else {
+    $('verify-error').textContent = 'Incorrect digits. Please check your number and try again.';
+    inputs.forEach(inp => inp.value = '');
+  }
+};
+
+function finishSecurityCheck() {
+  localStorage.setItem('taupe_check_done', 'true');
+  hide($('modal-verify-number'));
+  localStorage.setItem('lastNumber', pendingAccountData.accountNumber);
+  bootApp(pendingAccountData, true);
+  toast('Welcome to taupe', '', 'ok', 5000);
+}
+
+document.querySelectorAll('.skip-btn').forEach(btn => {
+  btn.onclick = () => {
+    localStorage.setItem('taupe_check_done', 'true');
+    hide($('modal-save-number'));
+    hide($('modal-verify-number'));
+    if (pendingAccountData) {
+      localStorage.setItem('lastNumber', pendingAccountData.accountNumber);
+      bootApp(pendingAccountData, true);
+    }
+    toast('Welcome to taupe', '', 'ok', 5000);
+  };
+});
 
 async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) {
   if (S.activeBurnTimers.has(msgId)) return;
