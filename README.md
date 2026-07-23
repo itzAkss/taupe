@@ -56,7 +56,7 @@ npm start
 - [x] fix avatar editor
 - [x] add reply to msg
 - [ ] add voice messages
-- [ ] add reactions
+- [x] add reactions
 - [x] add gifs scroller (+ emojis)
 - [ ] video support
 - [x] favicon.ico

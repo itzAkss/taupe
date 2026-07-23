@@ -26,6 +26,13 @@ const $   = id => document.getElementById(id);
 const show = el => el?.classList.remove('hidden');
 const hide = el => el?.classList.add('hidden');
 
+const twemojiSafe = (str) => {
+  if (window.twemoji && typeof twemoji.parse === 'function') {
+    return twemoji.parse(str);
+  }
+  return str;
+};
+
 function dialog({ title, body, input, inputPlaceholder, inputDefault, inputType, okText = 'OK', cancelText = 'Cancel', danger = false }) {
   return new Promise(resolve => {
     $('dialog-title').textContent = title || '';
@@ -322,7 +329,46 @@ function connectSocket() {
     if (S.activeChatUid) updateChatPreviewUI(S.activeChatUid, myPreview ?? '');
   });
 
-      S.socket.on('chat:deleted', ({ chatUid, forWhom, by }) => {
+  S.socket.on('msg:reaction', ({ msgId, reactions }) => {
+    const wrap = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`)?.closest('.msg-wrap');
+    if (!wrap) return;
+
+    let reactionsBar = wrap.querySelector('.msg-reactions');
+    
+    const grouped = {};
+    reactions.forEach(r => {
+      grouped[r.emoji] = grouped[r.emoji] || [];
+      grouped[r.emoji].push(r.account_id);
+    });
+
+    if (Object.keys(grouped).length === 0) {
+      if (reactionsBar) reactionsBar.remove();
+      return;
+    }
+
+    if (!reactionsBar) {
+      reactionsBar = document.createElement('div');
+      reactionsBar.className = 'msg-reactions';
+      wrap.appendChild(reactionsBar);
+    }
+    
+    reactionsBar.innerHTML = '';
+    for (const [emoji, users] of Object.entries(grouped)) {
+      const isMine = users.includes(Number(S.account.accountId));
+      const btn = document.createElement('button');
+      btn.className = `msg-reaction ${isMine ? 'mine' : ''}`;
+      btn.dataset.msgId = msgId;
+      btn.dataset.emoji = emoji;
+      btn.innerHTML = `${twemoji.parse(emoji)} <span>${users.length}</span>`;
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        S.socket.emit('msg:react', { msgId, emoji });
+      };
+      reactionsBar.appendChild(btn);
+    }
+  });
+
+  S.socket.on('chat:deleted', ({ chatUid, forWhom, by }) => {
     const isMe = String(by) === String(S.account.accountId);
     if (forWhom === 'both' || (forWhom === 'peer' && !isMe)) {
       const chatEl = document.querySelector(`.chat-item[data-uid="${chatUid}"]`);
@@ -510,6 +556,15 @@ async function openChat(uid) {
     navigator.clipboard.writeText(peerChatNum);
     toast('Copied', fmtNum(peerChatNum), 'ok', 1500);
   };
+
+  const avatarSrc = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
+  const headerAvatar = $('chat-header-avatar');
+  if (avatarSrc) {
+    headerAvatar.src = avatarSrc;
+    headerAvatar.classList.remove('hidden');
+  } else {
+    headerAvatar.classList.add('hidden');
+  }
 
   let peerPub = await getPeerKey(peerChatNum);
   if (!peerPub) {
@@ -718,7 +773,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
                 const gifUrl = text.slice(4);
                 content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
               } else {
-                content = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
+                content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
               }
             }
       const burnLabel = formatBurnSecs(msg.burn_seconds);
@@ -751,11 +806,35 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   const isEncryptedPayload = isEncrypted(msg.content) || (msg.file_path && msg.file_path.endsWith('.bin'));
   const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted">#</span>' : '';
 
+  let reactionsHtml = '';
+  if (msg.reactions && msg.reactions.length > 0) {
+    const grouped = {};
+    msg.reactions.forEach(r => {
+      grouped[r.emoji] = grouped[r.emoji] || [];
+      grouped[r.emoji].push(r.account_id);
+    });
+    
+    reactionsHtml = '<div class="msg-reactions">';
+    for (const [emoji, users] of Object.entries(grouped)) {
+      const isMine = users.includes(Number(S.account.accountId));
+      reactionsHtml += `<button class="msg-reaction ${isMine ? 'mine' : ''}" data-msg-id="${msg.id}" data-emoji="${emoji}">${twemoji.parse(emoji)} <span>${users.length}</span></button>`;
+    }
+    reactionsHtml += '</div>';
+  }
+
   inner += `
     <div class="msg-bubble ${isMe ? 'me' : 'them'}" data-msg-id="${msg.id}">${replyHtml}${content}</div>
     <div class="msg-meta ${isMe ? 'me' : 'them'}">${lockIcon}<span>${time}</span>${tick}</div>
+    ${reactionsHtml}
   `;
   wrap.innerHTML = inner;
+
+  wrap.querySelectorAll('.msg-reaction').forEach(btn => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      S.socket.emit('msg:react', { msgId: parseInt(btn.dataset.msgId), emoji: btn.dataset.emoji });
+    };
+  });
 
   const replyDiv = wrap.querySelector('.msg-reply');
   if (replyDiv && msg.reply_to_id) {
@@ -884,11 +963,60 @@ function renderSystemMessage(text) {
   scrollBottom();
 }
 
+const quick_reacts = ['❤️', '👍', '🔥', '😂', '😱', '😭'];
+let pendingReactionMsgId = null;
+
+function getRecentReactions() {
+  const saved = localStorage.getItem('taupe_recent_reactions');
+  return saved ? JSON.parse(saved) : [...quick_reacts];
+}
+
+function addRecentReaction(emoji) {
+  let recent = getRecentReactions();
+  recent = recent.filter(e => e !== emoji);
+  recent.unshift(emoji);
+  if (recent.length > 6) recent = recent.slice(0, 6);
+  localStorage.setItem('taupe_recent_reactions', JSON.stringify(recent));
+}
+
 function showMsgCtx(e, msgId, isMe) {
   removeCtx();
   const menu = document.createElement('div');
   menu.className = 'ctx-menu'; menu.id = 'ctx-menu';
   
+  const reactBar = document.createElement('div');
+  reactBar.className = 'ctx-reactions';
+  
+  const recent = getRecentReactions();
+  recent.forEach(emoji => {
+    const btn = document.createElement('button');
+    btn.className = 'ctx-react-btn';
+    btn.innerHTML = twemojiSafe(emoji);
+    btn.onclick = (ev) => { 
+      ev.stopPropagation();
+      addRecentReaction(emoji);
+      S.socket.emit('msg:react', { msgId, emoji }); 
+      removeCtx(); 
+    };
+    reactBar.appendChild(btn);
+  });
+
+  const plusBtn = document.createElement('button');
+  plusBtn.className = 'ctx-react-btn';
+  plusBtn.style.fontSize = '20px';
+  plusBtn.style.color = 'var(--text2)';
+  plusBtn.textContent = '+';
+  plusBtn.onclick = (ev) => {
+    ev.stopPropagation();
+    pendingReactionMsgId = msgId;
+    removeCtx();
+    document.querySelector('.eg-tab[data-tab="emoji"]').click();
+    egSearch.value = '';
+    egPanel.classList.remove('hidden');
+  };
+  reactBar.appendChild(plusBtn);
+  menu.appendChild(reactBar);
+
   const items = isMe
     ? [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for peer', 'peer', false], ['Delete for both', 'both', true]]
     : [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for both', 'both', true]];
@@ -898,22 +1026,34 @@ function showMsgCtx(e, msgId, isMe) {
     d.className = 'ctx-item' + (danger ? ' danger' : '');
     d.textContent = lbl;
     d.onclick = () => {
-      if (action === 'reply') {
-        setReplyTo(msgId);
-      } else {
-        S.socket.emit('msg:delete', { msgId, forWhom: action });
-      }
+      if (action === 'reply') setReplyTo(msgId);
+      else S.socket.emit('msg:delete', { msgId, forWhom: action });
       removeCtx();
     };
     menu.appendChild(d);
   });
-  
+
   const x = Math.min(e.clientX ?? 100, window.innerWidth - 190);
   const y = Math.min(e.clientY ?? 100, window.innerHeight - 130);
   menu.style.left = x + 'px'; menu.style.top = y + 'px';
   document.body.appendChild(menu);
+
+  const rect = menu.getBoundingClientRect();
+  let finalX = e.clientX ?? 100;
+  let finalY = e.clientY ?? 100;
+  if (finalX + rect.width > window.innerWidth - 20) {
+    finalX = window.innerWidth - rect.width - 20;
+  }
+  if (finalY + rect.height > window.innerHeight - 10) {
+    finalY = window.innerHeight - rect.height - 10;
+  }
+  if (finalX < 10) finalX = 10;
+  if (finalY < 10) finalY = 10;
+  menu.style.left = finalX + 'px';
+  menu.style.top = finalY + 'px';
   setTimeout(() => document.addEventListener('click', removeCtx, { once: true }), 40);
 }
+
 function removeCtx() { $('ctx-menu')?.remove(); }
 
 $('btn-send').onclick = () => {
@@ -1569,9 +1709,16 @@ function renderEmojis(emojiList = EMOJIS) {
     span.className = 'eg-emoji';
     span.innerHTML = twemoji.parse(e);
     span.onclick = () => {
-      const inp = $('msg-input');
-      inp.value += e;
-      inp.focus();
+      if (pendingReactionMsgId) {
+        addRecentReaction(e); 
+        S.socket.emit('msg:react', { msgId: pendingReactionMsgId, emoji: e });
+        pendingReactionMsgId = null;
+        egPanel.classList.add('hidden');
+      } else {
+        const inp = $('msg-input');
+        inp.value += e;
+        inp.focus();
+      }
     };
     grid.appendChild(span);
   });
@@ -1589,6 +1736,7 @@ loadEmojis();
 document.addEventListener('click', (e) => {
   if (!egPanel.classList.contains('hidden') && !egPanel.contains(e.target) && e.target.id !== 'btn-emoji-gif') {
     egPanel.classList.add('hidden');
+    pendingReactionMsgId = null;
   }
 });
 
@@ -1811,6 +1959,10 @@ document.querySelectorAll('.skip-btn').forEach(btn => {
 
 function applyTheme(theme) {
   localStorage.setItem('taupe_theme', theme);
+  
+  if (theme !== 'custom') {
+    document.documentElement.style.cssText = '';
+  }
   
   if (theme === 'system') {
     const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;

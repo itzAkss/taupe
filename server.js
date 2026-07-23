@@ -638,6 +638,26 @@ io.on('connection', socket => {
     }
   });
 
+  socket.on('msg:react', ({ msgId, emoji }) => {
+    if (!emoji || emoji.length > 10) return;
+    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
+    if (!msg) return;
+    
+    const chat = DB.getChatById(msg.chat_id);
+    if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
+
+    const existing = DB.db.prepare('SELECT 1 FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').get(msgId, aid, emoji);
+    
+    if (existing) {
+      DB.db.prepare('DELETE FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').run(msgId, aid, emoji);
+    } else {
+      DB.db.prepare('INSERT INTO reactions (message_id, account_id, emoji) VALUES (?,?,?)').run(msgId, aid, emoji);
+    }
+
+    const reactions = DB.db.prepare('SELECT account_id, emoji FROM reactions WHERE message_id=?').all(msgId);
+    io.to(roomForChat(chat.uid)).emit('msg:reaction', { msgId, reactions });
+  });
+
   socket.on('chat:join', ({ chatUid }) => {
     const chat = DB.getChatByUid(chatUid);
     if (!chat) return;

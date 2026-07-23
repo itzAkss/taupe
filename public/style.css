@@ -735,3 +735,58 @@ main#chat-area.mob-hidden { opacity: 0; }
 
 .custom-color-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--text2); }
 .custom-color-row input { width: 40px; height: 28px; border: 1px solid var(--border); border-radius: 4px; cursor: pointer; background: none; padding: 0; }
+
+img#chat-header-avatar { 
+  display: none !important; 
+}
+
+@media (max-width: 640px) {
+  img#chat-header-avatar:not(.hidden) { 
+    display: block !important; 
+  }
+}
+
+.msg-reactions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.msg-reaction {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text);
+  transition: .1s;
+}
+.msg-reaction:hover { border-color: var(--text2); }
+.msg-reaction.mine {
+  background: rgba(79,142,247,0.15);
+  border-color: var(--accent);
+}
+.msg-reaction img.emoji { width: 16px; height: 16px; }
+
+.ctx-reactions {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.ctx-react-btn {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  width: 34px; height: 34px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform .1s;
+}
+.ctx-react-btn:hover { transform: scale(1.1); border-color: var(--accent); }
+.ctx-react-btn img.emoji { width: 20px; height: 20px; }

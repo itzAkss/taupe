@@ -98,6 +98,14 @@ db.exec(`
     blocked_until INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
+
+  CREATE TABLE IF NOT EXISTS reactions (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    emoji TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (message_id, account_id, emoji)
+  );
 `);
 
 db.exec(`
@@ -328,7 +336,23 @@ function getMessages(chatId, accountId, { beforeId = null, limit = 200 } = {}) {
   sql += ` ORDER BY id DESC LIMIT ?`;
   params.push(limit);
 
-  return db.prepare(sql).all(...params).reverse();
+  const messages = db.prepare(sql).all(...params).reverse();
+  
+  if (messages.length > 0) {
+    const ids = messages.map(m => m.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const reactions = db.prepare(`SELECT message_id, account_id, emoji FROM reactions WHERE message_id IN (${placeholders})`).all(...ids);
+    
+    const map = {};
+    reactions.forEach(r => {
+      if (!map[r.message_id]) map[r.message_id] = [];
+      map[r.message_id].push({ account_id: r.account_id, emoji: r.emoji });
+    });
+    
+    return messages.map(m => ({ ...m, reactions: map[m.id] || [] }));
+  }
+
+  return messages;
 }
 function addMessage(chatId, senderId, content, filePath, fileType, fileName, burnSeconds, replyToId) {
   const r = db.prepare(`
