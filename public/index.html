@@ -141,9 +141,19 @@
             <button id="btn-burn-timer" class="icon-btn burn-timer-btn" style="font-size: 18px; display: flex; align-items: center; justify-content: center;">ⴵ</button>
 
             <textarea id="msg-input" rows="1" placeholder="Message..."></textarea>
-            <label class="icon-btn" for="file-input">+</label>
+            <button id="btn-mic" class="icon-btn" style="font-size: 18px; display: flex; align-items: center; justify-content: center;">ᯤ</button>
+            <label class="icon-btn" for="file-input" style="font-size: 18px; display: flex; align-items: center; justify-content: center;">+</label>
             <input type="file" id="file-input" class="hidden" />
             <button id="btn-send" class="icon-btn send-btn">➤</button>
+          </div>
+
+          <div id="record-ui">
+            <span id="record-timer" class="mono">00:00.00</span>
+            <div style="color: var(--danger); font-size: 12px; flex:1; display:flex; align-items:center; gap:5px;">
+              <span class="rec-dot"></span> REC
+            </div>
+            <button id="btn-cancel-record" class="icon-btn" style="color:var(--danger)">✖</button>
+            <button id="btn-stop-record" class="icon-btn" style="color:var(--accent)">➤</button>
           </div>
         </div>
         <div id="burn-timer-panel" class="hidden">

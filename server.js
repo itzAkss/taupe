@@ -573,7 +573,7 @@ io.on('connection', socket => {
     if (isPeer && chat.deleted_by_peer) return;
     const secs = burnSeconds > 0 ? Math.max(5, Math.min(3600, parseInt(burnSeconds))) : null;
     const msg = DB.addMessage(chat.id, aid, content, fileUrl||null, fileType||null, fileName||null, secs, replyToId);
-    const preview = secs ? '[burns after read]' : (content ? content.slice(0,60) : (fileType==='image'?'[image]':'[file]'));
+    const preview = secs ? '[burns after read]' : (content ? content.slice(0,60) : (fileType==='image'?'📷 Image':(fileType==='audio'?'ᯤ Voice':'📎 File')));
     io.to(roomForChat(chatUid)).emit('msg:new', { chatUid, msg, preview });
 
     const trimmed = DB.enforceMaxMessages(chat.id);
@@ -656,6 +656,16 @@ io.on('connection', socket => {
 
     const reactions = DB.db.prepare('SELECT account_id, emoji FROM reactions WHERE message_id=?').all(msgId);
     io.to(roomForChat(chat.uid)).emit('msg:reaction', { msgId, reactions });
+  });
+
+  socket.on('msg:played', ({ msgId }) => {
+    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
+    if (!msg) return;
+    const chat = DB.getChatById(msg.chat_id);
+    if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
+    
+    DB.db.prepare('UPDATE messages SET is_played=1 WHERE id=?').run(msgId);
+    io.to(roomForChat(chat.uid)).emit('msg:played', { msgId });
   });
 
   socket.on('chat:join', ({ chatUid }) => {

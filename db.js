@@ -142,6 +142,8 @@ try {
     db.exec('ALTER TABLE messages ADD COLUMN burn_at INTEGER');
   if (!cols.some(c => c.name === 'reply_to_id'))
     db.exec('ALTER TABLE messages ADD COLUMN reply_to_id INTEGER');
+  if (!cols.some(c => c.name === 'is_played'))
+    db.exec('ALTER TABLE messages ADD COLUMN is_played INTEGER NOT NULL DEFAULT 0');
 } catch (e) {
   console.error('[migration] columns check failed:', e.message);
 }

@@ -251,7 +251,8 @@ function connectSocket() {
 
   S.socket.on('connect', () => {
     hideUnstable();
-    $('e2e-indicator').title = 'E2E active';
+    const indicator = $('e2e-indicator');
+    if (indicator) indicator.title = 'E2E active';
   });
   S.socket.on('disconnect', () => { if (!S.ignored) showUnstable(); });
   S.socket.on('connect_error', () => { if (!S.ignored) showUnstable(); });
@@ -366,6 +367,11 @@ function connectSocket() {
       };
       reactionsBar.appendChild(btn);
     }
+  });
+
+  S.socket.on('msg:played', ({ msgId }) => {
+    const dot = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"] .audio-unplayed`);
+    if (dot) dot.remove();
   });
 
   S.socket.on('chat:deleted', ({ chatUid, forWhom, by }) => {
@@ -697,8 +703,17 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   if (!cont) return;
   const myId  = S.account.accountId;
   const isMe  = msg.sender_id == myId;
-  const prev  = cont.lastElementChild;
-  const showLabel = prev?.dataset.sender !== String(msg.sender_id);
+
+  let prevWrap = null;
+  if (msg._prepend) {
+    prevWrap = cont.firstElementChild;
+  } else {
+    prevWrap = cont.lastElementChild;
+  }
+  
+  const showLabel = prevWrap?.dataset.sender !== String(msg.sender_id);
+  const prevTime = prevWrap ? parseInt(prevWrap.dataset.ts || '0') : 0;
+  const showTime = !prevWrap || prevWrap.dataset.sender !== String(msg.sender_id) || (Math.floor(prevTime / 60) !== Math.floor(msg.created_at / 60));
 
   const wrap = document.createElement('div');
   wrap.className = 'msg-wrap ' + (isMe ? 'me' : 'them');
@@ -719,7 +734,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     inner += `<button class="msg-sender-label" data-num="${peerChatNum}" title="Copy number">${lbl}</button>`;
   }
 
-    let replyHtml = '';
+  let replyHtml = '';
   if (msg.reply_to_id) {
     try {
       const origMsg = await api('GET', `/api/messages/${msg.reply_to_id}`);
@@ -742,8 +757,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         } else {
           senderName = getPeerDisplayName(c);
         }
-        
-        replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${twemoji.parse(esc(origText || '[Media]'))}</div></div>`;
+        replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${twemojiSafe(esc(origText || '[Media]'))}</div></div>`;
       } else {
         replyHtml = `<div class="msg-reply"><div class="msg-reply-text">[Deleted message]</div></div>`;
       }
@@ -752,59 +766,80 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
 
   let content = '';
   const hasBurn = !!msg.burn_seconds;
-  const isFile  = (msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path;
+  const isFile  = (msg.file_type === 'image' || msg.file_type === 'file' || msg.file_type === 'audio') && msg.file_path;
 
   if (hasBurn && !msg._spoilerOpened) {
-
     if (isMe) {
+      if (isFile) {
+        content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe);
+      } else if (msg.content) {
+        let text = msg._plaintext || msg.content;
+        if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
+          try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
+          catch { text = '[decryption failed]'; }
+        } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted — no key]'; }
 
-      if ((msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path) {
-        content = await buildFileHtml(msg, decryptChatNum, decryptKeys);
-            } else if (msg.content) {
-              let text = msg._plaintext || msg.content;
-              if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
-                try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
-                catch { text = '[decryption failed]'; }
-              } else if (!msg._plaintext && isEncrypted(text)) {
-                text = '[encrypted — no key]';
-              }
-
-              if (typeof text === 'string' && text.startsWith('gif:')) {
-                const gifUrl = text.slice(4);
-                content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
-              } else {
-                content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
-              }
-            }
+        if (typeof text === 'string' && text.startsWith('gif:')) {
+          const gifUrl = text.slice(4);
+          content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+        } else {
+          content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
+        }
+      }
       const burnLabel = formatBurnSecs(msg.burn_seconds);
-      content = `<div class="msg-burn-open" data-msg-id="${msg.id}">${content}<span class="burn-countdown">${burnLabel}</span></div>`;
+      content = `<div class="msg-burn-open" data-msg-id="${msg.id}">${content}</div>`;
     } else {
-
       const burnLabel = formatBurnSecs(msg.burn_seconds);
       content = `<button class="msg-spoiler" data-msg-id="${msg.id}" data-chat-uid="${S.activeChatUid}" data-burn-secs="${msg.burn_seconds}">Show (${burnLabel})</button>`;
     }
-  } else if ((msg.file_type === 'image' || msg.file_type === 'file') && msg.file_path) {
-    content = await buildFileHtml(msg, decryptChatNum, decryptKeys);
-    } else if (msg.content) {
+  } else if (isFile) {
+    content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe);
+  } else if (msg.content) {
     let text = msg._plaintext || msg.content;
     if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
       try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
       catch { text = '[decryption failed]'; }
-    } else if (!msg._plaintext && isEncrypted(text)) {
-      text = '[encrypted — no key]';
-    }
+    } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted — no key]'; }
     if (typeof text === 'string' && text.startsWith('gif:')) {
       const gifUrl = text.slice(4);
       content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
     } else {
-      content = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
+      content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
     }
   }
 
   const time = new Date(msg.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  const tick = isMe ? `<span class="read-tick ${msg.is_read ? 'read' : ''}">✓✓</span>` : '';
+  let tickHtml = '';
+  if (isMe) {
+    if (msg.is_read) {
+      tickHtml = '<span class="read-tick read">✓✓</span>';
+    } else {
+      tickHtml = '<span class="read-tick">✓</span>';
+    }
+  }
+  
   const isEncryptedPayload = isEncrypted(msg.content) || (msg.file_path && msg.file_path.endsWith('.bin'));
   const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted">#</span>' : '';
+  
+  const burnHtml = (hasBurn && !msg._spoilerOpened) ? `<span class="burn-countdown">${formatBurnSecs(msg.burn_seconds)}</span>` : '';
+  const metaHtml = `<span class="msg-meta-inline">${burnHtml}${lockIcon}${showTime ? `<span>${time}</span>` : ''}${tickHtml}</span>`;
+  const isMediaContent = content.includes('<img') || content.includes('msg-audio-player');
+  const isAudio = content.includes('msg-audio-player');
+  
+  let bubbleContent = content;
+  let bubbleClasses = `msg-bubble ${isMe ? 'me' : 'them'}`;
+  
+  if (isMediaContent) {
+    bubbleClasses += ' is-media';
+    if (isAudio) {
+      bubbleClasses += ' has-audio';
+      bubbleContent = `<div class="msg-media-wrap">${content}${metaHtml}</div>`;
+    } else {
+      bubbleContent = `<div class="msg-media-wrap">${content}${metaHtml}</div>`;
+    }
+  } else {
+    bubbleContent = `<div class="msg-text-content">${content}</div>${metaHtml}`;
+  }
 
   let reactionsHtml = '';
   if (msg.reactions && msg.reactions.length > 0) {
@@ -813,21 +848,21 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       grouped[r.emoji] = grouped[r.emoji] || [];
       grouped[r.emoji].push(r.account_id);
     });
-    
     reactionsHtml = '<div class="msg-reactions">';
     for (const [emoji, users] of Object.entries(grouped)) {
       const isMine = users.includes(Number(S.account.accountId));
-      reactionsHtml += `<button class="msg-reaction ${isMine ? 'mine' : ''}" data-msg-id="${msg.id}" data-emoji="${emoji}">${twemoji.parse(emoji)} <span>${users.length}</span></button>`;
+      reactionsHtml += `<button class="msg-reaction ${isMine ? 'mine' : ''}" data-msg-id="${msg.id}" data-emoji="${emoji}">${twemojiSafe(emoji)} <span>${users.length}</span></button>`;
     }
     reactionsHtml += '</div>';
   }
 
   inner += `
-    <div class="msg-bubble ${isMe ? 'me' : 'them'}" data-msg-id="${msg.id}">${replyHtml}${content}</div>
-    <div class="msg-meta ${isMe ? 'me' : 'them'}">${lockIcon}<span>${time}</span>${tick}</div>
+    <div class="${bubbleClasses}" data-msg-id="${msg.id}">${replyHtml}${bubbleContent}</div>
     ${reactionsHtml}
   `;
   wrap.innerHTML = inner;
+
+  wrap.querySelectorAll('.msg-audio-player').forEach(p => initAudioPlayer(p, msg, isMe));
 
   wrap.querySelectorAll('.msg-reaction').forEach(btn => {
     btn.onclick = (ev) => {
@@ -860,7 +895,6 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   if (spoiler) {
     spoiler.addEventListener('click', () => {
       S.socket?.emit('msg:spoiler:open', { msgId: msg.id, chatUid: S.activeChatUid });
-
       spoiler.innerHTML = '<span style="opacity:.5;font-size:12px">Opening…</span>';
     });
   }
@@ -868,7 +902,6 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   if (msg.burn_at && !isMe) {
     const remaining = msg.burn_at - Math.floor(Date.now() / 1000);
     if (remaining > 0) {
-
       setTimeout(() => S.socket?.emit('msg:spoiler:open', { msgId: msg.id, chatUid: S.activeChatUid }), 100);
     } else {
       S.socket?.emit('msg:burn:done', { msgId: msg.id, chatUid: S.activeChatUid });
@@ -881,15 +914,9 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     cont.appendChild(wrap);
   }
 
-  const allWraps = [...cont.querySelectorAll('.msg-wrap')];
-  const idx = allWraps.indexOf(wrap);
-  const prevWrap = allWraps[idx - 1];
-  const GROUP_WINDOW = 120;
-
   if (prevWrap && prevWrap.dataset.sender === String(msg.sender_id)) {
-    const prevTime = parseInt(prevWrap.dataset.ts || '0');
-    const curTime  = parseInt(wrap.dataset.ts || '0');
-    if (curTime - prevTime <= GROUP_WINDOW) {
+    const pTime = parseInt(prevWrap.dataset.ts || '0');
+    if (msg.created_at - pTime <= 120) {
       wrap.classList.add('same-sender');
       prevWrap.classList.remove('grouped-last');
     }
@@ -898,16 +925,17 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   wrap.dataset.ts = msg.created_at || Math.floor(Date.now() / 1000);
 }
 
-async function buildFileHtml(msg, decryptChatNum, decryptKeys) {
+async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
   if (!msg.file_path) return '';
   const isEncryptedFile = msg.file_path.endsWith('.bin');
 
   let isImageType = msg.file_type === 'image';
-  if (isEncryptedFile && !isImageType && msg.file_name) {
+  let isAudioType = msg.file_type === 'audio';
+  
+  if (isEncryptedFile && msg.file_name) {
     const baseName = msg.file_name.replace(/\.bin$/, '').toLowerCase();
-    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/.test(baseName)) {
-      isImageType = true;
-    }
+    if (!isImageType && /\.(png|jpe?g|gif|webp|bmp|svg)$/.test(baseName)) isImageType = true;
+    if (!isAudioType && /\.(webm|mp3|ogg|wav|m4a)$/.test(baseName)) isAudioType = true;
   }
 
   if (isEncryptedFile) {
@@ -920,19 +948,25 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys) {
       
       if (isImageType) {
         return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded'); URL.revokeObjectURL(this.src)">`;
+      } else if (isAudioType) {
+        return getAudioPlayerHtml(blobUrl, msg, isMe, metaHtml);
       } else {
         const dlName = (msg.file_name || 'file').replace('.bin', '');
         return `<div class="msg-file">[ <a href="${blobUrl}" download="${esc(dlName)}" target="_blank" rel="noreferrer">${esc(dlName)}</a> ]</div>`;
       }
     } catch (e) {
+      console.error('[file decrypt]', e);
       return `<span style="color:var(--danger)">[decryption failed]</span>`;
     }
   }
   
   if (isImageType) {
     return `<img class="msg-img" src="${msg.file_path}" loading="lazy" data-msg-id="${msg.id}">`;
+  } else if (isAudioType) {
+    return getAudioPlayerHtml(msg.file_path, msg, isMe, metaHtml);
   }
   return `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
+  rawContent = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml);
 }
 
 function markAllRead() { document.querySelectorAll('.read-tick').forEach(t => t.classList.add('read')); }
@@ -1728,12 +1762,16 @@ function renderEmojis(emojiList = EMOJIS) {
 
 loadEmojis();
 
- $('btn-emoji-gif').onclick = (e) => {
+ $('btn-emoji-gif').addEventListener('click', (e) => {
+  e.preventDefault();
   e.stopPropagation();
-  egPanel.classList.toggle('hidden');
-};
+  if (egPanel) {
+    egPanel.classList.toggle('hidden');
+  }
+});
 
 document.addEventListener('click', (e) => {
+  if (!egPanel) return;
   if (!egPanel.classList.contains('hidden') && !egPanel.contains(e.target) && e.target.id !== 'btn-emoji-gif') {
     egPanel.classList.add('hidden');
     pendingReactionMsgId = null;
@@ -2012,6 +2050,249 @@ document.querySelectorAll('#custom-theme-editor input').forEach(inp => {
 });
 
 applyTheme(localStorage.getItem('taupe_theme') || 'dark');
+
+let mediaRecorder;
+let audioChunks = [];
+let recordTimerInterval;
+let recordStartTime;
+let recordingStream = null;
+
+ $('btn-mic').onclick = async () => {
+  try {
+    recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(recordingStream);
+    audioChunks = [];
+    
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+      if (recordingStream) {
+        recordingStream.getTracks().forEach(track => track.stop());
+        recordingStream = null;
+      }
+      if (mediaRecorder._send) {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        await sendVoiceMessage(audioBlob);
+      }
+    };
+    
+    mediaRecorder.start();
+    recordStartTime = Date.now();
+    updateRecordTimer();
+    
+    $('record-ui').classList.add('active');
+    
+    recordTimerInterval = setInterval(updateRecordTimer, 10);
+  } catch (e) {
+    toast('Mic Error', 'Cannot access microphone', 'err');
+  }
+};
+
+function updateRecordTimer() {
+  const elapsed = Date.now() - recordStartTime;
+  const m = String(Math.floor(elapsed / 60000)).padStart(2, '0');
+  const s = String(Math.floor((elapsed % 60000) / 1000)).padStart(2, '0');
+  const ms = String(Math.floor((elapsed % 1000) / 10)).padStart(2, '0');
+  $('record-timer').textContent = `${m}:${s}.${ms}`;
+  
+  if (elapsed >= 120000) stopRecording(true);
+}
+
+function stopRecording(send) {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+  clearInterval(recordTimerInterval);
+  mediaRecorder._send = send;
+  mediaRecorder.stop();
+  $('record-ui').classList.remove('active');
+}
+
+ $('btn-stop-record').onclick = () => stopRecording(true);
+ $('btn-cancel-record').onclick = () => stopRecording(false);
+
+async function sendVoiceMessage(blob) {
+  if (!S.activeChatUid) return;
+  const peerChatNum = await getActivePeerChatNum();
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+
+  let fileToUpload = blob;
+  let finalName = 'voice_message.webm';
+
+  if (peerPub) {
+    try {
+      fileToUpload = await encryptFile(blob, peerChatNum, peerPub);
+      finalName = 'voice_message.webm.bin';
+    } catch (e) {
+      console.warn('[E2E] Voice encryption failed', e);
+      toast('E2E Error', 'Voice sent unencrypted', 'warn');
+    }
+  }
+
+  const fd = new FormData();
+  fd.append('file', fileToUpload, finalName);
+  
+  const rm = toast('Uploading...', 'Voice message', 'info', 0);
+  const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
+  const d = await r.json(); rm();
+  
+  if (d.error) { toast('Upload failed', d.error, 'err'); return; }
+
+  S.socket.emit('msg:send', {
+    chatUid: S.activeChatUid,
+    content: null,
+    fileUrl: d.url,
+    fileType: 'audio',
+    fileName: d.name,
+    burnSeconds: S.burnSeconds || null,
+    replyToId: replyTo?.id || null,
+  });
+  cancelReply();
+}
+
+function formatAudioTime(seconds) {
+  if (isNaN(seconds) || seconds < 0 || seconds === Infinity) seconds = 0;
+  if (seconds < 60) {
+    const s = Math.floor(seconds);
+    const ms = Math.floor((seconds - s) * 100);
+    return `${s}.${String(ms).padStart(2, '0')}`;
+  } else {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+}
+
+function getAudioPlayerHtml(blobUrl, msg, isMe, metaHtml = '') {
+  let bars = '';
+  for(let i=0; i<30; i++) {
+    bars += `<div class="wave-bar" style="height:4px"></div>`;
+  }
+  return `
+    <div class="msg-audio-player" data-blob="${blobUrl}">
+      <div class="audio-controls">
+        <button class="audio-play-btn">▶︎</button>
+        <div class="audio-waveform">${bars}</div>
+      </div>
+      <div class="audio-meta">
+        <span class="audio-time">0.00</span>
+        ${isMe && !msg.is_played ? '<span class="audio-unplayed">•</span>' : ''}
+        ${metaHtml}
+      </div>
+    </div>
+  `;
+}
+
+async function generateWaveform(blobUrl) {
+  try {
+    const response = await fetch(blobUrl);
+    const arrayBuffer = await response.arrayBuffer();
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    const channelData = audioBuffer.getChannelData(0);
+    const samples = 30;
+    const blockSize = Math.floor(channelData.length / samples);
+    let heights = [];
+    for (let i = 0; i < samples; i++) {
+      let sum = 0;
+      for (let j = 0; j < blockSize; j++) {
+        sum += Math.abs(channelData[i * blockSize + j]);
+      }
+      const avg = sum / blockSize;
+      heights.push(avg);
+    }
+    const max = Math.max(...heights);
+    if (max === 0) return new Array(samples).fill(4);
+    return heights.map(h => Math.max(4, Math.round((h / max) * 28)));
+  } catch (e) {
+    return null;
+  }
+}
+
+function initAudioPlayer(playerEl, msg, isMe) {
+  const url = playerEl.dataset.blob;
+  const audio = new Audio(url);
+  audio.preload = 'metadata';
+  
+  const playBtn = playerEl.querySelector('.audio-play-btn');
+  const timeEl = playerEl.querySelector('.audio-time');
+  const bars = playerEl.querySelectorAll('.wave-bar');
+  const waveform = playerEl.querySelector('.audio-waveform');
+  
+  let isPlaying = false;
+  let rafId = null;
+
+  generateWaveform(url).then(heights => {
+    if (heights) {
+      bars.forEach((bar, i) => {
+        bar.style.height = heights[i] + 'px';
+      });
+    } else {
+      const seed = msg.id || Math.random();
+      bars.forEach((bar, i) => {
+        bar.style.height = (Math.floor(Math.abs(Math.sin(seed * (i+1))) * 12) + 4) + 'px';
+      });
+    }
+  });
+  
+  const updateTime = () => {
+    if (audio.duration) {
+      timeEl.textContent = formatAudioTime(audio.currentTime);
+      const progress = audio.currentTime / audio.duration;
+      const playedBars = Math.floor(progress * bars.length);
+      bars.forEach((bar, i) => {
+        bar.classList.toggle('played', i < playedBars);
+      });
+    }
+    if (!audio.paused && !audio.ended) {
+      rafId = requestAnimationFrame(updateTime);
+    }
+  };
+  
+  audio.addEventListener('loadedmetadata', () => {
+    timeEl.textContent = formatAudioTime(audio.duration);
+  });
+  
+  audio.addEventListener('play', () => {
+    isPlaying = true;
+    playBtn.textContent = '||';
+    if (!isMe && !msg.is_played) {
+      S.socket.emit('msg:played', { msgId: msg.id });
+    }
+    rafId = requestAnimationFrame(updateTime);
+  });
+  
+  audio.addEventListener('pause', () => {
+    isPlaying = false;
+    playBtn.textContent = '▶︎';
+    if (rafId) cancelAnimationFrame(rafId);
+    updateTime();
+  });
+  
+  audio.addEventListener('ended', () => {
+    isPlaying = false;
+    playBtn.textContent = '▶︎';
+    if (rafId) cancelAnimationFrame(rafId);
+    timeEl.textContent = formatAudioTime(audio.duration);
+    bars.forEach(b => b.classList.remove('played'));
+  });
+  
+  playBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (isPlaying) {
+      audio.pause();
+    } else {
+      audio.play();
+    }
+  };
+
+  waveform.onclick = (e) => {
+    e.stopPropagation();
+    const rect = waveform.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / rect.width;
+    if (audio.duration) {
+      audio.currentTime = ratio * audio.duration;
+      updateTime();
+    }
+  };
+}
 
 async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) {
   if (S.activeBurnTimers.has(msgId)) return;
