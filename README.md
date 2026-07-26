@@ -55,7 +55,7 @@ npm start
 - [ ] host public, on vps (maybe oracle freetier cuz i have no mony)
 - [x] fix avatar editor
 - [x] add reply to msg
-- [ ] add voice messages
+- [x] add voice messages
 - [x] add reactions
 - [x] add gifs scroller (+ emojis)
 - [ ] video support
