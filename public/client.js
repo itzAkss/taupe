@@ -2079,7 +2079,8 @@ let recordingStream = null;
     recordStartTime = Date.now();
     updateRecordTimer();
     
-    $('record-ui').classList.add('active');
+    $('record-ui').classList.remove('hidden');
+    requestAnimationFrame(() => $('record-ui').classList.add('active'));
     
     recordTimerInterval = setInterval(updateRecordTimer, 10);
   } catch (e) {
@@ -2102,6 +2103,7 @@ function stopRecording(send) {
   clearInterval(recordTimerInterval);
   mediaRecorder._send = send;
   mediaRecorder.stop();
+  
   $('record-ui').classList.remove('active');
 }
 

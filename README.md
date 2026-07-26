@@ -73,3 +73,5 @@ npm start
 
 
 ### btw contact: tg @rdsrsgenius
+
+i may be not coding for 1 week for personal reasons
