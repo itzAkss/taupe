@@ -33,6 +33,8 @@ const twemojiSafe = (str) => {
   return str;
 };
 
+let currentRenderToken = 0;
+
 function dialog({ title, body, input, inputPlaceholder, inputDefault, inputType, okText = 'OK', cancelText = 'Cancel', danger = false }) {
   return new Promise(resolve => {
     $('dialog-title').textContent = title || '';
@@ -98,6 +100,7 @@ let pendingAccountData = null;
 
  $('btn-register').onclick = async () => {
   $('auth-error').textContent = '';
+  localStorage.removeItem('taupe_active_chat');
   const d = await api('POST', '/api/register');
   if (d.error) { $('auth-error').textContent = d.error; return; }
   
@@ -115,6 +118,7 @@ let pendingAccountData = null;
 
 $('btn-login').onclick = async () => {
   $('auth-error').textContent = '';
+  localStorage.removeItem('taupe_active_chat');
   const raw = $('input-number').value.replace(/\D/g, '');
   if (raw.length !== 16) { $('auth-error').textContent = 'Enter your 16-digit private number'; return; }
   const d = await api('POST', '/api/login', { number: raw });
@@ -164,7 +168,13 @@ async function bootApp(me, isNewAccount = false) {
   startPolling();
   
   const savedChat = localStorage.getItem('taupe_active_chat');
-  if (savedChat) openChat(savedChat);
+  if (savedChat && S.chats.find(c => c.uid === savedChat)) {
+    openChat(savedChat);
+  } else {
+    localStorage.removeItem('taupe_active_chat');
+    hide($('chat-view'));
+    show($('empty-state'));
+  }
 }
 
 function switchScreen(name) {
@@ -222,6 +232,7 @@ function startPolling() {
 async function refreshActiveChat() {
   if (!S.activeChatUid) return;
   const msgs = await api('GET', `/api/chats/${S.activeChatUid}/messages`);
+  if (myRenderToken !== currentRenderToken) return;
   if (!Array.isArray(msgs)) return;
   const cont = $('messages-container');
   const rendered = new Set([...cont.querySelectorAll('[data-msg-id]')].map(el => el.dataset.msgId));
@@ -468,7 +479,7 @@ function renderChatList() {
   S.chats.forEach(c => {
     const div = document.createElement('div');
     div.className = 'chat-item' +
-      (c.uid === S.activeChatUid ? ' active' : '') +
+      (c.uid === S.activeChatUid ? ' active active-chat' : '') +
       (c.burn_confirmed ? ' yellow' : '');
     div.dataset.uid = c.uid;
     div.dataset.chatUid = c.uid;
@@ -603,16 +614,25 @@ async function openChat(uid) {
   };
   
   updateBurnBtn();
-  document.querySelectorAll('.chat-item').forEach(el =>
-    el.classList.toggle('active', el.dataset.uid === uid));
+  document.querySelectorAll('.chat-item').forEach(el => {
+    const isActive = el.dataset.uid === uid;
+    el.classList.toggle('active', isActive);
+    el.classList.toggle('active-chat', isActive);
+  });
 
   S.peerKeys.delete(peerChatNum);
 
+  currentRenderToken++;
+  const myRenderToken = currentRenderToken;
+
   const msgs = await api('GET', `/api/chats/${uid}/messages`);
+  if (myRenderToken !== currentRenderToken) return;
+  
   const cont = $('messages-container');
   cont.innerHTML = '';
   if (Array.isArray(msgs)) {
     for (const m of msgs) {
+      if (myRenderToken !== currentRenderToken) return;
       try { await renderMessage(m, peerChatNum, peerPub); }
       catch (e) { console.error('[render error]', e); }
     }
@@ -626,6 +646,7 @@ async function openChat(uid) {
   S.isLoadingHistory = false;
 
   cont.onscroll = async () => {
+    if (myRenderToken !== currentRenderToken) return;
     if (!S.hasMoreHistory || S.isLoadingHistory) return;
     if (cont.scrollTop > 80) return;
 
@@ -640,6 +661,8 @@ async function openChat(uid) {
     const oldScrollTop    = cont.scrollTop;
 
     const olderMsgs = await api('GET', `/api/chats/${uid}/messages?beforeId=${firstMsg.dataset.msgId}`);
+    
+    if (myRenderToken !== currentRenderToken) return;
 
     if (!Array.isArray(olderMsgs) || olderMsgs.length === 0) {
       S.hasMoreHistory = false;
@@ -652,6 +675,7 @@ async function openChat(uid) {
     const scrollPeerPub = scrollPeerNum ? await getPeerKey(scrollPeerNum) : null;
 
     for (const m of [...olderMsgs].reverse()) {
+      if (myRenderToken !== currentRenderToken) return;
       m._prepend = true;
       try { await renderMessage(m, scrollPeerNum, scrollPeerPub); }
       catch (e) { console.error('[render error]', e); }
@@ -669,6 +693,7 @@ async function openChat(uid) {
 
 function closeChat() {
   S.activeChatUid = null;
+  currentRenderToken++;
   localStorage.removeItem('taupe_active_chat');
   hide($('chat-view'));
   show($('empty-state'));
@@ -711,7 +736,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     prevWrap = cont.lastElementChild;
   }
   
-  const showLabel = prevWrap?.dataset.sender !== String(msg.sender_id);
+  const showLabel = false
   const prevTime = prevWrap ? parseInt(prevWrap.dataset.ts || '0') : 0;
   const showTime = !prevWrap || prevWrap.dataset.sender !== String(msg.sender_id) || (Math.floor(prevTime / 60) !== Math.floor(msg.created_at / 60));
 
@@ -771,7 +796,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   if (hasBurn && !msg._spoilerOpened) {
     if (isMe) {
       if (isFile) {
-        content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe);
+        content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml);
       } else if (msg.content) {
         let text = msg._plaintext || msg.content;
         if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
@@ -790,7 +815,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       content = `<div class="msg-burn-open" data-msg-id="${msg.id}">${content}</div>`;
     } else {
       const burnLabel = formatBurnSecs(msg.burn_seconds);
-      content = `<button class="msg-spoiler" data-msg-id="${msg.id}" data-chat-uid="${S.activeChatUid}" data-burn-secs="${msg.burn_seconds}">Show (${burnLabel})</button>`;
+      content = `<button class="msg-spoiler" data-msg-id="${msg.id}" data-chat-uid="${S.activeChatUid}" data-burn-secs="${msg.burn_seconds}">Show</button>`;
     }
   } else if (isFile) {
     content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe);
@@ -821,8 +846,8 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   const isEncryptedPayload = isEncrypted(msg.content) || (msg.file_path && msg.file_path.endsWith('.bin'));
   const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted">#</span>' : '';
   
-  const burnHtml = (hasBurn && !msg._spoilerOpened) ? `<span class="burn-countdown">${formatBurnSecs(msg.burn_seconds)}</span>` : '';
-  const metaHtml = `<span class="msg-meta-inline">${burnHtml}${lockIcon}${showTime ? `<span>${time}</span>` : ''}${tickHtml}</span>`;
+  const burnMetaHtml = (hasBurn && !msg._spoilerOpened) ? `<span class="burn-countdown">${formatBurnSecs(msg.burn_seconds)}</span>` : '';
+  const metaHtml = `<span class="msg-meta-inline">${burnMetaHtml}${lockIcon}${showTime ? `<span>${time}</span>` : ''}${tickHtml}</span>`;
   const isMediaContent = content.includes('<img') || content.includes('msg-audio-player');
   const isAudio = content.includes('msg-audio-player');
   
@@ -969,7 +994,12 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
   rawContent = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml);
 }
 
-function markAllRead() { document.querySelectorAll('.read-tick').forEach(t => t.classList.add('read')); }
+function markAllRead() { 
+  document.querySelectorAll('.read-tick').forEach(t => {
+    t.classList.add('read');
+    t.textContent = '✓✓';
+  }); 
+}
 function scrollBottom() { const c = $('messages-container'); c.scrollTop = c.scrollHeight; }
 
 document.addEventListener('click', e => {
@@ -1536,6 +1566,7 @@ document.addEventListener('touchmove', e => {
 $('btn-logout').onclick = async () => {
   await api('POST', '/api/logout');
   localStorage.removeItem('lastNumber');
+  localStorage.removeItem('taupe_active_chat');
   location.reload();
 };
 $('btn-kick-all').onclick = async () => { await api('POST', '/api/devices/kick-all'); openSettings(); };
@@ -1544,6 +1575,7 @@ $('btn-delete-account').onclick = async () => {
   if (!ok) return;
   await api('DELETE', '/api/account');
   localStorage.removeItem('lastNumber');
+  localStorage.removeItem('taupe_active_chat');
   location.reload();
 };
 
@@ -1978,6 +2010,7 @@ function finishSecurityCheck() {
   localStorage.setItem('taupe_check_done', 'true');
   hide($('modal-verify-number'));
   localStorage.setItem('lastNumber', pendingAccountData.accountNumber);
+  localStorage.removeItem('taupe_active_chat');
   bootApp(pendingAccountData, true);
   toast('Welcome to taupe', '', 'ok', 5000);
 }
@@ -1989,6 +2022,7 @@ document.querySelectorAll('.skip-btn').forEach(btn => {
     hide($('modal-verify-number'));
     if (pendingAccountData) {
       localStorage.setItem('lastNumber', pendingAccountData.accountNumber);
+      localStorage.removeItem('taupe_active_chat');
       bootApp(pendingAccountData, true);
     }
     toast('Welcome to taupe', '', 'ok', 5000);
@@ -2306,42 +2340,48 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
 
   const spoilerBtn = document.querySelector(`.msg-spoiler[data-msg-id="${msgId}"]`);
   if (spoilerBtn && payload) {
-    const wrap = spoilerBtn.closest('.msg-wrap');
-    const bubble = spoilerBtn.closest('.msg-bubble');
-    if (bubble) {
-
-      let html = '';
-      if (payload.fileType === 'image' && payload.filePath) {
-        html = `<img class="msg-img" src="${payload.filePath}" loading="lazy">`;
-      } else if (payload.fileType === 'file' && payload.filePath) {
-        html = `<div class="msg-file">[ <a href="${payload.filePath}" target="_blank" rel="noreferrer">${esc(payload.fileName || 'file')}</a> ]</div>`;
-              
-      } else if (payload.content) {
-        let text = payload.content;
-        if (isEncrypted(text)) {
-          const peerChatNum = await getActivePeerChatNum();
-          const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-          if (peerPub) {
-            try { text = await decryptMsg(text, peerChatNum, peerPub); }
-            catch { text = '[decryption failed]'; }
-          } else { text = '[encrypted — no key]'; }
-        }
-
-        if (typeof text === 'string' && text.startsWith('gif:')) {
-          const gifUrl = text.slice(4);
-          html = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" onload="this.classList.add('loaded')">`;
-        } else {
-          html = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
-        }
+    let html = '';
+    if (payload.fileType === 'image' && payload.filePath) {
+      html = `<img class="msg-img" src="${payload.filePath}" loading="lazy" onload="this.classList.add('loaded')">`;
+    } else if (payload.fileType === 'file' && payload.filePath) {
+      html = `<div class="msg-file">[ <a href="${payload.filePath}" target="_blank" rel="noreferrer">${esc(payload.fileName || 'file')}</a> ]</div>`;
+    } else if (payload.content) {
+      let text = payload.content;
+      if (isEncrypted(text)) {
+        const peerChatNum = await getActivePeerChatNum();
+        const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+        if (peerPub) {
+          try { text = await decryptMsg(text, peerChatNum, peerPub); }
+          catch { text = '[decryption failed]'; }
+        } else { text = '[encrypted — no key]'; }
       }
-      bubble.innerHTML = `<div class="msg-burn-open" data-msg-id="${msgId}">${html}<span class="burn-countdown"></span></div>`;
+      if (typeof text === 'string' && text.startsWith('gif:')) {
+        const gifUrl = text.slice(4);
+        html = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" onload="this.classList.add('loaded')">`;
+      } else {
+        html = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
+      }
+    }
+    
+    const burnDiv = document.createElement('div');
+    burnDiv.className = 'msg-burn-open';
+    burnDiv.dataset.msgId = msgId;
+    burnDiv.innerHTML = `${html}`;
+    spoilerBtn.replaceWith(burnDiv);
+    
+    const wrap = getWrap();
+    const metaInline = wrap?.querySelector('.msg-meta-inline');
+    if (metaInline && !metaInline.querySelector('.burn-countdown')) {
+      const timerSpan = document.createElement('span');
+      timerSpan.className = 'burn-countdown';
+      metaInline.prepend(timerSpan);
     }
   }
 
   const interval = setInterval(() => {
     const remaining = Math.ceil(burnAt - Date.now() / 1000);
-    const el = document.querySelector(`.msg-burn-open[data-msg-id="${msgId}"]`);
-    const countdownEl = el?.querySelector('.burn-countdown');
+    const wrap = getWrap();
+    const countdownEl = wrap?.querySelector('.msg-meta-inline .burn-countdown');
     if (countdownEl) {
       countdownEl.textContent = formatBurnSecs(Math.max(0, remaining));
       countdownEl.classList.toggle('urgent', remaining <= 10);
@@ -2350,9 +2390,7 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
     if (remaining <= 0) {
       clearInterval(interval);
       S.activeBurnTimers.delete(msgId);
-
       getWrap()?.remove();
-
       S.socket?.emit('msg:burn:done', { msgId, chatUid });
     }
   }, 500);
