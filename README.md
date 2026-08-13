@@ -13,10 +13,6 @@
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/897d8900-fdd4-447d-8c88-b1988841a140" />
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/34344aa6-3538-4f55-8f07-7b8041469fd0" />
 
-## Try demo
-[Demo site](https://1v4nm9jrudqn.share.zrok.io/)
-### demo site can be down or slow. Hosting on my phone, so terrible uptime. db can reset
-
 # How to setup
 ### Archlinux
 ```bash
@@ -70,6 +66,3 @@ npm start
 - [ ] Develop a mobile app
 - [ ] same for linux/windows (and even macOS), electron desktop app
 - [ ] split database layers (wow, hard work)
-
-
-### btw contact: tg @rdsrsgenius
