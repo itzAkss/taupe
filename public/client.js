@@ -1240,9 +1240,18 @@ async function sendMsg() {
   cancelReply();
 }
 
+const MAX_FILE_SIZE   = 25 * 1024 * 1024;
+const MAX_AVATAR_SIZE =  5 * 1024 * 1024;
+
+async function readUploadResp(r) {
+  try { return await r.json(); }
+  catch { return { error: `Server error (HTTP ${r.status})` }; }
+}
+
 $('file-input').onchange = async e => {
   const file = e.target.files[0]; if (!file) return;
-  if (file.type.startsWith('video/')) { toast('No video', 'Video files are not supported', 'warn'); return; }
+  if (file.type.startsWith('video/')) { toast('No video', 'Video files are not supported', 'warn'); e.target.value = ''; return; }
+  if (file.size > MAX_FILE_SIZE) { toast('Too large', 'File must be under 25 MB', 'warn'); e.target.value = ''; return; }
   const rm = toast('Uploading...', file.name, 'info', 0);
   let fileToUpload = file;
   let finalName = file.name;
@@ -1260,17 +1269,26 @@ $('file-input').onchange = async e => {
     }
   }
 
-  const fd = new FormData(); 
+  const fd = new FormData();
   fd.append('file', fileToUpload, finalName);
   if (peerPub) fd.append('originalType', file.type);
-  const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
-  const d = await r.json(); rm();
-  if (d.error) { toast('Upload failed', d.error, 'err'); return; }
+  let d;
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
+    d = await readUploadResp(r);
+  } catch (err) {
+    console.error('[upload]', err);
+    d = { error: 'Network error' };
+  }
+  rm();
+  if (d.error) { toast('Upload failed', d.error, 'err'); e.target.value = ''; return; }
   S.pendingFile = d;
   const prev = $('file-preview');
-  prev.innerHTML = `${d.type === 'image' ? '[img]' : '[file]'} ${esc(d.name)} <button id="btn-clear-file">x</button>`;
-  show(prev);
-  $('btn-clear-file').onclick = () => { S.pendingFile = null; hide(prev); };
+  if (prev) {
+    prev.innerHTML = `${d.type === 'image' ? '[img]' : '[file]'} ${esc(d.name)} <button id="btn-clear-file">×</button>`;
+    show(prev);
+    $('btn-clear-file').onclick = () => { S.pendingFile = null; hide(prev); };
+  }
   e.target.value = '';
 };
 
@@ -1432,6 +1450,7 @@ $('my-avatar-preview').onclick  = () => $('avatar-file-input').click();
 $('avatar-file-input').onchange = e => {
   const file = e.target.files[0]; if (!file) return;
   e.target.value = '';
+  if (file.size > MAX_AVATAR_SIZE) { toast('Too large', 'Image must be under 5 MB', 'warn'); return; }
   openCropEditor(file);
 };
 
@@ -1550,13 +1569,14 @@ document.addEventListener('touchmove', e => {
 
   try {
     const r = await fetch('/api/me/avatar', { method: 'POST', body: fd, credentials: 'include' });
-    const d = await r.json();
+    const d = await readUploadResp(r);
     rm();
     if (d.error) { toast('Error', d.error, 'err'); return; }
     S.account.avatarPath = d.avatarPath;
     $('my-avatar-preview').innerHTML = `<img src="${d.avatarPath}?t=${Date.now()}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`;
     toast('Avatar updated', '', 'ok');
   } catch (err) {
+    console.error('[avatar upload]', err);
     rm();
     toast('Network Error', 'Upload failed', 'err');
   }
@@ -2146,6 +2166,7 @@ function stopRecording(send) {
 
 async function sendVoiceMessage(blob) {
   if (!S.activeChatUid) return;
+  if (blob.size > MAX_FILE_SIZE) { toast('Too long', 'Recording must be under 25 MB', 'warn'); return; }
   const peerChatNum = await getActivePeerChatNum();
   const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
 
@@ -2166,9 +2187,16 @@ async function sendVoiceMessage(blob) {
   fd.append('file', fileToUpload, finalName);
   
   const rm = toast('Uploading...', 'Voice message', 'info', 0);
-  const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
-  const d = await r.json(); rm();
-  
+  let d;
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
+    d = await readUploadResp(r);
+  } catch (err) {
+    console.error('[voice upload]', err);
+    d = { error: 'Network error' };
+  }
+  rm();
+
   if (d.error) { toast('Upload failed', d.error, 'err'); return; }
 
   S.socket.emit('msg:send', {

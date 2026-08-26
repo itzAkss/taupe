@@ -523,6 +523,19 @@ app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) 
   });
 });
 
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch {} }
+    const msg = err.code === 'LIMIT_FILE_SIZE'
+      ? (req.originalUrl.includes('/me/avatar') ? 'Image too large (max 5 MB)' : 'File too large (max 25 MB)')
+      : err.message;
+    return res.status(413).json({ error: msg });
+  }
+  console.error('[error]', err);
+  if (res.headersSent) return;
+  res.status(err.status || 500).json({ error: err.message || 'Server error' });
+});
+
 const httpsServer = https.createServer(tlsOptions, app);
 const httpServer  = http.createServer(app);
 const io = new Server(httpsServer);
