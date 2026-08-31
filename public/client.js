@@ -1857,17 +1857,38 @@ let gifSearchOffset = 0;
 let currentGifQuery = 'speed';
 let isFetchingGifs = false;
 
+let emojiSearchTimer;
 let gifSearchTimer;
+
 egSearch.oninput = () => {
+  clearTimeout(emojiSearchTimer);
   clearTimeout(gifSearchTimer);
-  const q = egSearch.value.trim();
-  const activeTab = document.querySelector('.eg-tab.active').dataset.tab;
-  if (activeTab !== 'gif') return;
   
-  gifSearchTimer = setTimeout(() => {
-    if (q) loadGifs(q, true);
-    else loadGifs('speed', true);
-  }, 400);
+  const q = egSearch.value.trim().toLowerCase();
+  const activeTab = document.querySelector('.eg-tab.active').dataset.tab;
+  
+  if (activeTab === 'emoji') {
+    emojiSearchTimer = setTimeout(() => {
+      if (!q) {
+        renderEmojis(EMOJIS);
+        return;
+      }
+      
+      const filtered = EMOJIS.filter(e => {
+        if (e.includes(q)) return true;
+        
+        const keywords = allEmojisData[e] || [];
+        return keywords.some(kw => kw.toLowerCase().includes(q));
+      });
+      
+      renderEmojis(filtered);
+    }, 150);
+  } else if (activeTab === 'gif') {
+    gifSearchTimer = setTimeout(() => {
+      if (q) loadGifs(q, true);
+      else loadGifs('speed', true);
+    }, 400);
+  }
 };
 
 gifGrid.addEventListener('scroll', () => {
