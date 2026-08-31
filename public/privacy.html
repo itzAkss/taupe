@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Privacy Policy — Taupe</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    body { overflow-y: auto; height: auto; min-height: 100vh; background: var(--bg); color: var(--text); padding: 20px; }
+    .legal-container { max-width: 800px; margin: 0 auto; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); padding: 30px; }
+    .legal-container h1 { font-size: 24px; margin-bottom: 5px; }
+    .legal-container h2 { font-size: 18px; margin-top: 25px; margin-bottom: 10px; color: var(--accent); }
+    .legal-container p, .legal-container li { font-size: 14px; line-height: 1.6; color: var(--text2); margin-bottom: 10px; }
+    .legal-container ul { padding-left: 20px; }
+    .back-link { display: inline-block; margin-bottom: 20px; color: var(--accent); text-decoration: none; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="legal-container">
+    <a href="/" class="back-link">← Back to Taupe</a>
+    <h1>Privacy Policy</h1>
+    <p style="font-size: 12px; color: var(--text2);">Last updated: October 24, 2023</p>
+
+    <p>This Privacy Policy describes how Taupe ("we", "us", or "our") handles your data when you use our web application (the "Service"). We are committed to protecting your privacy and minimizing data collection.</p>
+
+    <h2>1. Information We Do NOT Collect</h2>
+    <p>Taupe is designed to be privacy-first. We do not collect or store the following information:</p>
+    <ul>
+      <li>Email addresses or phone numbers.</li>
+      <li>Plain-text messages or files. All messages and files are End-to-End Encrypted (E2EE) using WebCrypto (AES-GCM). We cannot read your messages, and we do not have access to your encryption keys.</li>
+      <li>Your contact list or location data.</li>
+    </ul>
+
+    <h2>2. Information We Collect</h2>
+    <p>To provide the Service, we temporarily collect and store the following technical metadata:</p>
+    <ul>
+      <li><strong>Account Identifiers:</strong> A randomly generated 16-digit private number and an 8-digit public number. These are not linked to your real identity.</li>
+      <li><strong>IP Addresses:</strong> Used solely for rate-limiting (preventing spam and brute-force attacks) and security purposes.</li>
+      <li><strong>Device Metadata:</strong> Randomly generated device names, public encryption keys, and last-seen timestamps to manage your sessions.</li>
+      <li><strong>Encrypted Data:</strong> Your encrypted messages (.bin format) and media files, which are stored on our servers but cannot be decrypted by us.</li>
+    </ul>
+
+    <h2>3. Third-Party Services and CDNs</h2>
+    <p>To display content correctly, our application loads static assets (such as icons, fonts, and emoji graphics) from third-party Content Delivery Networks (CDNs). When you load the application, your browser connects to these services, which may temporarily log your IP address:</p>
+    <ul>
+      <li><strong>Cloudflare / cdnjs:</strong> Used to serve Font Awesome icons.</li>
+      <li><strong>jsDelivr:</strong> Used to serve Twemoji (emoji graphics) and client-side libraries.</li>
+      <li><strong>Giphy API:</strong> Used for searching GIF images.</li>
+    </ul>
+    <p>We do not control the privacy practices of these external services and encourage you to review their respective privacy policies.</p>
+
+    <h2>4. Data Retention and Deletion</h2>
+    <p>You have full control over your data. Messages can be manually deleted, or set to "Burn after read" (BAF) or auto-delete after a specified time. When a message or file is deleted, it is permanently removed from our servers.</p>
+    <p>If you choose to delete your account, all associated chats, encrypted files, and device information are permanently erased from our database.</p>
+
+    <h2>5. Cookies</h2>
+    <p>Taupe uses a strictly necessary httpOnly cookie to store your authentication JWT token. This cookie is required for the Service to function and is not used for tracking.</p>
+
+    <h2>6. Children's Privacy</h2>
+    <p>The Service is not intended for individuals under the age of 13. We do not knowingly collect data from children. If you believe a child has provided us with information, please contact us so we can delete it.</p>
+
+    <h2>7. Contact Us</h2>
+    <p>If you have questions about this Privacy Policy, please open an issue on our <a href="https://github.com/itzakss/taupe" target="_blank" style="color:var(--accent)">GitHub repository</a> or contact us at: taupe.app@proton.me</p>
+  </div>
+</body>
+</html>

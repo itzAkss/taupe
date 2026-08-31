@@ -455,3 +455,40 @@ img#chat-header-avatar { display: none !important; width: 32px; height: 32px; bo
 #msg-input-area .send-btn {
   margin-bottom: 1px;
 }
+
+#screen-auth.active {
+  flex-direction: column;
+  gap: 20px;
+}
+
+.legal-agreement {
+  margin-top: 16px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text2);
+  text-align: center;
+}
+.legal-agreement a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.legal-agreement a:hover {
+  text-decoration: underline;
+}
+
+.auth-footer {
+  font-size: 11px;
+  color: var(--text2);
+  text-align: center;
+}
+.auth-footer a {
+  color: var(--text2);
+  text-decoration: none;
+  transition: color .15s;
+  border-bottom: 1px dotted var(--text2);
+  padding-bottom: 1px;
+}
+.auth-footer a:hover {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
