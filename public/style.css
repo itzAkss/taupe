@@ -420,3 +420,38 @@ img#chat-header-avatar { display: none !important; width: 32px; height: 32px; bo
 #devices-list li { display: flex; align-items: center; justify-content: space-between; border-radius: 6px; padding: 10px 12px; font-size: 12px; border: 1px solid var(--border); }
 .device-kick { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 11px; }
 .cur-device { color: var(--accent); font-size: 10px; font-style: italic; }
+
+.icon-btn i, .send-btn i, #btn-stop-record i, #btn-cancel-record i, .skip-btn i {
+  pointer-events: none;
+}
+
+.send-btn i {
+  font-size: 18px;
+}
+
+.avatar-preview i {
+  color: var(--text2);
+}
+
+.menu-item, .theme-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.toast-icon i {
+  font-size: 18px;
+}
+
+#msg-input-area > div:first-of-type {
+  align-items: flex-end;
+}
+
+#msg-input-area .icon-btn {
+  margin-bottom: 2px;
+}
+
+#msg-input-area .send-btn {
+  margin-bottom: 1px;
+}

@@ -63,19 +63,26 @@ function dialog({ title, body, input, inputPlaceholder, inputDefault, inputType,
 }
 
 function toast(title, msg = '', type = 'info', duration = 4000, onClick = null) {
-  const icons = { info: 'i', ok: '✓', warn: '!', err: 'x', key: '#', msg: '>' };
-  const icon  = icons[type] || 'i';
+  const icons = { 
+    info: 'fa-circle-info', 
+    ok: 'fa-check', 
+    warn: 'fa-triangle-exclamation', 
+    err: 'fa-circle-xmark', 
+    key: 'fa-key', 
+    msg: 'fa-comment' 
+  };
+  const iconClass = icons[type] || 'fa-circle-info';
   const c = $('toast-container');
   const t = document.createElement('div');
   t.className = `toast toast-${type}`;
   if (onClick) t.style.cursor = 'pointer';
   t.innerHTML = `
-    <span class="toast-icon">${icon}</span>
+    <span class="toast-icon"><i class="fa-solid ${iconClass}"></i></span>
     <div class="toast-body">
       <div class="toast-title">${esc(title)}</div>
       ${msg ? `<div class="toast-msg">${esc(msg)}</div>` : ''}
     </div>
-    <button class="toast-close" aria-label="Close">×</button>
+    <button class="toast-close" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
   `;
   const remove = () => { t.classList.add('removing'); setTimeout(() => t.remove(), 180); };
   t.querySelector('.toast-close').onclick = e => { e.stopPropagation(); remove(); };
@@ -834,18 +841,17 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   }
 
   const time = new Date(msg.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  let tickHtml = '';
+    let tickHtml = '';
   if (isMe) {
     if (msg.is_read) {
-      tickHtml = '<span class="read-tick read">✓✓</span>';
+      tickHtml = '<span class="read-tick read"><i class="fa-solid fa-check-double"></i></span>';
     } else {
-      tickHtml = '<span class="read-tick">✓</span>';
+      tickHtml = '<span class="read-tick"><i class="fa-solid fa-check"></i></span>';
     }
   }
   
   const isEncryptedPayload = isEncrypted(msg.content) || (msg.file_path && msg.file_path.endsWith('.bin'));
-  const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted">#</span>' : '';
-  
+  const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted"><i class="fa-solid fa-lock"></i></span>' : '';  
   const burnMetaHtml = (hasBurn && !msg._spoilerOpened) ? `<span class="burn-countdown">${formatBurnSecs(msg.burn_seconds)}</span>` : '';
   const metaHtml = `<span class="msg-meta-inline">${burnMetaHtml}${lockIcon}${showTime ? `<span>${time}</span>` : ''}${tickHtml}</span>`;
   const isMediaContent = content.includes('<img') || content.includes('msg-audio-player');
@@ -997,7 +1003,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
 function markAllRead() { 
   document.querySelectorAll('.read-tick').forEach(t => {
     t.classList.add('read');
-    t.textContent = '✓✓';
+    t.innerHTML = '<i class="fa-solid fa-check-double"></i>';
   }); 
 }
 function scrollBottom() { const c = $('messages-container'); c.scrollTop = c.scrollHeight; }
@@ -1069,7 +1075,7 @@ function showMsgCtx(e, msgId, isMe) {
   plusBtn.className = 'ctx-react-btn';
   plusBtn.style.fontSize = '20px';
   plusBtn.style.color = 'var(--text2)';
-  plusBtn.textContent = '+';
+  plusBtn.innerHTML = '<i class="fa-solid fa-plus"></i>';
   plusBtn.onclick = (ev) => {
     ev.stopPropagation();
     pendingReactionMsgId = msgId;
@@ -1285,7 +1291,7 @@ $('file-input').onchange = async e => {
   S.pendingFile = d;
   const prev = $('file-preview');
   if (prev) {
-    prev.innerHTML = `${d.type === 'image' ? '[img]' : '[file]'} ${esc(d.name)} <button id="btn-clear-file">×</button>`;
+    prev.innerHTML = `${d.type === 'image' ? '<i class="fa-solid fa-image"></i>' : '<i class="fa-solid fa-file"></i>'} ${esc(d.name)} <button id="btn-clear-file"><i class="fa-solid fa-xmark"></i></button>`;
     show(prev);
     $('btn-clear-file').onclick = () => { S.pendingFile = null; hide(prev); };
   }
@@ -1397,7 +1403,7 @@ async function openSettings() {
   const av = $('my-avatar-preview');
   av.innerHTML = me.avatarPath
     ? `<img src="${me.avatarPath}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`
-    : '<span style="font-size:24px">?</span>';
+    : '<i class="fa-solid fa-user" style="font-size:24px"></i>';
   const list = $('devices-list'); list.innerHTML = '';
   (me.devices || []).forEach(d => {
     const li = document.createElement('li');
@@ -1621,7 +1627,7 @@ async function renderAliasList() {
   (aliases || []).forEach(a => {
     const div = document.createElement('div');
     div.className = 'alias-item';
-    div.innerHTML = `<span class="alias-name">${esc(a.alias)}</span><span class="alias-num mono">${fmtNum(a.target_number)}</span><button class="alias-del" data-n="${a.target_number}">x</button>`;
+      div.innerHTML = `<span class="alias-name">${esc(a.alias)}</span><span class="alias-num mono">${fmtNum(a.target_number)}</span><button class="alias-del" data-n="${a.target_number}"><i class="fa-solid fa-xmark"></i></button>`;
     div.onclick = e => {
       if (e.target.classList.contains('alias-del')) return;
       navigator.clipboard.writeText(a.target_number);
@@ -1700,11 +1706,11 @@ function formatBurnSecs(secs) {
     });
 
     if (secs) {
-      btn.textContent = `${formatBurnSecs(secs)}`;
+      btn.innerHTML = `<i class="fa-solid fa-fire"></i> ${formatBurnSecs(secs)}`;
       btn.classList.add('active');
       localStorage.setItem('taupe_burn_secs', secs);
     } else {
-      btn.textContent = 'ⴵ';
+      btn.innerHTML = '<i class="fa-solid fa-fire"></i>';
       btn.classList.remove('active');
       localStorage.removeItem('taupe_burn_secs');
     }
@@ -2232,7 +2238,7 @@ function getAudioPlayerHtml(blobUrl, msg, isMe, metaHtml = '') {
   return `
     <div class="msg-audio-player" data-blob="${blobUrl}">
       <div class="audio-controls">
-        <button class="audio-play-btn">▶︎</button>
+        <button class="audio-play-btn"><i class="fa-solid fa-play"></i></button>
         <div class="audio-waveform">${bars}</div>
       </div>
       <div class="audio-meta">
@@ -2316,7 +2322,7 @@ function initAudioPlayer(playerEl, msg, isMe) {
   
   audio.addEventListener('play', () => {
     isPlaying = true;
-    playBtn.textContent = '||';
+    playBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
     if (!isMe && !msg.is_played) {
       S.socket.emit('msg:played', { msgId: msg.id });
     }
@@ -2325,14 +2331,14 @@ function initAudioPlayer(playerEl, msg, isMe) {
   
   audio.addEventListener('pause', () => {
     isPlaying = false;
-    playBtn.textContent = '▶︎';
+    playBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
     if (rafId) cancelAnimationFrame(rafId);
     updateTime();
   });
   
   audio.addEventListener('ended', () => {
     isPlaying = false;
-    playBtn.textContent = '▶︎';
+    playBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
     if (rafId) cancelAnimationFrame(rafId);
     timeEl.textContent = formatAudioTime(audio.duration);
     bars.forEach(b => b.classList.remove('played'));
