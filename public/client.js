@@ -2,7 +2,7 @@ import {
   getMyPublicKeyB64, encryptMsg, decryptMsg,
   encryptFile, decryptFile, isEncrypted, cryptoSupported, invalidateSession,
   setMyDeviceId, getSafetyNumber,
-  exportPrivateKeyForSync, encryptKeyForSync, decryptSyncedKey
+  exportPrivateKeyForSync, encryptKeyForSync, decryptSyncedKey, hasSyncedKeys
 } from './crypto.js';
 
 const S = {
@@ -170,11 +170,17 @@ async function bootApp(me, isNewAccount = false) {
 
   if (me.deviceId) await setMyDeviceId(me.deviceId);
   if (me.devices && me.devices.length > 1) {
-    S.waitingForKeySync = true;
-    setTimeout(async () => {
-      toast('Waiting for key from another device', 'Please open Taupe on another device to sync history.', 'warn', 6000);
-      S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
-    }, 1000);
+    const alreadySynced = await hasSyncedKeys();
+    
+    if (!alreadySynced) {
+      S.waitingForKeySync = true;
+      setTimeout(async () => {
+        toast('Waiting for key from another device', 'Please open Taupe on another device to sync history.', 'warn', 6000);
+        S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
+      }, 1000);
+    } else {
+      console.log('[Key Sync] Already synced.');
+    }
   }
 
   await uploadMyPublicKey();
@@ -584,6 +590,7 @@ function renderChatList() {
     if (isEncrypted(previewText)) {
       previewText = '[encrypted]';
     }
+    previewText = parseSystemPreview(esc(previewText));
 
     div.innerHTML = `
       <div class="chat-avatar">${avatarSrc
@@ -593,7 +600,7 @@ function renderChatList() {
         <div class="chat-item-top">
           <span class="chat-item-name">${nameHtml}</span>
         </div>
-        <div class="chat-item-preview" id="preview-${c.uid}">${esc(previewText)}</div>
+        <div class="chat-item-preview" id="preview-${c.uid}">${previewText}</div>
       </div>
             <span class="chat-item-badge ${(c.unread || 0) > 0 ? '' : 'hidden'}" id="badge-${c.uid}">${c.unread || 0}</span>
     `;
@@ -662,7 +669,8 @@ function bumpUnread(uid) {
 }
 
 function updateChatPreviewUI(uid, preview) {
-  const el = $('preview-' + uid); if (el) el.textContent = preview || '';
+  const el = $('preview-' + uid); 
+  if (el) el.innerHTML = parseSystemPreview(esc(preview || ''));
   const c  = S.chats.find(x => x.uid === uid);
   if (c) c.last_message_preview = preview;
 }
@@ -879,16 +887,27 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       const origMsg = await api('GET', `/api/messages/${msg.reply_to_id}`);
       if (origMsg && !origMsg.error) {
         let origText = '';
+        let isSystem = false;
+        
         if (origMsg.file_path) {
-          origText = origMsg.file_type === 'image' ? '📷 Photo' : '📎 File';
+          isSystem = true;
+          if (origMsg.file_type === 'image') origText = '<i class="fa-solid fa-image"></i> Photo';
+          else if (origMsg.file_type === 'audio') origText = '<i class="fa-solid fa-microphone"></i> Voice';
+          else origText = '<i class="fa-solid fa-paperclip"></i> File';
         } else {
           origText = origMsg.content || '';
-          if (origText && origText.startsWith('gif:')) origText = '🎞️ GIF';
         }
+        
         if (origText && isEncrypted(origText) && decryptKeys) {
           try { origText = await decryptMsg(origText, decryptChatNum, decryptKeys); }
           catch { origText = '[decryption failed]'; }
         }
+
+        if (!isSystem && typeof origText === 'string' && origText.startsWith('gif:')) {
+          isSystem = true;
+          origText = '<i class="fa-solid fa-film"></i> GIF';
+        }
+        
         const c = S.chats.find(x => x.uid === S.activeChatUid);
         let senderName = 'Peer';
         if (String(origMsg.sender_id) === String(S.account.accountId)) {
@@ -896,7 +915,9 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         } else {
           senderName = getPeerDisplayName(c);
         }
-        replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${twemojiSafe(esc(origText || '[Media]'))}</div></div>`;
+        
+        const finalText = isSystem ? origText : twemojiSafe(esc(origText || '[Media]'));
+        replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${finalText}</div></div>`;
       } else {
         replyHtml = `<div class="msg-reply"><div class="msg-reply-text">[Deleted message]</div></div>`;
       }
@@ -923,14 +944,20 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
               try { text = await decryptMsg(text, decryptChatNum, freshKeys); }
               catch { text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
             } else {
-              text = '[key mismatch]';
+              text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]';
             }
           }
         } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted]'; }
-        
-        if (typeof text === 'string' && text.startsWith('gif:')) {
-          const gifUrl = text.slice(4);
-          content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+
+        if (typeof text === 'string' && text.includes('gif:')) {
+          const gifData = parseGifContent(text);
+          if (gifData) {
+            const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+            const safeText = esc(gifData.text).replace(/\n/g, '<br>');
+            content = `${imgTag}${safeText ? `<br>${safeText}` : ''}`;
+          } else {
+            content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
+          }
         } else if (isSingleEmoji(text)) {
           content = `<div class="msg-emoji-only">${twemoji.parse(text)}</div>`;
         } else {
@@ -949,7 +976,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     let text = msg._plaintext || msg.content;
     if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
       try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
-      catch {
+      catch { 
         S.peerKeys.delete(decryptChatNum);
         await invalidateSession(decryptChatNum);
         const freshKeys = await getPeerKey(decryptChatNum);
@@ -957,14 +984,20 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
           try { text = await decryptMsg(text, decryptChatNum, freshKeys); }
           catch { text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
         } else {
-          text = '[key mismatch]';
+          text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]';
         }
       }
     } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted]'; }
-
-    if (typeof text === 'string' && text.startsWith('gif:')) {
-      const gifUrl = text.slice(4);
-      content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+    
+    if (typeof text === 'string' && text.includes('gif:')) {
+      const gifData = parseGifContent(text);
+      if (gifData) {
+        const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+        const safeText = esc(gifData.text).replace(/\n/g, '<br>');
+        content = `${imgTag}${safeText ? `<br>${safeText}` : ''}`;
+      } else {
+        content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
+      }
     } else if (isSingleEmoji(text)) {
       content = `<div class="msg-emoji-only">${twemoji.parse(text)}</div>`;
     } else {
@@ -1341,12 +1374,25 @@ let replyTo = null;
 function setReplyTo(msgId) {
   const bubble = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`);
   if (!bubble) return;
-    let text = bubble.innerText;
-  if (bubble.querySelector('.msg-img')) {
-    text = '🎞️ GIF';
+  
+  let text = bubble.innerText;
+  let iconHtml = '';
+  
+  if (bubble.querySelector('.msg-gif') || text.startsWith('gif:')) {
+    iconHtml = '<i class="fa-solid fa-film"></i> GIF';
+    text = '';
+  } else if (bubble.querySelector('.msg-img')) {
+    iconHtml = '<i class="fa-solid fa-image"></i> Photo';
+    text = '';
+  } else if (bubble.querySelector('.msg-audio-player')) {
+    iconHtml = '<i class="fa-solid fa-microphone"></i> Voice';
+    text = '';
+  } else if (bubble.querySelector('.msg-file')) {
+    iconHtml = '<i class="fa-solid fa-paperclip"></i> File';
+    text = '';
   }
-  else if (bubble.querySelector('.msg-file')) text = '📎 File';
 
+  const replyContent = iconHtml || esc(text);
   const wrap = bubble.closest('.msg-wrap');
   const isMe = wrap.classList.contains('me');
   let senderName = 'Peer';
@@ -1363,12 +1409,12 @@ function setReplyTo(msgId) {
     }
   }
 
-  replyTo = { id: msgId, text };
+  replyTo = { id: msgId, text: iconHtml || text };
 
   const preview = document.getElementById('reply-preview');
   if (preview) {
     preview.querySelector('.reply-preview-name').textContent = senderName;
-    preview.querySelector('.reply-preview-text').textContent = text;
+    preview.querySelector('.reply-preview-text').innerHTML = replyContent;
     preview.classList.remove('hidden');
     document.getElementById('msg-input').focus();
   }
@@ -1894,6 +1940,36 @@ function isSingleEmoji(text) {
   }
   const regex = /^(\p{Extended_Pictographic}(\p{Emoji_Modifier}|\uFE0F\u20E3?|[\u{E0020}-\u{E007E}]+\u{E007F})?(\u200D\p{Extended_Pictographic}(\p{Emoji_Modifier}|\uFE0F\u20E3?|[\u{E0020}-\u{E007E}]+\u{E007F})?)*)$/u;
   return regex.test(cleanText);
+}
+function parseSystemPreview(text) {
+  if (!text) return '';
+  return text
+    .replace('📷 Image', '<i class="fa-solid fa-image"></i> Photo')
+    .replace('📷 Photo', '<i class="fa-solid fa-image"></i> Photo')
+    .replace('🎞️ GIF', '<i class="fa-solid fa-film"></i> GIF')
+    .replace('ᯤ Voice', '<i class="fa-solid fa-microphone"></i> Voice')
+    .replace('📎 File', '<i class="fa-solid fa-paperclip"></i> File')
+    .replace('[burns after read]', '<i class="fa-solid fa-fire"></i> Burns after read')
+    .replace('[encrypted]', '<i class="fa-solid fa-lock"></i> Encrypted');
+}
+function parseGifContent(text) {
+  if (typeof text !== 'string' || !text.includes('gif:')) return null;
+  const gifIndex = text.indexOf('gif:');
+  const rest = text.substring(gifIndex + 4);
+  
+  let urlEnd = rest.length;
+  for (let i = 0; i < rest.length; i++) {
+    if (/\s/.test(rest[i])) {
+      urlEnd = i;
+      break;
+    }
+  }
+  
+  const gifUrl = rest.substring(0, urlEnd);
+  if (!gifUrl.startsWith('http')) return null;
+  
+  const remainingText = text.substring(0, gifIndex) + text.substring(gifIndex + 4 + urlEnd);
+  return { url: gifUrl, text: remainingText.trim() };
 }
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -2645,9 +2721,15 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
           catch { text = '[decryption failed]'; }
         } else { text = '[encrypted]'; }
       }
-      if (typeof text === 'string' && text.startsWith('gif:')) {
-        const gifUrl = text.slice(4);
-        html = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" onload="this.classList.add('loaded')">`;
+      if (typeof text === 'string' && text.includes('gif:')) {
+        const gifData = parseGifContent(text);
+        if (gifData) {
+          const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" onload="this.classList.add('loaded')">`;
+          const safeText = esc(gifData.text).replace(/\n/g, '<br>');
+          html = `${imgTag}${safeText ? `<br>${safeText}` : ''}`;
+        } else {
+          html = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
+        }
       } else {
         html = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
       }

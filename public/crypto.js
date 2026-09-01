@@ -85,6 +85,11 @@ export async function getMyDeviceId() {
   return await idbGet('keys', 'deviceId') ?? 0;
 }
 
+export async function hasSyncedKeys() {
+  const synced = await idbGet('keys', 'synced_private_keys');
+  return Array.isArray(synced) && synced.length > 0;
+}
+
 async function loadMyPrivateKey() {
   const id = await getOrCreateIdentityKey();
   return crypto.subtle.importKey(
@@ -299,7 +304,7 @@ export async function decryptFile(encryptedBlob, peerChatNumber, peerPubB64OrKey
   
   const iv = data.slice(4 + headerLen, 4 + headerLen + 12);
   const ct = data.slice(4 + headerLen + 12);
-  
+
   const myPriv = await loadMyPrivateKey();
   const syncedJwks = await idbGet('keys', 'synced_private_keys') || [];
   const allMyPrivKeys = [myPriv, ...await Promise.all(syncedJwks.map(jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])))];
