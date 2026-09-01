@@ -348,17 +348,33 @@ function connectSocket() {
     if (S.activeChatUid) updateChatPreviewUI(S.activeChatUid, myPreview ?? '');
   });
 
-  S.socket.on('msg:reaction', ({ msgId, reactions }) => {
+  S.socket.on('msg:reaction', async ({ msgId, reactions }) => {
     const wrap = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`)?.closest('.msg-wrap');
     if (!wrap) return;
 
     let reactionsBar = wrap.querySelector('.msg-reactions');
     
+    const peerChatNum = await getActivePeerChatNum();
+    const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+    
     const grouped = {};
-    reactions.forEach(r => {
-      grouped[r.emoji] = grouped[r.emoji] || [];
-      grouped[r.emoji].push(r.account_id);
-    });
+    const myEncEmojis = {};
+    
+    for (const r of reactions) {
+      let emoji = r.emoji;
+      if (isEncrypted(emoji) && peerPub) {
+        try { emoji = await decryptMsg(emoji, peerChatNum, peerPub); }
+        catch { emoji = '?'; }
+      } else if (isEncrypted(emoji)) {
+        emoji = '?';
+      }
+      grouped[emoji] = grouped[emoji] || [];
+      grouped[emoji].push(r.account_id);
+      
+      if (r.account_id === Number(S.account.accountId)) {
+        myEncEmojis[emoji] = r.emoji;
+      }
+    }
 
     if (Object.keys(grouped).length === 0) {
       if (reactionsBar) reactionsBar.remove();
@@ -378,10 +394,18 @@ function connectSocket() {
       btn.className = `msg-reaction ${isMine ? 'mine' : ''}`;
       btn.dataset.msgId = msgId;
       btn.dataset.emoji = emoji;
+      if (isMine) {
+        btn.dataset.encEmoji = myEncEmojis[emoji];
+      }
       btn.innerHTML = `${twemoji.parse(emoji)} <span>${users.length}</span>`;
       btn.onclick = (ev) => {
         ev.stopPropagation();
-        S.socket.emit('msg:react', { msgId, emoji });
+        const encEmoji = btn.dataset.encEmoji;
+        if (encEmoji) {
+          S.socket.emit('msg:react', { msgId, emoji: encEmoji });
+        } else {
+          sendReaction(msgId, emoji);
+        }
       };
       reactionsBar.appendChild(btn);
     }
@@ -499,7 +523,11 @@ function renderChatList() {
       ? `${esc(displayName)} <span class="num-dim">${fmtNum(peerChatNum)}</span>`
       : `<span class="mono">${fmtNum(peerChatNum)}</span>`;
     const avatarSrc  = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
-    const preview    = c.last_message_preview || '';
+    
+    let previewText = c.last_message_preview || '';
+    if (isEncrypted(previewText)) {
+      previewText = '[encrypted]';
+    }
 
     div.innerHTML = `
       <div class="chat-avatar">${avatarSrc
@@ -509,13 +537,26 @@ function renderChatList() {
         <div class="chat-item-top">
           <span class="chat-item-name">${nameHtml}</span>
         </div>
-        <div class="chat-item-preview" id="preview-${c.uid}">${esc(preview)}</div>
+        <div class="chat-item-preview" id="preview-${c.uid}">${esc(previewText)}</div>
       </div>
             <span class="chat-item-badge ${(c.unread || 0) > 0 ? '' : 'hidden'}" id="badge-${c.uid}">${c.unread || 0}</span>
     `;
     div.onclick = () => openChat(c.uid);
     if (c.uid === S.activeChatUid) div.classList.add('active-chat');
     list.appendChild(div);
+
+    if (isEncrypted(c.last_message_preview)) {
+      getPeerKey(peerChatNum).then(async (peerPub) => {
+        if (!peerPub) return;
+        try {
+          const decrypted = await decryptMsg(c.last_message_preview, peerChatNum, peerPub);
+          const previewEl = document.getElementById(`preview-${c.uid}`);
+          if (previewEl) previewEl.textContent = decrypted;
+        } catch (e) {
+          console.warn('[E2E] Preview decrypt failed', e);
+        }
+      });
+    }
   });
 }
 
@@ -577,8 +618,7 @@ async function openChat(uid) {
   $('chat-title-display').textContent = chatLabel(c);
   $('chat-title-display').style.cursor = 'pointer';
   $('chat-title-display').onclick = () => {
-    navigator.clipboard.writeText(peerChatNum);
-    toast('Copied', fmtNum(peerChatNum), 'ok', 1500);
+    copyToClipboard(peerChatNum, 'Copied', fmtNum(peerChatNum));
   };
 
   const avatarSrc = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
@@ -612,11 +652,9 @@ async function openChat(uid) {
   $('chat-subtitle').onclick = () => {
     const fpPart = subtitleText.includes('·') ? subtitleText.split('·')[1].trim() : '';
     if (fpPart) {
-      navigator.clipboard.writeText(fpPart);
-      toast('Fingerprint copied', fpPart, 'ok', 3000);
+      copyToClipboard(fpPart, 'Fingerprint copied', fpPart);
     } else {
-      navigator.clipboard.writeText(peerChatNum);
-      toast('Copied', fmtNum(peerChatNum), 'ok', 1500);
+      copyToClipboard(peerChatNum, 'Copied', fmtNum(peerChatNum));
     }
   };
   
@@ -745,7 +783,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   
   const showLabel = false
   const prevTime = prevWrap ? parseInt(prevWrap.dataset.ts || '0') : 0;
-  const showTime = !prevWrap || prevWrap.dataset.sender !== String(msg.sender_id) || (Math.floor(prevTime / 60) !== Math.floor(msg.created_at / 60));
+  const showTime = true
 
   const wrap = document.createElement('div');
   wrap.className = 'msg-wrap ' + (isMe ? 'me' : 'them');
@@ -814,6 +852,8 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         if (typeof text === 'string' && text.startsWith('gif:')) {
           const gifUrl = text.slice(4);
           content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+        } else if (isSingleEmoji(text)) {
+          content = `<div class="msg-emoji-only">${twemoji.parse(text)}</div>`;
         } else {
           content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
         }
@@ -835,6 +875,8 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     if (typeof text === 'string' && text.startsWith('gif:')) {
       const gifUrl = text.slice(4);
       content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+    } else if (isSingleEmoji(text)) {
+      content = `<div class="msg-emoji-only">${twemoji.parse(text)}</div>`;
     } else {
       content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
     }
@@ -854,13 +896,17 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted"><i class="fa-solid fa-lock"></i></span>' : '';  
   const burnMetaHtml = (hasBurn && !msg._spoilerOpened) ? `<span class="burn-countdown">${formatBurnSecs(msg.burn_seconds)}</span>` : '';
   const metaHtml = `<span class="msg-meta-inline">${burnMetaHtml}${lockIcon}${showTime ? `<span>${time}</span>` : ''}${tickHtml}</span>`;
-  const isMediaContent = content.includes('<img') || content.includes('msg-audio-player');
+  const isMediaContent = content.includes('msg-img') || content.includes('msg-gif') || content.includes('msg-audio-player');
   const isAudio = content.includes('msg-audio-player');
   
+  const isEmojiOnly = content.includes('msg-emoji-only');
   let bubbleContent = content;
   let bubbleClasses = `msg-bubble ${isMe ? 'me' : 'them'}`;
+  if (isEmojiOnly) bubbleClasses += ' emoji-only';
   
-  if (isMediaContent) {
+  if (isEmojiOnly) {
+    bubbleContent = `<div class="msg-text-content">${content}</div>${metaHtml}`;
+  } else if (isMediaContent) {
     bubbleClasses += ' is-media';
     if (isAudio) {
       bubbleClasses += ' has-audio';
@@ -875,14 +921,29 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   let reactionsHtml = '';
   if (msg.reactions && msg.reactions.length > 0) {
     const grouped = {};
-    msg.reactions.forEach(r => {
-      grouped[r.emoji] = grouped[r.emoji] || [];
-      grouped[r.emoji].push(r.account_id);
-    });
+    const myEncEmojis = {};
+    
+    for (const r of msg.reactions) {
+      let emoji = r.emoji;
+      if (isEncrypted(emoji) && decryptKeys) {
+        try { emoji = await decryptMsg(emoji, decryptChatNum, decryptKeys); }
+        catch { emoji = '?'; }
+      } else if (isEncrypted(emoji)) {
+        emoji = '?';
+      }
+      grouped[emoji] = grouped[emoji] || [];
+      grouped[emoji].push(r.account_id);
+      
+      if (r.account_id === Number(S.account.accountId)) {
+        myEncEmojis[emoji] = r.emoji;
+      }
+    }
+    
     reactionsHtml = '<div class="msg-reactions">';
     for (const [emoji, users] of Object.entries(grouped)) {
       const isMine = users.includes(Number(S.account.accountId));
-      reactionsHtml += `<button class="msg-reaction ${isMine ? 'mine' : ''}" data-msg-id="${msg.id}" data-emoji="${emoji}">${twemojiSafe(emoji)} <span>${users.length}</span></button>`;
+      const encAttr = isMine && myEncEmojis[emoji] ? `data-enc-emoji="${esc(myEncEmojis[emoji])}"` : '';
+      reactionsHtml += `<button class="msg-reaction ${isMine ? 'mine' : ''}" data-msg-id="${msg.id}" data-emoji="${esc(emoji)}" ${encAttr}>${twemojiSafe(emoji)} <span>${users.length}</span></button>`;
     }
     reactionsHtml += '</div>';
   }
@@ -898,7 +959,12 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   wrap.querySelectorAll('.msg-reaction').forEach(btn => {
     btn.onclick = (ev) => {
       ev.stopPropagation();
-      S.socket.emit('msg:react', { msgId: parseInt(btn.dataset.msgId), emoji: btn.dataset.emoji });
+      const encEmoji = btn.dataset.encEmoji;
+      if (encEmoji) {
+        S.socket.emit('msg:react', { msgId: parseInt(btn.dataset.msgId), emoji: encEmoji });
+      } else {
+        sendReaction(parseInt(btn.dataset.msgId), btn.dataset.emoji);
+      }
     };
   });
 
@@ -912,8 +978,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   }
 
   wrap.querySelector('.msg-sender-label')?.addEventListener('click', () => {
-    navigator.clipboard.writeText(peerChatNum);
-    toast('Copied', fmtNum(peerChatNum), 'ok', 1200);
+    copyToClipboard(peerChatNum, 'Copied', fmtNum(peerChatNum));
   });
 
   const bubble = wrap.querySelector('.msg-bubble');
@@ -997,7 +1062,6 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
     return getAudioPlayerHtml(msg.file_path, msg, isMe, metaHtml);
   }
   return `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
-  rawContent = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml);
 }
 
 function markAllRead() { 
@@ -1049,6 +1113,18 @@ function addRecentReaction(emoji) {
   localStorage.setItem('taupe_recent_reactions', JSON.stringify(recent));
 }
 
+
+async function sendReaction(msgId, emoji) {
+  const peerChatNum = await getActivePeerChatNum();
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+  let encEmoji = emoji;
+  if (peerPub) {
+    try { encEmoji = await encryptMsg(emoji, peerChatNum, peerPub); }
+    catch (e) { console.warn('[E2E] react encrypt failed', e); }
+  }
+  S.socket.emit('msg:react', { msgId, emoji: encEmoji });
+}
+
 function showMsgCtx(e, msgId, isMe) {
   removeCtx();
   const menu = document.createElement('div');
@@ -1062,10 +1138,17 @@ function showMsgCtx(e, msgId, isMe) {
     const btn = document.createElement('button');
     btn.className = 'ctx-react-btn';
     btn.innerHTML = twemojiSafe(emoji);
-    btn.onclick = (ev) => { 
+    btn.onclick = async (ev) => { 
       ev.stopPropagation();
       addRecentReaction(emoji);
-      S.socket.emit('msg:react', { msgId, emoji }); 
+      const peerChatNum = await getActivePeerChatNum();
+      const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+      let encEmoji = emoji;
+      if (peerPub) {
+        try { encEmoji = await encryptMsg(emoji, peerChatNum, peerPub); }
+        catch {}
+      }
+      S.socket.emit('msg:react', { msgId, emoji: encEmoji }); 
       removeCtx(); 
     };
     reactBar.appendChild(btn);
@@ -1221,9 +1304,15 @@ async function sendMsg() {
   const peerPub     = peerChatNum ? await getPeerKey(peerChatNum) : null;
 
   let content = text || null;
+  let preview = null;
+
   if (content && peerPub) {
-    try { content = await encryptMsg(content, peerChatNum, peerPub); }
-    catch (e) { console.warn('[E2E] encrypt failed', e); }
+    try { 
+      content = await encryptMsg(content, peerChatNum, peerPub);
+      preview = await encryptMsg(text.slice(0, 60), peerChatNum, peerPub);
+    } catch (e) { console.warn('[E2E] encrypt failed', e); }
+  } else if (content) {
+    preview = content.slice(0, 60);
   }
 
   $('msg-input').value = '';
@@ -1235,6 +1324,7 @@ async function sendMsg() {
   S.socket.emit('msg:send', {
     chatUid:     S.activeChatUid,
     content,
+    preview,
     fileUrl:     file?.url  || null,
     fileType:    file?.type || null,
     fileName:    file?.name || null,
@@ -1396,8 +1486,10 @@ $('settings-close').onclick = () => hide($('modal-settings'));
 async function openSettings() {
   const me = await api('GET', '/api/me');
   S.account = { ...S.account, ...me };
-  $('settings-chat-number').textContent    = fmtNum(me.chatNumber);
-  $('settings-private-number').textContent = fmtPrivate(me.accountNumber);
+  S.account.accountNumber = localStorage.getItem('lastNumber') || '';
+  $('settings-chat-number').textContent = fmtNum(me.chatNumber);
+  const savedPrivateNum = localStorage.getItem('lastNumber') || 'Unknown';
+  $('settings-private-number').textContent = fmtPrivate(savedPrivateNum);
   $('settings-username').value      = me.username || '';
   $('settings-username-public').checked = !!me.usernamePublic;
   const av = $('my-avatar-preview');
@@ -1418,14 +1510,13 @@ async function openSettings() {
   show($('modal-settings'));
 }
 
-$('settings-chat-number-box').onclick = () => {
-  navigator.clipboard.writeText(S.account.chatNumber);
-  toast('Copied', 'Chat number copied', 'ok', 1500);
+ $('settings-chat-number-box').onclick = () => {
+  copyToClipboard(S.account.chatNumber, 'Copied', 'Chat number copied');
 };
 
 let privateRevealed = false;
 let privateRevealTimer = null;
-$('settings-private-number-box').onclick = () => {
+ $('settings-private-number-box').onclick = () => {
   const span = $('settings-private-number');
   if (!privateRevealed) {
     span.style.filter = 'none';
@@ -1436,8 +1527,7 @@ $('settings-private-number-box').onclick = () => {
       privateRevealed = false;
     }, 10000);
   } else {
-    navigator.clipboard.writeText(S.account.accountNumber);
-    toast('Copied', 'Keep this private!', 'warn', 3000);
+    copyToClipboard(localStorage.getItem('lastNumber') || '', 'Copied', 'Keep this private!');
   }
 };
 
@@ -1630,8 +1720,7 @@ async function renderAliasList() {
       div.innerHTML = `<span class="alias-name">${esc(a.alias)}</span><span class="alias-num mono">${fmtNum(a.target_number)}</span><button class="alias-del" data-n="${a.target_number}"><i class="fa-solid fa-xmark"></i></button>`;
     div.onclick = e => {
       if (e.target.classList.contains('alias-del')) return;
-      navigator.clipboard.writeText(a.target_number);
-      toast('Copied', `${a.alias} — ${fmtNum(a.target_number)}`, 'ok', 2000);
+      copyToClipboard(a.target_number, 'Copied', `${a.alias} — ${fmtNum(a.target_number)}`);
     };
     div.querySelector('.alias-del').onclick = async e => {
       e.stopPropagation();
@@ -1661,6 +1750,53 @@ $('alias-number-input').addEventListener('input', e => {
   e.target.value = v.length > 4 ? v.slice(0, 4) + '-' + v.slice(4) : v;
 });
 
+function copyToClipboard(text, successTitle = 'Copied', successMsg = '') {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => {
+      toast(successTitle, successMsg, 'ok', 1500);
+    }).catch(err => {
+      fallbackCopyText(text, successTitle, successMsg);
+    });
+  } else {
+    fallbackCopyText(text, successTitle, successMsg);
+  }
+}
+
+function fallbackCopyText(text, successTitle, successMsg) {
+  const textArea = document.createElement("textarea");
+  textArea.value = text;
+  textArea.style.position = "fixed";
+  textArea.style.left = "-9999px";
+  textArea.style.top = "0";
+  textArea.setAttribute("readonly", "");
+  document.body.appendChild(textArea);
+  textArea.focus();
+  textArea.select();
+  try {
+    const successful = document.execCommand('copy');
+    if (successful) {
+      toast(successTitle, successMsg, 'ok', 1500);
+    } else {
+      toast('Copy failed', 'Please copy manually', 'err');
+    }
+  } catch (err) {
+    toast('Copy failed', 'Please copy manually', 'err');
+  }
+  document.body.removeChild(textArea);
+}
+function isSingleEmoji(text) {
+  if (!text) return false;
+  const cleanText = text.trim();
+  if (!cleanText) return false;
+  if (Intl.Segmenter) {
+    const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
+    const segments = Array.from(segmenter.segment(cleanText));
+    if (segments.length !== 1) return false;
+    return /\p{Extended_Pictographic}/u.test(segments[0].segment);
+  }
+  const regex = /^(\p{Extended_Pictographic}(\p{Emoji_Modifier}|\uFE0F\u20E3?|[\u{E0020}-\u{E007E}]+\u{E007F})?(\u200D\p{Extended_Pictographic}(\p{Emoji_Modifier}|\uFE0F\u20E3?|[\u{E0020}-\u{E007E}]+\u{E007F})?)*)$/u;
+  return regex.test(cleanText);
+}
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -1800,10 +1936,10 @@ function renderEmojis(emojiList = EMOJIS) {
     const span = document.createElement('span');
     span.className = 'eg-emoji';
     span.innerHTML = twemoji.parse(e);
-    span.onclick = () => {
+    span.onclick = async () => {
       if (pendingReactionMsgId) {
         addRecentReaction(e); 
-        S.socket.emit('msg:react', { msgId: pendingReactionMsgId, emoji: e });
+        await sendReaction(pendingReactionMsgId, e);
         pendingReactionMsgId = null;
         egPanel.classList.add('hidden');
       } else {
@@ -1988,8 +2124,7 @@ async function sendGif(url) {
 };
 
  $('btn-copy-save-number').onclick = () => {
-  navigator.clipboard.writeText(pendingAccountData.accountNumber);
-  toast('Copied', 'Private number copied to clipboard', 'warn', 2000);
+  copyToClipboard(pendingAccountData.accountNumber, 'Copied', 'Private number copied to clipboard');
 };
 
  $('btn-download-save-number').onclick = () => {

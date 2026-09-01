@@ -164,13 +164,17 @@ app.get('/uploads/*', authMiddleware, (req, res) => {
 });
 
 app.post('/api/register', (req, res) => {
-  const acct = DB.createAccount();
-  const dt   = crypto.randomBytes(32).toString('hex');
-  const dName = DB.addDevice(acct.id, dt);
-  setCookie(res, signToken(dt));
-  res.json({ accountNumber: acct.number, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
+  try {
+    const acct = DB.createAccount();
+    const dt = crypto.randomBytes(32).toString('hex');
+    const dName = DB.addDevice(acct.id, dt);
+    setCookie(res, signToken(dt));
+    res.json({ accountNumber: acct.number, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
+  } catch (e) {
+    console.error('[register]', e);
+    res.status(500).json({ error: 'Failed to create account' });
+  }
 });
-
 app.post('/api/login', (req, res) => {
   const ip = req.ip;
   const { blocked, remaining } = checkLoginRateLimit(ip);
@@ -188,7 +192,7 @@ app.post('/api/login', (req, res) => {
   const dt = crypto.randomBytes(32).toString('hex');
   const dName = DB.addDevice(acct.id, dt);
   setCookie(res, signToken(dt));
-  res.json({ accountNumber: acct.number, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
+  res.json({ accountNumber: clean, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
 });
 
 app.post('/api/login/username', (req, res) => {
@@ -204,7 +208,6 @@ app.get('/api/me', authMiddleware, (req, res) => {
   const devices = DB.getDevices(req.account.id);
   const aliases = DB.getAliases(req.account.id);
   res.json({
-    accountNumber: req.account.number,
     chatNumber:    req.account.chat_number,
     accountId:     req.account.id,
     username:      req.account.username,
@@ -575,23 +578,21 @@ io.on('connection', socket => {
     if (s) { s.delete(socket.id); if (!s.size) online.delete(aid); }
   });
 
-    socket.on('msg:send', ({ chatUid, content, fileUrl, fileType, fileName, burnSeconds, replyToId }) => {
+  socket.on('msg:send', ({ chatUid, content, fileUrl, fileType, fileName, burnSeconds, replyToId, preview }) => {
     const chat = DB.getChatByUid(chatUid);
     if (!chat) return;
     const isInit = chat.initiator_id === aid;
     const isPeer = chat.peer_id === aid;
     if (!isInit && !isPeer) return;
-
     if (isInit && chat.deleted_by_initiator) return;
     if (isPeer && chat.deleted_by_peer) return;
     const secs = burnSeconds > 0 ? Math.max(5, Math.min(3600, parseInt(burnSeconds))) : null;
-    const msg = DB.addMessage(chat.id, aid, content, fileUrl||null, fileType||null, fileName||null, secs, replyToId);
-    const preview = secs ? '[burns after read]' : (content ? content.slice(0,60) : (fileType==='image'?'📷 Image':(fileType==='audio'?'ᯤ Voice':'📎 File')));
-    io.to(roomForChat(chatUid)).emit('msg:new', { chatUid, msg, preview });
-
+    const finalPreview = preview || (secs ? '[burns after read]' : (content ? content.slice(0,60) : (fileType==='image'?'📷 Image':(fileType==='audio'?'ᯤ Voice':'📎 File'))));
+    const msg = DB.addMessage(chat.id, aid, content, fileUrl||null, fileType||null, fileName||null, secs, replyToId, finalPreview);
+    io.to(roomForChat(chatUid)).emit('msg:new', { chatUid, msg, preview: finalPreview });
     const trimmed = DB.enforceMaxMessages(chat.id);
     if (trimmed.length) {
-      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: trimmed, preview });
+      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: trimmed, preview: finalPreview });
     }
   });
 
@@ -652,7 +653,7 @@ io.on('connection', socket => {
   });
 
   socket.on('msg:react', ({ msgId, emoji }) => {
-    if (!emoji || emoji.length > 10) return;
+    if (!emoji || emoji.length > 500) return;
     const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
     if (!msg) return;
     

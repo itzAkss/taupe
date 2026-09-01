@@ -3,6 +3,7 @@ const path = require('path');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 
+const PEPPER = process.env.TAUPE_PEPPER
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'messenger.db');
 const raw = new DatabaseSync(DB_PATH);
 
@@ -31,12 +32,12 @@ db.pragma('foreign_keys = ON');
 db.exec(`
   CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    number TEXT UNIQUE NOT NULL,         -- 16-digit login number (private)
-    chat_number TEXT UNIQUE NOT NULL,    -- 8-digit public chat number
+    number TEXT UNIQUE NOT NULL,
+    chat_number TEXT UNIQUE NOT NULL,
     username TEXT UNIQUE,
     username_public INTEGER NOT NULL DEFAULT 0,
     avatar_path TEXT,
-    public_key TEXT,                     -- ECDH P-256 public key (base64), for E2E
+    public_key TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
@@ -87,8 +88,8 @@ db.exec(`
     file_name TEXT,
     is_read INTEGER NOT NULL DEFAULT 0,
     deleted_for TEXT NOT NULL DEFAULT '',
-    burn_seconds INTEGER,        -- per-message burn timer in seconds (null = no burn)
-    burn_at INTEGER,             -- unix timestamp when burn should fire (set when receiver opens spoiler)
+    burn_seconds INTEGER,
+    burn_at INTEGER,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
@@ -162,23 +163,27 @@ function generateNumber(len) {
   return n;
 }
 
+function hashNumber(num) {
+  return crypto.createHash('sha256').update(num + PEPPER).digest('hex');
+}
+
 function createAccount() {
   const insert = db.prepare('INSERT INTO accounts (number, chat_number) VALUES (?, ?)');
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
-      const number = generateNumber(16);
-      const chatNumber = generateNumber(8);
-      const r = insert.run(number, chatNumber);
-      return { id: r.lastInsertRowid, number, chat_number: chatNumber };
+      const rawNumber = generateNumber(16);
+      const rawChatNumber = generateNumber(8);
+      const r = insert.run(hashNumber(rawNumber), rawChatNumber);
+      return { id: r.lastInsertRowid, number: rawNumber, chat_number: rawChatNumber };
     } catch (e) {
       if (!e.message.includes('UNIQUE')) throw e;
-      }
+    }
   }
-  throw new Error('Failed to generate unique numbers');
+  throw new Error('Failed to generate numbers');
 }
 
-function getAccountByNumber(number) {
-  return db.prepare('SELECT * FROM accounts WHERE number=?').get(number);
+function getAccountByNumber(rawNumber) {
+  return db.prepare('SELECT * FROM accounts WHERE number=?').get(hashNumber(rawNumber));
 }
 function getAccountByChatNumber(chatNumber) {
   return db.prepare('SELECT * FROM accounts WHERE chat_number=?').get(chatNumber);
@@ -356,13 +361,13 @@ function getMessages(chatId, accountId, { beforeId = null, limit = 200 } = {}) {
 
   return messages;
 }
-function addMessage(chatId, senderId, content, filePath, fileType, fileName, burnSeconds, replyToId) {
+function addMessage(chatId, senderId, content, filePath, fileType, fileName, burnSeconds, replyToId, customPreview) {
   const r = db.prepare(`
     INSERT INTO messages (chat_id,sender_id,content,file_path,file_type,file_name,burn_seconds,reply_to_id)
     VALUES (?,?,?,?,?,?,?,?)
   `).run(chatId, senderId, content||null, filePath||null, fileType||null, fileName||null, burnSeconds||null, replyToId||null);
 
-  const preview = content ? (content.startsWith('e2e:') ? '[encrypted]' : content.slice(0,60)) : (fileType==='image'?'📷 Image':'📎 File');
+  const preview = customPreview || (burnSeconds ? '[burns after read]' : (content ? '[encrypted]' : (fileType==='image'?'📷 Image':'📎 File')));
   updateChatPreview(chatId, preview);
   return db.prepare('SELECT * FROM messages WHERE id=?').get(r.lastInsertRowid);
 }

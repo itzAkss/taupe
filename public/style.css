@@ -492,3 +492,69 @@ img#chat-header-avatar { display: none !important; width: 32px; height: 32px; bo
   color: var(--text);
   border-bottom-color: var(--text);
 }
+
+.msg-bubble.emoji-only {
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  max-width: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.msg-bubble.me.emoji-only { align-items: flex-end; }
+.msg-bubble.them.emoji-only { align-items: flex-start; }
+
+.msg-bubble.emoji-only .msg-text-content {
+  display: flex;
+}
+.msg-bubble.emoji-only .msg-emoji-only {
+  font-size: 48px;
+  line-height: 1;
+}
+.msg-bubble.emoji-only .msg-emoji-only img.emoji {
+  width: 48px;
+  height: 48px;
+  margin: 0;
+}
+.msg-bubble.emoji-only .msg-meta-inline {
+  float: none !important;
+  margin: 0 !important;
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 3px;
+  background: var(--bg3);
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  line-height: 1;
+}
+.msg-bubble.me.emoji-only .msg-meta-inline {
+  background: var(--accent);
+  color: #fff;
+}
+.msg-bubble.them.emoji-only .msg-meta-inline {
+  color: var(--text2);
+}
+.msg-bubble:not(.is-media):not(.emoji-only) {
+  display: flex;
+  flex-direction: column;
+  min-width: 45px;
+}
+.msg-bubble:not(.is-media):not(.emoji-only) .msg-text-content {
+  width: 100%;
+  display: block;
+}
+.msg-bubble:not(.is-media):not(.emoji-only) .msg-meta-inline {
+  float: none !important;
+  margin: 4px 0 0 auto !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: auto;
+  vertical-align: baseline;
+}
+.msg-bubble img.emoji {
+  vertical-align: -0.2em;
+}
