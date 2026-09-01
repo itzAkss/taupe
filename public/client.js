@@ -2,6 +2,7 @@ import {
   getMyPublicKeyB64, encryptMsg, decryptMsg,
   encryptFile, decryptFile, isEncrypted, cryptoSupported, invalidateSession,
   setMyDeviceId, getSafetyNumber,
+  exportPrivateKeyForSync, encryptKeyForSync, decryptSyncedKey
 } from './crypto.js';
 
 const S = {
@@ -168,6 +169,13 @@ async function bootApp(me, isNewAccount = false) {
   switchScreen('main');
 
   if (me.deviceId) await setMyDeviceId(me.deviceId);
+  if (me.devices && me.devices.length > 1) {
+    S.waitingForKeySync = true;
+    setTimeout(async () => {
+      toast('Waiting for key from another device', 'Please open Taupe on another device to sync history.', 'warn', 6000);
+      S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
+    }, 1000);
+  }
 
   await uploadMyPublicKey();
   await loadChats();
@@ -199,6 +207,13 @@ async function uploadMyPublicKey() {
     const d = await api('POST', '/api/me/pubkey', { publicKey: pubKey });
     if (d.ok) console.log('[E2E] public key uploaded');
   } catch (e) { console.warn('[E2E] key upload failed', e); }
+}
+
+async function getMyDevicesKeys() {
+  if (!S.account || !S.account.devices) return [];
+  return S.account.devices
+    .filter(d => d.public_key && String(d.id) !== String(S.account.deviceId))
+    .map(d => ({ deviceId: d.id, key: d.public_key }));
 }
 
 async function getPeerKey(peerChatNumber) {
@@ -274,6 +289,34 @@ function connectSocket() {
   });
   S.socket.on('disconnect', () => { if (!S.ignored) showUnstable(); });
   S.socket.on('connect_error', () => { if (!S.ignored) showUnstable(); });
+
+  S.socket.emit('key:presence', { myPublicKey: 'online' });
+
+  S.socket.on('key:presence', async () => {
+    if (S.waitingForKeySync) {
+      S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
+    }
+  });
+
+  S.socket.on('key:request', async ({ fromDeviceId, fromPublicKey }) => {
+    try {
+      const myPrivJwk = await exportPrivateKeyForSync();
+      const encryptedKey = await encryptKeyForSync(myPrivJwk, fromPublicKey);
+      S.socket.emit('key:sync', { targetDeviceId: fromDeviceId, encryptedKey });
+      toast('Key Sync', 'Sent encryption keys to another device.', 'ok', 3000);
+    } catch (e) { console.error('[Key Sync] Failed to send key:', e); }
+  });
+
+  S.socket.on('key:sync', async ({ fromPublicKey, encryptedKey }) => {
+    try {
+      await decryptSyncedKey(encryptedKey, fromPublicKey);
+      S.waitingForKeySync = false;
+      toast('Keys Synced', 'Successfully imported keys from another device.', 'ok', 3000);
+      
+      if (S.activeChatUid) openChat(S.activeChatUid);
+      else loadChats();
+    } catch (e) { console.error('[Key Sync] Failed to decrypt synced key:', e); }
+  });
 
   S.socket.on('msg:new', async ({ chatUid, msg, preview }) => {
     updateChatPreviewUI(chatUid, preview);
@@ -478,6 +521,19 @@ function connectSocket() {
   S.socket.on('typing:stop', ({ chatUid }) => {
     if (S.activeChatUid === chatUid) hide($('typing-indicator'));
   });
+
+  S.socket.on('peer:key_update', async ({ chatUid }) => {
+    const c = S.chats.find(x => x.uid === chatUid);
+    if (c) {
+      const myId = S.account.accountId;
+      const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
+      S.peerKeys.delete(peerChatNum);
+      await invalidateSession(peerChatNum);
+      if (S.activeChatUid === chatUid) {
+        getPeerKey(peerChatNum);
+      }
+    }
+  });
 }
 
 function showUnstable() { $('screen-main').classList.add('blurred'); show($('overlay-unstable')); }
@@ -546,6 +602,7 @@ function renderChatList() {
     list.appendChild(div);
 
     if (isEncrypted(c.last_message_preview)) {
+      S.peerKeys.delete(peerChatNum);
       getPeerKey(peerChatNum).then(async (peerPub) => {
         if (!peerPub) return;
         try {
@@ -553,7 +610,18 @@ function renderChatList() {
           const previewEl = document.getElementById(`preview-${c.uid}`);
           if (previewEl) previewEl.textContent = decrypted;
         } catch (e) {
-          console.warn('[E2E] Preview decrypt failed', e);
+          await invalidateSession(peerChatNum);
+          const freshKeys = await getPeerKey(peerChatNum);
+          if (freshKeys) {
+            try {
+              const decrypted = await decryptMsg(c.last_message_preview, peerChatNum, freshKeys);
+              const previewEl = document.getElementById(`preview-${c.uid}`);
+              if (previewEl) previewEl.textContent = decrypted;
+            } catch (e2) {
+              const previewEl = document.getElementById(`preview-${c.uid}`);
+              if (previewEl) previewEl.textContent = '[encrypted]';
+            }
+          }
         }
       });
     }
@@ -629,7 +697,8 @@ async function openChat(uid) {
   } else {
     headerAvatar.classList.add('hidden');
   }
-
+  
+  S.peerKeys.delete(peerChatNum);
   let peerPub = await getPeerKey(peerChatNum);
   if (!peerPub) {
     await new Promise(r => setTimeout(r, 800));
@@ -846,9 +915,19 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         let text = msg._plaintext || msg.content;
         if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
           try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
-          catch { text = '[decryption failed]'; }
-        } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted — no key]'; }
-
+          catch {
+            S.peerKeys.delete(decryptChatNum);
+            await invalidateSession(decryptChatNum);
+            const freshKeys = await getPeerKey(decryptChatNum);
+            if (freshKeys) {
+              try { text = await decryptMsg(text, decryptChatNum, freshKeys); }
+              catch { text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
+            } else {
+              text = '[key mismatch]';
+            }
+          }
+        } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted]'; }
+        
         if (typeof text === 'string' && text.startsWith('gif:')) {
           const gifUrl = text.slice(4);
           content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
@@ -870,8 +949,19 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     let text = msg._plaintext || msg.content;
     if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
       try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
-      catch { text = '[decryption failed]'; }
-    } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted — no key]'; }
+      catch {
+        S.peerKeys.delete(decryptChatNum);
+        await invalidateSession(decryptChatNum);
+        const freshKeys = await getPeerKey(decryptChatNum);
+        if (freshKeys) {
+          try { text = await decryptMsg(text, decryptChatNum, freshKeys); }
+          catch { text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
+        } else {
+          text = '[key mismatch]';
+        }
+      }
+    } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted]'; }
+
     if (typeof text === 'string' && text.startsWith('gif:')) {
       const gifUrl = text.slice(4);
       content = `<img class="msg-img msg-gif" src="${esc(gifUrl)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
@@ -1299,17 +1389,22 @@ async function sendMsg() {
   const text = $('msg-input').value.trim();
   const file = S.pendingFile;
   if (!text && !file) return;
-
   const peerChatNum = await getActivePeerChatNum();
-  const peerPub     = peerChatNum ? await getPeerKey(peerChatNum) : null;
+  const peerPub     = peerChatNum ? await getPeerKey(peerChatNum) : [];
+  const myDevices   = await getMyDevicesKeys();
+  
+  const allRecipients = [...peerPub, ...myDevices];
+  if (peerPub.length === 0) {
+    toast('Cannot send', 'Peer has not set up E2E encryption yet. Wait for them to come online.', 'err', 5000);
+    return;
+  }
 
   let content = text || null;
   let preview = null;
-
-  if (content && peerPub) {
+  if (content) {
     try { 
-      content = await encryptMsg(content, peerChatNum, peerPub);
-      preview = await encryptMsg(text.slice(0, 60), peerChatNum, peerPub);
+      content = await encryptMsg(content, peerChatNum, allRecipients);
+      preview = await encryptMsg(text.slice(0, 60), peerChatNum, allRecipients);
     } catch (e) { console.warn('[E2E] encrypt failed', e); }
   } else if (content) {
     preview = content.slice(0, 60);
@@ -1349,15 +1444,18 @@ $('file-input').onchange = async e => {
   if (file.type.startsWith('video/')) { toast('No video', 'Video files are not supported', 'warn'); e.target.value = ''; return; }
   if (file.size > MAX_FILE_SIZE) { toast('Too large', 'File must be under 25 MB', 'warn'); e.target.value = ''; return; }
   const rm = toast('Uploading...', file.name, 'info', 0);
+
+  const peerChatNum = await getActivePeerChatNum();
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
+  const myDevices = await getMyDevicesKeys();
+  const allRecipients = [...peerPub, ...myDevices];
+
   let fileToUpload = file;
   let finalName = file.name;
 
-  const peerChatNum = await getActivePeerChatNum();
-  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-
-  if (peerPub) {
+  if (allRecipients.length > 0) {
     try {
-      fileToUpload = await encryptFile(file, peerChatNum, peerPub);
+      fileToUpload = await encryptFile(file, peerChatNum, allRecipients);
       finalName = file.name + '.bin';
     } catch (e) {
       console.warn('[E2E] File encryption failed', e);
@@ -1720,7 +1818,7 @@ async function renderAliasList() {
       div.innerHTML = `<span class="alias-name">${esc(a.alias)}</span><span class="alias-num mono">${fmtNum(a.target_number)}</span><button class="alias-del" data-n="${a.target_number}"><i class="fa-solid fa-xmark"></i></button>`;
     div.onclick = e => {
       if (e.target.classList.contains('alias-del')) return;
-      copyToClipboard(a.target_number, 'Copied', `${a.alias} — ${fmtNum(a.target_number)}`);
+      copyToClipboard(a.target_number, 'Copied', `${a.alias} - ${fmtNum(a.target_number)}`);
     };
     div.querySelector('.alias-del').onclick = async e => {
       e.stopPropagation();
@@ -2095,13 +2193,14 @@ async function loadGifs(query, isNewSearch) {
 }
 
 async function sendGif(url) {
-  if (!S.activeChatUid) return;
   const peerChatNum = await getActivePeerChatNum();
-  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-  
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
+  const myDevices = await getMyDevicesKeys();
+  const allRecipients = [...peerPub, ...myDevices];
+
   let content = 'gif:' + url;
-  if (peerPub) {
-    try { content = await encryptMsg(content, peerChatNum, peerPub); }
+  if (allRecipients.length > 0) {
+    try { content = await encryptMsg(content, peerChatNum, allRecipients); }
     catch (e) { console.warn('[E2E] encrypt failed', e); }
   }
   
@@ -2330,18 +2429,19 @@ async function sendVoiceMessage(blob) {
   if (!S.activeChatUid) return;
   if (blob.size > MAX_FILE_SIZE) { toast('Too long', 'Recording must be under 25 MB', 'warn'); return; }
   const peerChatNum = await getActivePeerChatNum();
-  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
+  const myDevices = await getMyDevicesKeys();
+  const allRecipients = [...peerPub, ...myDevices];
 
   let fileToUpload = blob;
   let finalName = 'voice_message.webm';
 
-  if (peerPub) {
+  if (allRecipients.length > 0) {
     try {
-      fileToUpload = await encryptFile(blob, peerChatNum, peerPub);
+      fileToUpload = await encryptFile(blob, peerChatNum, allRecipients);
       finalName = 'voice_message.webm.bin';
     } catch (e) {
       console.warn('[E2E] Voice encryption failed', e);
-      toast('E2E Error', 'Voice sent unencrypted', 'warn');
     }
   }
 
@@ -2543,7 +2643,7 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
         if (peerPub) {
           try { text = await decryptMsg(text, peerChatNum, peerPub); }
           catch { text = '[decryption failed]'; }
-        } else { text = '[encrypted — no key]'; }
+        } else { text = '[encrypted]'; }
       }
       if (typeof text === 'string' && text.startsWith('gif:')) {
         const gifUrl = text.slice(4);

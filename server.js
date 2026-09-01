@@ -13,7 +13,7 @@ let sharp = null;
 try {
   sharp = require('sharp');
 } catch (e) {
-  console.warn('[taupe] sharp unavailable on this platform — images will be stored without resizing/recompression (no EXIF stripping either). Avatar/file uploads still work.');
+  console.warn('[taupe] sharp unavailable on this platform, images will be stored without resizing/recompression (no EXIF stripping either). Avatar/file uploads still work.');
 }
 const selfsigned = require('selfsigned');
 const DB = require('./db');
@@ -247,6 +247,11 @@ app.post('/api/me/pubkey', authMiddleware, (req, res) => {
   try {
     DB.db.prepare('UPDATE devices SET public_key=? WHERE id=?').run(publicKey, req.device.id);
     DB.db.prepare('UPDATE accounts SET public_key=? WHERE id=?').run(publicKey, req.account.id);
+    
+    const chats = DB.getChatsForAccount(req.account.id);
+    chats.forEach(c => {
+      io.to(roomForChat(c.uid)).emit('peer:key_update', { chatUid: c.uid });
+    });
     res.json({ ok: true });
   } catch (e) {
     console.error('[pubkey]', e.message);
@@ -735,6 +740,25 @@ io.on('connection', socket => {
   });
   socket.on('typing:stop', ({ chatUid }) => {
     socket.to(roomForChat(chatUid)).emit('typing:stop', { chatUid, accountId: aid });
+  });
+
+  socket.on('key:request', ({ myPublicKey }) => {
+    for (const [sid, sock] of io.of('/').sockets) {
+      if (sock.accountId === aid && sock.id !== socket.id) {
+        sock.emit('key:request', { fromDeviceId: socket.deviceId, fromPublicKey: myPublicKey });
+      }
+    }
+  });
+
+  socket.on('key:sync', async ({ targetDeviceId, encryptedKey }) => {
+    const senderDevice = DB.db.prepare('SELECT public_key FROM devices WHERE id=?').get(socket.deviceId);
+    if (!senderDevice || !senderDevice.public_key) return;
+    
+    for (const [sid, sock] of io.of('/').sockets) {
+      if (sock.accountId === aid && sock.deviceId === targetDeviceId) {
+        sock.emit('key:sync', { fromPublicKey: senderDevice.public_key, encryptedKey });
+      }
+    }
   });
 });
 

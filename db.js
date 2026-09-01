@@ -250,7 +250,7 @@ function getDeviceByToken(token) {
   return db.prepare('SELECT * FROM devices WHERE token=?').get(token);
 }
 function getDevices(accountId) {
-  return db.prepare('SELECT id,device_name,last_seen,created_at FROM devices WHERE account_id=? ORDER BY last_seen DESC').all(accountId);
+  return db.prepare('SELECT id,device_name,last_seen,created_at,public_key FROM devices WHERE account_id=? ORDER BY last_seen DESC').all(accountId);
 }
 function kickDevice(deviceId, accountId) {
   db.prepare('DELETE FROM devices WHERE id=? AND account_id=?').run(deviceId, accountId);

@@ -107,7 +107,10 @@ const _sessionMem = new Map();
 const MAX_SESSION_CACHE = 100;
 
 async function getSessionKey(peerChatNumber, peerPubB64) {
-  if (_sessionMem.has(peerChatNumber)) return _sessionMem.get(peerChatNumber);
+  const memCached = _sessionMem.get(peerChatNumber);
+  if (memCached && memCached.peerPub === peerPubB64) {
+    return memCached.key;
+  }
 
   if (_sessionMem.size >= MAX_SESSION_CACHE) {
     const firstKey = _sessionMem.keys().next().value;
@@ -120,7 +123,7 @@ async function getSessionKey(peerChatNumber, peerPubB64) {
       'raw', new Uint8Array(cached.keyBytes),
       { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']
     );
-    _sessionMem.set(peerChatNumber, aesKey);
+    _sessionMem.set(peerChatNumber, { peerPub: peerPubB64, key: aesKey });
     return aesKey;
   }
 
@@ -144,12 +147,16 @@ async function getSessionKey(peerChatNumber, peerPubB64) {
     keyBytes: Array.from(new Uint8Array(exported)),
   });
 
-  _sessionMem.set(peerChatNumber, aesKey);
+  _sessionMem.set(peerChatNumber, { peerPub: peerPubB64, key: aesKey });
   return aesKey;
 }
 
 export async function invalidateSession(peerChatNumber) {
-  _sessionMem.delete(peerChatNumber);
+  for (const k of [..._sessionMem.keys()]) {
+    if (k.startsWith(peerChatNumber)) {
+      _sessionMem.delete(k);
+    }
+  }
   await idbDel('session_cache', peerChatNumber);
 }
 
@@ -188,7 +195,11 @@ export async function decryptMsg(payload, peerChatNumber, peerPubB64OrKeys) {
     ? peerPubB64OrKeys
     : (peerPubB64OrKeys ? [{ deviceId: 0, key: peerPubB64OrKeys }] : []);
 
-  if (!keys.length) return '[encrypted — no key]';
+  if (!keys.length) return '[encrypted]';
+
+  const myPriv = await loadMyPrivateKey();
+  const syncedJwks = await idbGet('keys', 'synced_private_keys') || [];
+  const allMyPrivKeys = [myPriv, ...await Promise.all(syncedJwks.map(jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])))];
 
   let slots = null;
   try {
@@ -197,19 +208,16 @@ export async function decryptMsg(payload, peerChatNumber, peerPubB64OrKeys) {
   } catch {}
 
   if (slots) {
-
     const myDeviceId = await getMyDeviceId();
     const mySlot = slots.find(s => s.d === myDeviceId);
+    
     if (mySlot) {
       for (const { key } of keys) {
         if (!key) continue;
         try {
           const sessionKey = await getSessionKey(peerChatNumber + ':' + myDeviceId, key);
           const combined   = Uint8Array.from(atob(mySlot.p), c => c.charCodeAt(0));
-          const pt = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: combined.slice(0, 12) },
-            sessionKey, combined.slice(12)
-          );
+          const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: combined.slice(0, 12) }, sessionKey, combined.slice(12));
           return new TextDecoder().decode(pt);
         } catch {}
       }
@@ -218,18 +226,17 @@ export async function decryptMsg(payload, peerChatNumber, peerPubB64OrKeys) {
     for (const { d: deviceId, p: encB64 } of slots) {
       for (const { key } of keys) {
         if (!key) continue;
-        try {
-          const sessionKey = await getSessionKey(peerChatNumber + ':' + deviceId, key);
-          const combined   = Uint8Array.from(atob(encB64), c => c.charCodeAt(0));
-          const pt = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: combined.slice(0, 12) },
-            sessionKey, combined.slice(12)
-          );
-          return new TextDecoder().decode(pt);
-        } catch {}
+        for (const privKey of allMyPrivKeys) {
+          try {
+            const sessionKey = await deriveSessionKeyForPriv(privKey, key);
+            const combined   = Uint8Array.from(atob(encB64), c => c.charCodeAt(0));
+            const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: combined.slice(0, 12) }, sessionKey, combined.slice(12));
+            return new TextDecoder().decode(pt);
+          } catch {}
+        }
       }
     }
-    return '[unable to decrypt — key mismatch or corrupted]';
+    return '[key mismatch]';
   }
 
   for (const { key } of keys) {
@@ -238,30 +245,45 @@ export async function decryptMsg(payload, peerChatNumber, peerPubB64OrKeys) {
       try {
         const sessionKey = await getSessionKey(cacheKey, key);
         const combined   = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        const pt = await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv: combined.slice(0, 12) },
-          sessionKey, combined.slice(12)
-        );
+        const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: combined.slice(0, 12) }, sessionKey, combined.slice(12));
         return new TextDecoder().decode(pt);
       } catch {}
     }
   }
-  return '[unable to decrypt — key mismatch or corrupted]';
+  return '[key mismatch]';
 }
 
 export async function encryptFile(blob, peerChatNumber, peerPubB64OrKeys) {
   const keys = Array.isArray(peerPubB64OrKeys) ? peerPubB64OrKeys : [{ deviceId: 0, key: peerPubB64OrKeys }];
-  const { deviceId, key } = keys[0];
-  if (!key) throw new Error("No key");
-
-  const sessionKey = await getSessionKey(peerChatNumber + ':' + deviceId, key);
+  const fileKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const buf = await blob.arrayBuffer();
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sessionKey, buf);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, fileKey, buf);
 
-  const combined = new Uint8Array(iv.length + ct.byteLength);
-  combined.set(iv);
-  combined.set(new Uint8Array(ct), iv.length);
+  const rawFileKey = await crypto.subtle.exportKey('raw', fileKey);
+  
+  const encryptedKeys = [];
+  for (const { deviceId, key } of keys) {
+    if (!key) continue;
+    const sessionKey = await getSessionKey(peerChatNumber + ':' + deviceId, key);
+    const keyIv = crypto.getRandomValues(new Uint8Array(12));
+    const encKey = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: keyIv }, sessionKey, rawFileKey);
+    const combinedKey = new Uint8Array(keyIv.length + encKey.byteLength);
+    combinedKey.set(keyIv);
+    combinedKey.set(new Uint8Array(encKey), keyIv.length);
+    encryptedKeys.push({ d: deviceId, k: btoa(String.fromCharCode(...combinedKey)) });
+  }
+
+  const header = JSON.stringify(encryptedKeys);
+  const headerBytes = new TextEncoder().encode(header);
+  const headerLen = new Uint32Array([headerBytes.length]);
+
+  const totalLen = 4 + headerBytes.length + iv.length + ct.byteLength;
+  const combined = new Uint8Array(totalLen);
+  combined.set(new Uint8Array(headerLen.buffer), 0);
+  combined.set(headerBytes, 4);
+  combined.set(iv, 4 + headerBytes.length);
+  combined.set(new Uint8Array(ct), 4 + headerBytes.length + iv.length);
 
   return new Blob([combined], { type: 'application/octet-stream' });
 }
@@ -269,19 +291,44 @@ export async function encryptFile(blob, peerChatNumber, peerPubB64OrKeys) {
 export async function decryptFile(encryptedBlob, peerChatNumber, peerPubB64OrKeys) {
   const keys = Array.isArray(peerPubB64OrKeys) ? peerPubB64OrKeys : [{ deviceId: 0, key: peerPubB64OrKeys }];
   const buf = await encryptedBlob.arrayBuffer();
-  const combined = new Uint8Array(buf);
-  const iv = combined.slice(0, 12);
-  const ct = combined.slice(12);
+  const data = new Uint8Array(buf);
+  const view = new DataView(data.buffer);
+  const headerLen = view.getUint32(0, true);
+  const headerBytes = data.slice(4, 4 + headerLen);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  
+  const iv = data.slice(4 + headerLen, 4 + headerLen + 12);
+  const ct = data.slice(4 + headerLen + 12);
+  
+  const myPriv = await loadMyPrivateKey();
+  const syncedJwks = await idbGet('keys', 'synced_private_keys') || [];
+  const allMyPrivKeys = [myPriv, ...await Promise.all(syncedJwks.map(jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])))];
 
-  for (const { deviceId, key } of keys) {
-    if (!key) continue;
-    try {
-      const sessionKey = await getSessionKey(peerChatNumber + ':' + deviceId, key);
-      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sessionKey, ct);
-      return new Blob([pt]);
-    } catch {}
+  let rawFileKey = null;
+  
+  for (const { d: deviceId, k: encB64 } of header) {
+    for (const { key } of keys) {
+      if (!key) continue;
+      for (const privKey of allMyPrivKeys) {
+        try {
+          const sessionKey = await deriveSessionKeyForPriv(privKey, key);
+          const combinedKey = Uint8Array.from(atob(encB64), c => c.charCodeAt(0));
+          const keyIv = combinedKey.slice(0, 12);
+          const encKey = combinedKey.slice(12);
+          rawFileKey = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: keyIv }, sessionKey, encKey);
+          break;
+        } catch {}
+      }
+      if (rawFileKey) break;
+    }
+    if (rawFileKey) break;
   }
-  throw new Error("Decryption failed");
+  
+  if (!rawFileKey) throw new Error("File decryption failed");
+
+  const fileKey = await crypto.subtle.importKey('raw', rawFileKey, { name: 'AES-GCM' }, false, ['decrypt']);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, fileKey, ct);
+  return new Blob([pt]);
 }
 
 export function isEncrypted(s) {
@@ -305,4 +352,49 @@ export async function getSafetyNumber(myPubB64, peerPubB64) {
 
 export function cryptoSupported() {
   return !!(window.crypto?.subtle && window.indexedDB);
+}
+
+export async function exportPrivateKeyForSync() {
+  const id = await getOrCreateIdentityKey();
+  return id.privateKeyJwk;
+}
+
+export async function encryptKeyForSync(myPrivJwk, theirPubB64) {
+  const myPriv = await crypto.subtle.importKey('jwk', myPrivJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const theirPub = await importPeerPublicKey(theirPubB64);
+  const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: theirPub }, myPriv, 256);
+  const sharedKey = await crypto.subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['encrypt']);
+  
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sharedKey, new TextEncoder().encode(JSON.stringify(myPrivJwk)));
+  const combined = new Uint8Array(iv.length + ct.byteLength);
+  combined.set(iv); combined.set(new Uint8Array(ct), iv.length);
+  return btoa(String.fromCharCode(...combined));
+}
+
+export async function decryptSyncedKey(encB64, theirPubB64) {
+  const myPriv = await loadMyPrivateKey();
+  const theirPub = await importPeerPublicKey(theirPubB64);
+  const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: theirPub }, myPriv, 256);
+  const sharedKey = await crypto.subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['decrypt']);
+  
+  const combined = Uint8Array.from(atob(encB64), c => c.charCodeAt(0));
+  const iv = combined.slice(0, 12);
+  const ct = combined.slice(12);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sharedKey, ct);
+  const jwk = JSON.parse(new TextDecoder().decode(pt));
+  
+  const synced = await idbGet('keys', 'synced_private_keys') || [];
+  if (!synced.some(k => k.k === jwk.k)) {
+    synced.push(jwk);
+    await idbSet('keys', 'synced_private_keys', synced);
+  }
+  return true;
+}
+
+async function deriveSessionKeyForPriv(myPriv, theirPubB64) {
+  const theirPub = await importPeerPublicKey(theirPubB64);
+  const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: theirPub }, myPriv, 256);
+  const hashed = await crypto.subtle.digest('SHA-256', bits);
+  return crypto.subtle.importKey('raw', hashed, { name: 'AES-GCM' }, false, ['decrypt']);
 }
