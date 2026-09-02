@@ -136,6 +136,18 @@ try {
 }
 
 try {
+  const cols = db.prepare("PRAGMA table_info(devices)").all();
+  if (!cols.some(c => c.name === 'push_endpoint')) {
+    db.exec('ALTER TABLE devices ADD COLUMN push_endpoint TEXT');
+  }
+  if (!cols.some(c => c.name === 'push_provider')) {
+    db.exec("ALTER TABLE devices ADD COLUMN push_provider TEXT");
+  }
+} catch (e) {
+  console.error('[migration] devices.push_endpoint column check failed:', e.message);
+}
+
+try {
   const cols = db.prepare("PRAGMA table_info(messages)").all();
   if (!cols.some(c => c.name === 'burn_seconds'))
     db.exec('ALTER TABLE messages ADD COLUMN burn_seconds INTEGER');
@@ -260,6 +272,17 @@ function kickAllDevicesExcept(accountId, keepToken) {
 }
 function touchDevice(token) {
   db.prepare('UPDATE devices SET last_seen=unixepoch() WHERE token=?').run(token);
+}
+
+function setPushEndpoint(deviceId, accountId, endpoint, provider) {
+  db.prepare('UPDATE devices SET push_endpoint=?, push_provider=? WHERE id=? AND account_id=?')
+    .run(endpoint || null, provider || null, deviceId, accountId);
+}
+
+function getPushableDevices(accountId, excludeDeviceId) {
+  return db.prepare(
+    'SELECT id, push_endpoint, push_provider FROM devices WHERE account_id=? AND push_endpoint IS NOT NULL AND id != ?'
+  ).all(accountId, excludeDeviceId || -1);
 }
 
 function randomUid() {
@@ -500,6 +523,7 @@ module.exports = {
   setAlias, getAlias, getAliases, deleteAlias,
   addDevice, countDevices, getDeviceByToken, getDevices,
   kickDevice, kickAllDevicesExcept, touchDevice,
+  setPushEndpoint, getPushableDevices,
   getChatsForAccount, getChatByUid, getChatById,
   createChat, setBurnMode, confirmBurn, setChatLabel, deleteChat, updateChatPreview,
   getMessages, addMessage, markRead, deleteMessage,

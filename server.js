@@ -259,6 +259,20 @@ app.post('/api/me/pubkey', authMiddleware, (req, res) => {
   }
 });
 
+app.post('/api/me/push', authMiddleware, (req, res) => {
+  const { endpoint, provider } = req.body;
+  if (endpoint && typeof endpoint !== 'string') {
+    return res.status(400).json({ error: 'Invalid endpoint' });
+  }
+  try {
+    DB.setPushEndpoint(req.device.id, req.account.id, endpoint || null, provider || null);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[push register]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/pubkey/:chatNumber', authMiddleware, (req, res) => {
   try {
     const acct = DB.getAccountByChatNumber(req.params.chatNumber.replace(/-/g, ''));
@@ -568,6 +582,22 @@ const online = new Map();
 const activeTimedBurns = new Set();
 function roomForChat(uid) { return `chat:${uid}`; }
 
+async function pushWakeup(accountId, chatUid) {
+  if (online.has(accountId)) return;
+  const devices = DB.getPushableDevices(accountId);
+  for (const d of devices) {
+    try {
+      await fetch(d.push_endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: JSON.stringify({ t: 'new_message', chatUid }),
+      });
+    } catch (e) {
+      console.error('[push] failed for device', d.id, e.message);
+    }
+  }
+}
+
 io.on('connection', socket => {
   const aid = socket.accountId;
   if (!online.has(aid)) online.set(aid, new Set());
@@ -599,6 +629,8 @@ io.on('connection', socket => {
     if (trimmed.length) {
       io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: trimmed, preview: finalPreview });
     }
+    const recipientId = isInit ? chat.peer_id : chat.initiator_id;
+    pushWakeup(recipientId, chatUid).catch(e => console.error('[push] wakeup error', e.message));
   });
 
   socket.on('msg:read', ({ chatUid }) => {
