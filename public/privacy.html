@@ -27,7 +27,7 @@
     <p>Taupe is designed to be privacy-first. We do not collect or store the following information:</p>
     <ul>
       <li>Email addresses or phone numbers.</li>
-      <li>Plain-text messages or files. All messages and files are End-to-End Encrypted (E2EE) using WebCrypto (AES-GCM). We cannot read your messages, and we do not have access to your encryption keys.</li>
+      <li>Plain-text messages or files (except unencrypted). All messages and files are End-to-End Encrypted (E2EE) using WebCrypto (AES-GCM). We cannot read your messages, and we do not have access to your encryption keys.</li>
       <li>Your contact list or location data.</li>
     </ul>
 
@@ -38,6 +38,7 @@
       <li><strong>IP Addresses:</strong> Used solely for rate-limiting (preventing spam and brute-force attacks) and security purposes.</li>
       <li><strong>Device Metadata:</strong> Randomly generated device names, public encryption keys, and last-seen timestamps to manage your sessions.</li>
       <li><strong>Encrypted Data:</strong> Your encrypted messages (.bin format) and media files, which are stored on our servers but cannot be decrypted by us.</li>
+      <li><strong>Unencrypted Data:</strong> Your unencrypted messages and media files will be stored on our servers.</li>
     </ul>
 
     <h2>3. Third-Party Services and CDNs</h2>
