@@ -80,7 +80,23 @@ function recordLoginSuccess(ip) { DB.recordLoginSuccessDb(ip); }
 setInterval(() => DB.cleanupRateLimits(), 15 * 60 * 1000);
 
 const app = express();
-app.use(helmet({ contentSecurityPolicy: false }));
+const publicUrl = process.env.PUBLIC_URL || 'http://localhost:3000';
+const cspHost = publicUrl.replace(/^https?:\/\//, '');
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "https://cdn.jsdelivr.net"],
+      imgSrc: ["'self'", "data:", "https://*.giphy.com", "https://twemoji.maxcdn.com", "https://abs-0.twimg.com"],
+      connectSrc: ["'self'", `ws://${cspHost}`, `wss://${cspHost}`, `http://${cspHost}`, `https://${cspHost}`],
+      styleSrc: ["'self'", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
+      fontSrc: ["'self'", "https://cdnjs.cloudflare.com"],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: [],
+    }
+  }
+}));
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
