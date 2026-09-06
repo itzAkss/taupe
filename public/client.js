@@ -1963,6 +1963,7 @@ function isSingleEmoji(text) {
   const regex = /^(\p{Extended_Pictographic}(\p{Emoji_Modifier}|\uFE0F\u20E3?|[\u{E0020}-\u{E007E}]+\u{E007F})?(\u200D\p{Extended_Pictographic}(\p{Emoji_Modifier}|\uFE0F\u20E3?|[\u{E0020}-\u{E007E}]+\u{E007F})?)*)$/u;
   return regex.test(cleanText);
 }
+
 function parseSystemPreview(text) {
   if (!text) return '';
   return text
