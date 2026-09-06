@@ -88,8 +88,8 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'", "https://cdn.jsdelivr.net"],
-      imgSrc: ["'self'", "data:", "https://*.giphy.com", "https://twemoji.maxcdn.com", "https://abs-0.twimg.com"],
-      connectSrc: ["'self'", `ws://${cspHost}`, `wss://${cspHost}`, `http://${cspHost}`, `https://${cspHost}`],
+      imgSrc: ["'self'", "data:", "blob:", "https://*.giphy.com", "https://twemoji.maxcdn.com", "https://abs-0.twimg.com", "https://raw.githubusercontent.com"],
+      connectSrc: ["'self'", `ws://${cspHost}`, `wss://${cspHost}`, `http://${cspHost}`, `https://${cspHost}`, "https://raw.githubusercontent.com"],
       styleSrc: ["'self'", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
       fontSrc: ["'self'", "https://cdnjs.cloudflare.com"],
       objectSrc: ["'none'"],
