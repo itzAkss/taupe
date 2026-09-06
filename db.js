@@ -410,7 +410,7 @@ function deleteMessage(msgId, accountId, forWhom) {
   db.prepare('UPDATE messages SET deleted_for=? WHERE id=?').run(cur, msgId);
 
   const last = db.prepare(`SELECT content,file_type FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(m.chat_id);
-  const preview = last ? (last.content ? last.content.slice(0,60) : (last.file_type==='image'?'📷 Image':'📎 File')) : '';
+  const preview = last ? (last.content ? last.content : (last.file_type==='image'?'📷 Image':(last.file_type==='audio'?'ᯤ Voice':'📎 File'))) : '';
   updateChatPreview(m.chat_id, preview);
 }
 
@@ -421,7 +421,7 @@ function applyBurnBaf(chatId) {
     db.prepare(`UPDATE messages SET deleted_for='both' WHERE id IN (${ids.map(()=>'?').join(',')})`).run(...ids);
 
     const last = db.prepare(`SELECT content,file_type FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chatId);
-    updateChatPreview(chatId, last ? (last.content||'').slice(0,60) || (last.file_type==='image'?'📷 Image':'📎 File') : '');
+    updateChatPreview(chatId, last ? (last.content||'') || (last.file_type==='image'?'📷 Image':'📎 File') : '');
     return ids;
   }
   return [];
@@ -462,7 +462,7 @@ function applyBurnTimed(chatId, beforeUnix) {
     const ids = msgs.map(m=>m.id);
     db.prepare(`UPDATE messages SET deleted_for='both' WHERE id IN (${ids.map(()=>'?').join(',')})`).run(...ids);
     const last = db.prepare(`SELECT content,file_type FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chatId);
-    updateChatPreview(chatId, last ? (last.content||'').slice(0,60) || (last.file_type==='image'?'📷 Image':'📎 File') : '');
+    updateChatPreview(chatId, last ? (last.content||'') || (last.file_type==='image'?'📷 Image':'📎 File') : '');
   }
   return msgs.map(m=>m.id);
 }

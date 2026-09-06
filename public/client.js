@@ -670,11 +670,17 @@ function bumpUnread(uid) {
 
 function updateChatPreviewUI(uid, preview) {
   const el = $('preview-' + uid); 
-  if (el) el.innerHTML = parseSystemPreview(esc(preview || ''));
-  const c  = S.chats.find(x => x.uid === uid);
+  if (el) {
+    const cleanText = (preview || '').replace(/^e2e:/, '');
+    if (preview && preview.startsWith('e2e:')) {
+      el.textContent = '[Encrypted]';
+    } else {
+      el.innerHTML = parseSystemPreview(esc(preview || ''));
+    }
+  }
+  const c = S.chats.find(x => x.uid === uid);
   if (c) c.last_message_preview = preview;
 }
-
 async function openChat(uid) {
   S.activeChatUid = uid;
   localStorage.setItem('taupe_active_chat', uid);
@@ -1994,6 +2000,17 @@ function esc(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+function parseSystemPreview(text) {
+  if (!text) return '';
+  return text
+    .replace('📷 Image', '<i class="fa-solid fa-image"></i> Photo')
+    .replace('📷 Photo', '<i class="fa-solid fa-image"></i> Photo')
+    .replace('🎞️ GIF', '<i class="fa-solid fa-film"></i> GIF')
+    .replace('ᯤ Voice', '<i class="fa-solid fa-microphone"></i> Voice')
+    .replace('📎 File', '<i class="fa-solid fa-paperclip"></i> File')
+    .replace('[burns after read]', '<i class="fa-solid fa-fire"></i> Burns after read')
+    .replace('[encrypted]', '<i class="fa-solid fa-lock"></i> Encrypted');
 }
 function fmtNum(n) {
   const s = String(n || '').replace(/\D/g, '');
