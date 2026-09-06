@@ -689,6 +689,7 @@ io.on('connection', socket => {
     DB.hardDeleteMessage(msgId);
     const last = DB.db.prepare(`SELECT content,file_type,burn_seconds FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 1`).get(chat.id);
     const preview = last ? (last.burn_seconds ? '[🔥 burns after read]' : (last.content||'').slice(0,60)||(last.file_type==='image'?'[image]':'[file]')) : '';
+    DB.updateChatPreview(chat.id, preview);
     io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: [msgId], preview });
   });
 
@@ -699,8 +700,8 @@ io.on('connection', socket => {
       const chat = DB.getChatById(m.chat_id);
       if (chat) {
         const last = DB.db.prepare(`SELECT content,file_type FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chat.id);
-        const preview = last ? (last.content||'').slice(0,60)||(last.file_type==='image'?'📷 Image':'📎 File') : '';
-        io.to(roomForChat(chat.uid)).emit('msg:deleted', { msgId, forWhom, by: aid, preview });
+        const preview = last ? (last.content ? last.content.slice(0,60) : (last.file_type==='image'?'📷 Image':'📎 File')) : '';
+        io.to(roomForChat(chat.uid)).emit('msg:deleted', { msgId, forWhom, by: aid, chatUid: chat.uid, preview });
       }
     }
   });
@@ -837,7 +838,11 @@ setInterval(() => {
       byChat.get(chat_uid).push(id);
     }
     for (const [chatUid, ids] of byChat) {
-      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids, preview: '' });
+      const chat = DB.getChatByUid(chatUid);
+      const last = DB.db.prepare(`SELECT content,file_type,burn_seconds FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chat.id);
+      const preview = last ? (last.burn_seconds ? '[🔥 burns after read]' : (last.content||'').slice(0,60)||(last.file_type==='image'?'[image]':'[file]')) : '';
+      DB.updateChatPreview(chat.id, preview);
+      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids, preview });
     }
   }
 }, 15_000);
