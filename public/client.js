@@ -952,7 +952,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         if (typeof text === 'string' && text.includes('gif:')) {
           const gifData = parseGifContent(text);
           if (gifData) {
-            const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+            const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" data-msg-id="${msg.id}">`;
             const safeText = esc(gifData.text).replace(/\n/g, '<br>');
             content = `${imgTag}${safeText ? `<br>${safeText}` : ''}`;
           } else {
@@ -992,7 +992,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     if (typeof text === 'string' && text.includes('gif:')) {
       const gifData = parseGifContent(text);
       if (gifData) {
-        const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded')">`;
+        const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" data-msg-id="${msg.id}">`;
         const safeText = esc(gifData.text).replace(/\n/g, '<br>');
         content = `${imgTag}${safeText ? `<br>${safeText}` : ''}`;
       } else {
@@ -1076,6 +1076,18 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     ${reactionsHtml}
   `;
   wrap.innerHTML = inner;
+
+  wrap.querySelectorAll('img.msg-img, img.msg-gif').forEach(img => {
+    if (img.complete) {
+      img.classList.add('loaded');
+      if (img.src.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(img.src), 1000);
+    } else {
+      img.addEventListener('load', () => {
+        img.classList.add('loaded');
+        if (img.src.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(img.src), 1000);
+      });
+    }
+  });
 
   wrap.querySelectorAll('.msg-audio-player').forEach(p => initAudioPlayer(p, msg, isMe));
 
@@ -1166,7 +1178,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
       const blobUrl = URL.createObjectURL(decBlob);
       
       if (isImageType) {
-        return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}" onload="this.classList.add('loaded'); URL.revokeObjectURL(this.src)">`;
+        return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}">`;
       } else if (isAudioType) {
         return getAudioPlayerHtml(blobUrl, msg, isMe, metaHtml);
       } else {
@@ -2717,7 +2729,7 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
   if (spoilerBtn && payload) {
     let html = '';
     if (payload.fileType === 'image' && payload.filePath) {
-      html = `<img class="msg-img" src="${payload.filePath}" loading="lazy" onload="this.classList.add('loaded')">`;
+      html = `<img class="msg-img" src="${payload.filePath}" loading="lazy">`;
     } else if (payload.fileType === 'file' && payload.filePath) {
       html = `<div class="msg-file">[ <a href="${payload.filePath}" target="_blank" rel="noreferrer">${esc(payload.fileName || 'file')}</a> ]</div>`;
     } else if (payload.content) {
@@ -2733,7 +2745,7 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
       if (typeof text === 'string' && text.includes('gif:')) {
         const gifData = parseGifContent(text);
         if (gifData) {
-          const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy" onload="this.classList.add('loaded')">`;
+          const imgTag = `<img class="msg-img msg-gif" src="${esc(gifData.url)}" loading="lazy">`;
           const safeText = esc(gifData.text).replace(/\n/g, '<br>');
           html = `${imgTag}${safeText ? `<br>${safeText}` : ''}`;
         } else {
