@@ -2002,17 +2002,6 @@ function esc(s) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
-function parseSystemPreview(text) {
-  if (!text) return '';
-  return text
-    .replace('📷 Image', '<i class="fa-solid fa-image"></i> Photo')
-    .replace('📷 Photo', '<i class="fa-solid fa-image"></i> Photo')
-    .replace('🎞️ GIF', '<i class="fa-solid fa-film"></i> GIF')
-    .replace('ᯤ Voice', '<i class="fa-solid fa-microphone"></i> Voice')
-    .replace('📎 File', '<i class="fa-solid fa-paperclip"></i> File')
-    .replace('[burns after read]', '<i class="fa-solid fa-fire"></i> Burns after read')
-    .replace('[encrypted]', '<i class="fa-solid fa-lock"></i> Encrypted');
-}
 function fmtNum(n) {
   const s = String(n || '').replace(/\D/g, '');
   return s.length === 8 ? s.slice(0,4)+'-'+s.slice(4) : s;
