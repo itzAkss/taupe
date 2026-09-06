@@ -1447,13 +1447,17 @@ async function sendMsg() {
 
   let content = text || null;
   let preview = null;
-  if (content) {
+  if (content && peerPub) {
     try { 
       content = await encryptMsg(content, peerChatNum, allRecipients);
-      preview = await encryptMsg(text.slice(0, 60), peerChatNum, allRecipients);
+      if (!S.burnSeconds) {
+        preview = await encryptMsg(text.slice(0, 60), peerChatNum, allRecipients);
+      }
     } catch (e) { console.warn('[E2E] encrypt failed', e); }
   } else if (content) {
-    preview = content.slice(0, 60);
+    if (!S.burnSeconds) {
+      preview = content.slice(0, 60);
+    }
   }
 
   $('msg-input').value = '';
