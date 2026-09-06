@@ -385,32 +385,26 @@ app.delete('/api/aliases/:number', authMiddleware, (req, res) => {
 
 const GIPHY_API_KEY = process.env.GIPHY_KEY || 'api';
 
-app.get('/api/gifs', authMiddleware, (req, res) => {
+app.get('/api/gifs', authMiddleware, async (req, res) => {
   const q = req.query.q || 'speed';
   const offset = req.query.offset || 0;
   const url = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(q)}&limit=30&rating=pg-13&offset=${offset}`;
   
-  https.get(url, (apiRes) => {
-    let data = '';
-    apiRes.on('data', chunk => data += chunk);
-    apiRes.on('end', () => {
-      try {
-        const parsed = JSON.parse(data);
-        if (parsed.meta && parsed.meta.status !== 200) {
-          console.error('[giphy Error]', parsed.meta.msg, 'status:', parsed.meta.status);
-          return res.status(500).json({ error: parsed.meta.msg || 'giphy API error' });
-        }
-        const gifs = (parsed.data || []).map(g => g.images.fixed_height_small.url);
-        res.json({ gifs });
-      } catch (e) {
-        console.error('[giphy parse error]', e.message, 'raw data:', data);
-        res.status(500).json({ error: 'giphy parse error' });
-      }
-    });
-  }).on('error', e => {
+  try {
+    const apiRes = await fetch(url);
+    const parsed = await apiRes.json();
+    
+    if (parsed.meta && parsed.meta.status !== 200) {
+      console.error('[giphy Error]', parsed.meta.msg, 'status:', parsed.meta.status);
+      return res.status(500).json({ error: parsed.meta.msg || 'giphy API error' });
+    }
+    
+    const gifs = (parsed.data || []).map(g => g.images.fixed_height_small.url);
+    res.json({ gifs });
+  } catch (e) {
     console.error('[giphy request error]', e.message);
     res.status(500).json({ error: e.message });
-  });
+  }
 });
 
 app.get('/api/lookup/:query', authMiddleware, (req, res) => {
