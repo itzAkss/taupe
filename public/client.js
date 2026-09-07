@@ -361,6 +361,28 @@ function connectSocket() {
     }
   });
 
+    S.socket.on('peer:avatar_update', ({ chatUid, accountId, avatarPath }) => {
+    const c = S.chats.find(x => x.uid === chatUid);
+    if (c) {
+      if (c.initiator_id == accountId) c.initiator_avatar = avatarPath;
+      if (c.peer_id == accountId) c.peer_avatar = avatarPath;
+      
+      renderChatList();
+      
+      if (S.activeChatUid === chatUid) {
+        const myId = S.account.accountId;
+        const avatarSrc = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
+        const headerAvatar = $('chat-header-avatar');
+        if (avatarSrc) {
+          headerAvatar.src = avatarSrc;
+          headerAvatar.classList.remove('hidden');
+        } else {
+          headerAvatar.classList.add('hidden');
+        }
+      }
+    }
+  });
+
   S.socket.on('msg:burned', ({ chatUid, ids, preview }) => {
     ids.forEach(id => {
 
