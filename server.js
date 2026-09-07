@@ -325,6 +325,17 @@ app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async 
   if (!req.file) return res.status(400).json({ error: 'No file' });
   const outPath = req.file.path;
   
+  const notifyAvatarUpdate = (accountId, rel) => {
+    const chats = DB.getChatsForAccount(accountId);
+    chats.forEach(c => {
+      io.to(roomForChat(c.uid)).emit('peer:avatar_update', { 
+        chatUid: c.uid, 
+        accountId: accountId, 
+        avatarPath: rel 
+      });
+    });
+  };
+
   if (!validateFileMagic(outPath, req.file.mimetype)) {
     try { fs.unlinkSync(outPath); } catch {}
     return res.status(400).json({ error: 'Invalid image format' });
@@ -333,29 +344,17 @@ app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async 
   if (sharp) {
     try {
       let pipeline = sharp(outPath);
-      
       if (req.body.crop) {
         try {
           const { x, y, w, h } = JSON.parse(req.body.crop);
-          pipeline = pipeline.extract({ 
-            left: parseInt(x), 
-            top: parseInt(y), 
-            width: parseInt(w), 
-            height: parseInt(h) 
-          });
-        } catch (e) {
-          console.warn('[Avatar] Invalid crop data, falling back to center crop');
-        }
+          pipeline = pipeline.extract({ left: parseInt(x), top: parseInt(y), width: parseInt(w), height: parseInt(h) });
+        } catch (e) { console.warn('[Avatar] Invalid crop data'); }
       }
-      
-      await pipeline
-        .resize(128, 128, { fit: 'cover' })
-        .webp({ quality: 85 })
-        .toFile(outPath + '.webp');
-        
+      await pipeline.resize(128, 128, { fit: 'cover' }).webp({ quality: 85 }).toFile(outPath + '.webp');
       fs.unlinkSync(outPath);
       const rel = '/uploads/avatars/' + path.basename(outPath + '.webp');
       DB.setAvatar(req.account.id, rel);
+      notifyAvatarUpdate(req.account.id, rel);
       return res.json({ avatarPath: rel });
     } catch (e) {
       console.error('[Avatar] Sharp processing failed:', e.message);
@@ -366,6 +365,7 @@ app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async 
 
   const rel = '/uploads/avatars/' + path.basename(outPath);
   DB.setAvatar(req.account.id, rel);
+  notifyAvatarUpdate(req.account.id, rel);
   res.json({ avatarPath: rel });
 });
 
