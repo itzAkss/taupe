@@ -579,8 +579,9 @@ function renderChatList() {
     const myId       = S.account.accountId;
     const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
     const alias      = c.peer_alias || null;
+    const lbl = c.initiator_id == myId ? c.label_initiator : c.label_peer;
     const peerUsername = c.initiator_id == myId ? c.peer_username : c.initiator_username;
-    const displayName = alias || peerUsername || null;
+    const displayName = alias || lbl || peerUsername || null;
     const nameHtml   = displayName
       ? `${esc(displayName)} <span class="num-dim">${fmtNum(peerChatNum)}</span>`
       : `<span class="mono">${fmtNum(peerChatNum)}</span>`;
@@ -639,18 +640,23 @@ function chatLabel(c) {
   const myId = S.account.accountId;
   const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
   if (c.peer_alias) return c.peer_alias;
+  const lbl = c.initiator_id == myId ? c.label_initiator : c.label_peer;
+  if (lbl) return lbl;
   const peerUsername = c.initiator_id == myId ? c.peer_username : c.initiator_username;
   if (peerUsername) return peerUsername;
-  const lbl = c.initiator_id == myId ? c.label_initiator : c.label_peer;
-  return lbl || fmtNum(peerChatNum);
+  return fmtNum(peerChatNum);
 }
 
 function getPeerDisplayName(c) {
   if (!c) return 'Peer';
   const myId = S.account.accountId;
   if (c.initiator_id == myId) {
+    const lbl = c.label_initiator;
+    if (lbl) return lbl;
     return c.peer_alias || c.peer_username || fmtNum(c.peer_chat_number);
   } 
+  const lbl = c.label_peer;
+  if (lbl) return lbl;
   return c.initiator_username || fmtNum(c.initiator_chat_number);
 }
 
@@ -1626,14 +1632,22 @@ $('burn-deny').onclick = () => { hide($('modal-burn-confirm')); S.burnConfirmPen
 $('btn-chat-menu').onclick = () => show($('modal-chat-menu'));
 $('cm-cancel').onclick     = () => hide($('modal-chat-menu'));
 
-$('cm-rename').onclick = async () => {
+ $('cm-rename').onclick = async () => {
   hide($('modal-chat-menu'));
   const name = await dialog({ title: 'Rename chat', body: 'New label:', input: true, inputPlaceholder: 'chat1' });
   if (!name) return;
-  api('PATCH', `/api/chats/${S.activeChatUid}/label`, { label: name });
+  
+  const d = await api('PATCH', `/api/chats/${S.activeChatUid}/label`, { label: name });
+  if (d.error) { toast('Error', d.error, 'err'); return; }
+  
   const c = S.chats.find(x => x.uid === S.activeChatUid);
-  if (c) { c.label_initiator = name; c.label_peer = name; }
-  $('chat-title-display').textContent = name; renderChatList();
+  if (c) {
+    if (c.initiator_id == S.account.accountId) c.label_initiator = name;
+    else c.label_peer = name;
+  }
+  
+  $('chat-title-display').textContent = chatLabel(c);
+  renderChatList();
 };
 
 ['self','peer','both'].forEach(fw => {
