@@ -124,16 +124,59 @@ let pendingAccountData = null;
   show($('modal-save-number'));
 };
 
-$('btn-login').onclick = async () => {
+ $('btn-login').onclick = async () => {
   $('auth-error').textContent = '';
   localStorage.removeItem('taupe_active_chat');
   const raw = $('input-number').value.replace(/\D/g, '');
   if (raw.length !== 16) { $('auth-error').textContent = 'Enter your 16-digit private number'; return; }
   const d = await api('POST', '/api/login', { number: raw });
+  
+  if (d.error === 'Max 5 devices. Kick one first.') {
+    showKickDevicesModal(raw);
+    return;
+  }
+  
   if (d.error) { $('auth-error').textContent = d.error; return; }
   localStorage.setItem('lastNumber', d.accountNumber);
   await bootApp(d, false);
 };
+
+async function showKickDevicesModal(number) {
+  const d = await api('POST', '/api/login/devices', { number });
+  if (d.error) { $('auth-error').textContent = d.error; return; }
+  
+  const list = $('kick-devices-list');
+  list.innerHTML = '';
+  (d.devices || []).forEach(dev => {
+    const div = document.createElement('div');
+    div.className = 'alias-item';
+    const lastSeen = dev.last_seen ? new Date(dev.last_seen * 1000).toLocaleString() : 'Unknown';
+    div.innerHTML = `<span style="display:flex; flex-direction:column;">
+                        <span style="font-weight:600">${esc(dev.device_name)}</span>
+                        <span style="font-size:10px;color:var(--text2)">Last seen: ${lastSeen}</span>
+                      </span>
+                      <button class="device-kick" data-id="${dev.id}">kick</button>`;
+    div.querySelector('.device-kick').onclick = async (e) => {
+      e.stopPropagation();
+      const kickRes = await api('POST', '/api/login/kick', { number, deviceId: parseInt(e.target.dataset.id) });
+      if (kickRes.ok) {
+        showKickDevicesModal(number);
+      }
+    };
+    list.appendChild(div);
+  });
+
+  $('btn-kick-signin').disabled = (d.devices || []).length >= 5;
+  $('btn-kick-signin').onclick = async () => {
+    hide($('modal-kick-devices'));
+    const loginRes = await api('POST', '/api/login', { number });
+    if (loginRes.error) { $('auth-error').textContent = loginRes.error; return; }
+    localStorage.setItem('lastNumber', loginRes.accountNumber);
+    await bootApp(loginRes, false);
+  };
+  $('kick-cancel').onclick = () => hide($('modal-kick-devices'));
+  show($('modal-kick-devices'));
+}
 
 document.querySelectorAll('.tab').forEach(t => {
   t.onclick = () => {

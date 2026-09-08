@@ -361,6 +361,15 @@
   </div>
 </div>
 
+<div id="modal-kick-devices" class="modal hidden">
+  <div class="modal-box">
+    <h2>Device Limit Reached</h2>
+    <p style="font-size: 12px; color: var(--text2); margin-bottom: 15px;">You have 5 devices. Kick one to sign in here.</p>
+    <div id="kick-devices-list" style="display:flex; flex-direction:column; gap:8px; margin-bottom: 15px;"></div>
+    <button id="btn-kick-signin" class="btn-primary full" disabled>Sign In</button>
+    <button id="kick-cancel" class="btn-ghost full mt">Cancel</button>
+  </div>
+</div>
 <script src="/socket.io/socket.io.js"></script>
 <script type="module" src="client.js"></script>
 </body>

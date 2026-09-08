@@ -212,6 +212,30 @@ app.post('/api/login', (req, res) => {
   res.json({ accountNumber: clean, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
 });
 
+app.post('/api/login/devices', (req, res) => {
+  const { number } = req.body;
+  const clean = (number||'').replace(/\D/g,'');
+  if (clean.length !== 16) return res.status(400).json({ error: 'Invalid number' });
+
+  const acct = DB.getAccountByNumber(clean);
+  if (!acct) return res.status(404).json({ error: 'Account not found' });
+
+  const devices = DB.getDevices(acct.id);
+  res.json({ devices });
+});
+
+app.post('/api/login/kick', (req, res) => {
+  const { number, deviceId } = req.body;
+  const clean = (number||'').replace(/\D/g,'');
+  if (clean.length !== 16) return res.status(400).json({ error: 'Invalid number' });
+
+  const acct = DB.getAccountByNumber(clean);
+  if (!acct) return res.status(404).json({ error: 'Account not found' });
+
+  DB.kickDevice(parseInt(deviceId), acct.id);
+  res.json({ ok: true, count: DB.countDevices(acct.id) });
+});
+
 app.post('/api/login/username', (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'No username' });
