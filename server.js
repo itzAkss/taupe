@@ -341,6 +341,20 @@ app.patch('/api/me/username', authMiddleware, (req, res) => {
     if (existing) return res.status(409).json({ error: 'Username taken' });
   }
   DB.setUsername(req.account.id, username || null, isPublic);
+  
+  const publicUsername = isPublic ? (username || null) : null;
+
+  const chats = DB.getChatsForAccount(req.account.id);
+  chats.forEach(c => {
+    io.to(roomForChat(c.uid)).emit('peer:profile_update', {
+      chatUid: c.uid,
+      accountId: req.account.id,
+      username: publicUsername,
+      isPublic: isPublic ? 1 : 0,
+      avatarPath: req.account.avatar_path
+    });
+  });
+
   res.json({ ok: true, username: username || null });
 });
 
@@ -351,10 +365,12 @@ app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async 
   const notifyAvatarUpdate = (accountId, rel) => {
     const chats = DB.getChatsForAccount(accountId);
     chats.forEach(c => {
-      io.to(roomForChat(c.uid)).emit('peer:avatar_update', { 
-        chatUid: c.uid, 
-        accountId: accountId, 
-        avatarPath: rel 
+      io.to(roomForChat(c.uid)).emit('peer:profile_update', {
+        chatUid: c.uid,
+        accountId: accountId,
+        username: req.account.username,
+        isPublic: req.account.username_public,
+        avatarPath: rel
       });
     });
   };

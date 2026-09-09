@@ -404,15 +404,22 @@ function connectSocket() {
     }
   });
 
-    S.socket.on('peer:avatar_update', ({ chatUid, accountId, avatarPath }) => {
+  S.socket.on('peer:profile_update', ({ chatUid, accountId, username, isPublic, avatarPath }) => {
     const c = S.chats.find(x => x.uid === chatUid);
     if (c) {
-      if (c.initiator_id == accountId) c.initiator_avatar = avatarPath;
-      if (c.peer_id == accountId) c.peer_avatar = avatarPath;
+      if (c.initiator_id == accountId) {
+        c.initiator_username = username;
+        c.initiator_avatar = avatarPath;
+      }
+      if (c.peer_id == accountId) {
+        c.peer_username = username;
+        c.peer_avatar = avatarPath;
+      }
       
       renderChatList();
       
       if (S.activeChatUid === chatUid) {
+        $('chat-title-display').textContent = chatLabel(c);
         const myId = S.account.accountId;
         const avatarSrc = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
         const headerAvatar = $('chat-header-avatar');
