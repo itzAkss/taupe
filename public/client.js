@@ -259,8 +259,9 @@ async function uploadMyPublicKey() {
 }
 
 async function getMyDevicesKeys() {
-  if (!S.account || !S.account.devices) return [];
-  return S.account.devices
+  const me = await api('GET', '/api/me');
+  if (me.error || !me.devices) return [];
+  return me.devices
     .filter(d => d.public_key && String(d.id) !== String(S.account.deviceId))
     .map(d => ({ deviceId: d.id, key: d.public_key }));
 }
