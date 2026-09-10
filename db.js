@@ -292,7 +292,10 @@ function getChatsForAccount(accountId) {
   return db.prepare(`
     SELECT c.*,
       a1.chat_number as initiator_chat_number, a1.username as initiator_username, a1.avatar_path as initiator_avatar,
-      a2.chat_number as peer_chat_number, a2.username as peer_username, a2.avatar_path as peer_avatar
+      a2.chat_number as peer_chat_number, a2.username as peer_username, a2.avatar_path as peer_avatar,
+      (SELECT sender_id FROM messages WHERE chat_id=c.id AND deleted_for!='both' ORDER BY id DESC LIMIT 1) as last_sender_id,
+      (SELECT is_read FROM messages WHERE chat_id=c.id AND deleted_for!='both' ORDER BY id DESC LIMIT 1) as last_is_read,
+      (SELECT created_at FROM messages WHERE chat_id=c.id AND deleted_for!='both' ORDER BY id DESC LIMIT 1) as last_msg_time
     FROM chats c
     JOIN accounts a1 ON a1.id=c.initiator_id
     JOIN accounts a2 ON a2.id=c.peer_id
