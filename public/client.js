@@ -14,6 +14,7 @@ const S = {
   pendingFile: null,
   burnConfirmPending: null,
   peerKeys:   new Map(),
+  presence:   new Map(),
   pollTimer:  null,
   _pendingPlaintext: null,
   isMobile:   () => window.innerWidth <= 640,
@@ -290,6 +291,33 @@ async function getActivePeerChatNum() {
   return c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
 }
 
+function formatLastSeenTs(sec) {
+  try {
+    return new Date(sec * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  } catch { return ''; }
+}
+
+function renderPresence() {
+  const el = $('chat-presence');
+  if (!el) return;
+  const c = S.chats.find(x => x.uid === S.activeChatUid);
+  if (!c) { el.className = 'hidden'; el.textContent = ''; return; }
+  const myId = S.account.accountId;
+  const num = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
+  const p = S.presence.get(num);
+  if (!p) { el.className = 'hidden'; el.textContent = ''; return; }
+  if (p.online) {
+    el.textContent = 'online';
+    el.className = 'online';
+  } else if (p.lastSeen) {
+    el.textContent = 'last seen: ' + formatLastSeenTs(p.lastSeen);
+    el.className = 'lastseen';
+  } else {
+    el.textContent = 'offline';
+    el.className = 'offline';
+  }
+}
+
 function startPolling() {
   if (S.pollTimer) clearInterval(S.pollTimer);
   S.pollTimer = setInterval(async () => {
@@ -446,6 +474,12 @@ function connectSocket() {
 
   S.socket.on('msg:burn:countdown', async ({ msgId, chatUid, burnAt, burnSeconds, content, filePath, fileType, fileName }) => {
     await startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, { content, filePath, fileType, fileName });
+  });
+
+  S.socket.on('peer:presence', ({ chatUid, number, online, lastSeen }) => {
+    if (!number) return;
+    S.presence.set(number, { online: !!online, lastSeen: lastSeen || null });
+    if (chatUid && chatUid === S.activeChatUid) renderPresence();
   });
 
   S.socket.on('msg:read:ack', ({ chatUid, by }) => {
@@ -775,6 +809,9 @@ async function openChat(uid) {
   if (!c) return;
   const myId  = S.account.accountId;
   const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
+
+  S.socket.emit('presence:get', { number: peerChatNum });
+  renderPresence();
 
   $('chat-title-display').textContent = chatLabel(c);
   $('chat-title-display').style.cursor = 'pointer';

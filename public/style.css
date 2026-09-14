@@ -87,6 +87,10 @@ main#chat-area.mob-hidden { opacity: 0; }
 #back-btn { display:none; }
 img#chat-header-avatar { display: none !important; width: 32px; height: 32px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 #chat-title-display { font-weight:600; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; transition: opacity .15s, transform .15s; }
+#chat-title-row { display:flex; align-items:baseline; gap:8px; min-width:0; }
+#chat-presence { font-size:10px; font-weight:600; white-space:nowrap; flex-shrink:0; letter-spacing:.2px; }
+#chat-presence.online { color:var(--accent); }
+#chat-presence.lastseen, #chat-presence.offline { color:var(--text2); }
 #chat-subtitle { font-size:11px; color:var(--text2); cursor:pointer; }
 #chat-subtitle:hover { color:var(--accent); }
 .chat-header-actions { display:flex; gap:2px; flex-shrink:0; }
