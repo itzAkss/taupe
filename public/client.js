@@ -1782,6 +1782,7 @@ async function openSettings() {
   $('settings-private-number').textContent = fmtPrivate(savedPrivateNum);
   $('settings-username').value      = me.username || '';
   $('settings-username-public').checked = !!me.usernamePublic;
+  $('settings-show-presence').checked = me.showPresence !== false;
   const av = $('my-avatar-preview');
   av.innerHTML = me.avatarPath
     ? `<img src="${me.avatarPath}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`
@@ -1830,6 +1831,17 @@ $('btn-save-username').onclick = async () => {
   $('settings-username').value = saved;
   toast('Saved', 'Username updated', 'ok');
   S.account.username = saved; S.account.usernamePublic = isPublic;
+};
+
+$('settings-show-presence').onchange = async () => {
+  const show = $('settings-show-presence').checked;
+  const d = await api('PATCH', '/api/me/presence', { show });
+  if (d.error) {
+    $('settings-show-presence').checked = !show;
+    toast('Error', d.error, 'err');
+    return;
+  }
+  toast('Saved', show ? 'Presence visible to others' : 'Presence hidden from others', 'ok');
 };
 
 $('my-avatar-preview').onclick  = () => $('avatar-file-input').click();

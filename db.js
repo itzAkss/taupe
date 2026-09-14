@@ -178,6 +178,15 @@ try {
   console.error('[migration] accounts.last_seen column check failed:', e.message);
 }
 
+try {
+  const colsPresence = db.prepare("PRAGMA table_info(accounts)").all();
+  if (!colsPresence.some(c => c.name === 'show_presence')) {
+    db.exec("ALTER TABLE accounts ADD COLUMN show_presence INTEGER NOT NULL DEFAULT 1");
+  }
+} catch (e) {
+  console.error('[migration] accounts.show_presence column check failed:', e.message);
+}
+
 function generateNumber(len) {
   let n = '';
   for (let i = 0; i < len; i++) n += crypto.randomInt(0, 10);

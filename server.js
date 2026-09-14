@@ -253,6 +253,7 @@ app.get('/api/me', authMiddleware, (req, res) => {
     username:      req.account.username,
     usernamePublic: req.account.username_public,
     avatarPath:    req.account.avatar_path,
+    showPresence:  req.account.show_presence === 0 ? false : true,
     deviceName:    req.device.device_name,
     deviceId:      req.device.id,
     devices, aliases,
@@ -356,6 +357,18 @@ app.patch('/api/me/username', authMiddleware, (req, res) => {
   });
 
   res.json({ ok: true, username: username || null });
+});
+
+app.patch('/api/me/presence', authMiddleware, (req, res) => {
+  const { show } = req.body;
+  try {
+    DB.db.prepare('UPDATE accounts SET show_presence=? WHERE id=?').run(show ? 1 : 0, req.account.id);
+    broadcastPresence(req.account.id);
+    res.json({ ok: true, showPresence: !!show });
+  } catch (e) {
+    console.error('[presence setting]', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async (req, res) => {
@@ -630,7 +643,40 @@ io.use((socket, next) => {
 
 const online = new Map();
 const activeTimedBurns = new Set();
+const presenceShown = new Map();
 function roomForChat(uid) { return `chat:${uid}`; }
+
+function isOnline(aid) {
+  const set = online.get(aid);
+  if (!set || !set.size) return false;
+  for (const sid of set) {
+    const sock = io.sockets.sockets.get(sid);
+    if (sock && sock.presenceHidden !== true) return true;
+  }
+  return false;
+}
+
+function presenceVisibleToPeers(acct) {
+  return !!acct && acct.show_presence !== 0;
+}
+
+function broadcastPresence(aid) {
+  const acct = DB.getAccountById(aid);
+  if (!acct) return;
+  if (isOnline(aid)) {
+    notifyPresence(aid, true, null);
+  } else {
+    notifyPresence(aid, false, acct.last_seen || null);
+  }
+}
+
+function recomputePresence(aid) {
+  const now = isOnline(aid);
+  if (presenceShown.get(aid) === now) return;
+  presenceShown.set(aid, now);
+  if (!now) touchAccountLastSeen(aid, Math.floor(Date.now() / 1000));
+  broadcastPresence(aid);
+}
 
 function touchAccountLastSeen(accountId, unixSec) {
   try {
@@ -640,17 +686,18 @@ function touchAccountLastSeen(accountId, unixSec) {
   }
 }
 
-function notifyPresence(accountId, isOnline, lastSeenSec) {
+function notifyPresence(accountId, isOnlineNow, lastSeenSec) {
   const acct = DB.getAccountById(accountId);
   if (!acct) return;
+  const visible = presenceVisibleToPeers(acct);
   const chats = DB.getChatsForAccount(accountId);
   for (const c of chats) {
     const peerId = c.initiator_id === accountId ? c.peer_id : c.initiator_id;
     io.to(`user:${peerId}`).emit('peer:presence', {
       chatUid: c.uid,
       number: acct.chat_number,
-      online: isOnline,
-      lastSeen: lastSeenSec || null,
+      online: visible && isOnlineNow,
+      lastSeen: visible ? (lastSeenSec || null) : null,
     });
   }
 }
@@ -687,31 +734,38 @@ io.on('connection', socket => {
   const chats = DB.getChatsForAccount(aid);
   chats.forEach(c => socket.join(roomForChat(c.uid)));
 
-  notifyPresence(aid, true, null);
+  recomputePresence(aid);
 
   for (const c of chats) {
     const peerId = c.initiator_id === aid ? c.peer_id : c.initiator_id;
     const peerAcct = DB.getAccountById(peerId);
     if (!peerAcct) continue;
-    const peerOnline = online.has(peerId);
+    const peerOnline = isOnline(peerId);
+    const peerVisible = presenceVisibleToPeers(peerAcct);
     socket.emit('peer:presence', {
       chatUid: c.uid,
       number: peerAcct.chat_number,
-      online: peerOnline,
-      lastSeen: peerOnline ? null : (peerAcct.last_seen || null),
+      online: peerVisible && peerOnline,
+      lastSeen: peerVisible && !peerOnline ? (peerAcct.last_seen || null) : null,
     });
   }
+
+  socket.on('presence:report', ({ online: reported }) => {
+    socket.presenceHidden = reported === false;
+    recomputePresence(aid);
+  });
 
   socket.on('presence:get', ({ number }) => {
     if (!number) return;
     const peer = DB.getAccountByChatNumber(String(number));
     if (!peer || peer.id === aid) return;
-    const peerOnline = online.has(peer.id);
+    const peerOnline = isOnline(peer.id);
+    const peerVisible = presenceVisibleToPeers(peer);
     socket.emit('peer:presence', {
       chatUid: getChatUidBetween(aid, peer.id),
       number: peer.chat_number,
-      online: peerOnline,
-      lastSeen: peerOnline ? null : (peer.last_seen || null),
+      online: peerVisible && peerOnline,
+      lastSeen: peerVisible && !peerOnline ? (peer.last_seen || null) : null,
     });
   });
 
@@ -719,13 +773,9 @@ io.on('connection', socket => {
     const s = online.get(aid);
     if (s) {
       s.delete(socket.id);
-      if (!s.size) {
-        online.delete(aid);
-        const lastSeen = Math.floor(Date.now() / 1000);
-        touchAccountLastSeen(aid, lastSeen);
-        notifyPresence(aid, false, lastSeen);
-      }
+      if (!s.size) online.delete(aid);
     }
+    recomputePresence(aid);
   });
 
   socket.on('msg:send', ({ chatUid, content, fileUrl, fileType, fileName, burnSeconds, replyToId, preview }) => {
