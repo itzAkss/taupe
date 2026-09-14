@@ -623,7 +623,10 @@ app.use((err, req, res, next) => {
 
 const httpsServer = https.createServer(tlsOptions, app);
 const httpServer  = http.createServer(app);
-const io = new Server(httpsServer);
+const io = new Server(httpsServer, {
+  pingInterval: 10000,
+  pingTimeout: 10000,
+});
 io.attach(httpServer);
 
 io.use((socket, next) => {
