@@ -632,6 +632,35 @@ const online = new Map();
 const activeTimedBurns = new Set();
 function roomForChat(uid) { return `chat:${uid}`; }
 
+function touchAccountLastSeen(accountId, unixSec) {
+  try {
+    DB.db.prepare('UPDATE accounts SET last_seen=? WHERE id=?').run(unixSec, accountId);
+  } catch (e) {
+    console.error('[presence] last_seen update failed:', e.message);
+  }
+}
+
+function notifyPresence(accountId, isOnline, lastSeenSec) {
+  const acct = DB.getAccountById(accountId);
+  if (!acct) return;
+  const chats = DB.getChatsForAccount(accountId);
+  for (const c of chats) {
+    const peerId = c.initiator_id === accountId ? c.peer_id : c.initiator_id;
+    io.to(`user:${peerId}`).emit('peer:presence', {
+      chatUid: c.uid,
+      number: acct.chat_number,
+      online: isOnline,
+      lastSeen: lastSeenSec || null,
+    });
+  }
+}
+
+function getChatUidBetween(a, b) {
+  return DB.db.prepare(
+    'SELECT uid FROM chats WHERE (initiator_id=? AND peer_id=?) OR (initiator_id=? AND peer_id=?) LIMIT 1'
+  ).get(a, b, b, a)?.uid || null;
+}
+
 async function pushWakeup(accountId, chatUid) {
   if (online.has(accountId)) return;
   const devices = DB.getPushableDevices(accountId);
@@ -658,9 +687,45 @@ io.on('connection', socket => {
   const chats = DB.getChatsForAccount(aid);
   chats.forEach(c => socket.join(roomForChat(c.uid)));
 
+  notifyPresence(aid, true, null);
+
+  for (const c of chats) {
+    const peerId = c.initiator_id === aid ? c.peer_id : c.initiator_id;
+    const peerAcct = DB.getAccountById(peerId);
+    if (!peerAcct) continue;
+    const peerOnline = online.has(peerId);
+    socket.emit('peer:presence', {
+      chatUid: c.uid,
+      number: peerAcct.chat_number,
+      online: peerOnline,
+      lastSeen: peerOnline ? null : (peerAcct.last_seen || null),
+    });
+  }
+
+  socket.on('presence:get', ({ number }) => {
+    if (!number) return;
+    const peer = DB.getAccountByChatNumber(String(number));
+    if (!peer || peer.id === aid) return;
+    const peerOnline = online.has(peer.id);
+    socket.emit('peer:presence', {
+      chatUid: getChatUidBetween(aid, peer.id),
+      number: peer.chat_number,
+      online: peerOnline,
+      lastSeen: peerOnline ? null : (peer.last_seen || null),
+    });
+  });
+
   socket.on('disconnect', () => {
     const s = online.get(aid);
-    if (s) { s.delete(socket.id); if (!s.size) online.delete(aid); }
+    if (s) {
+      s.delete(socket.id);
+      if (!s.size) {
+        online.delete(aid);
+        const lastSeen = Math.floor(Date.now() / 1000);
+        touchAccountLastSeen(aid, lastSeen);
+        notifyPresence(aid, false, lastSeen);
+      }
+    }
   });
 
   socket.on('msg:send', ({ chatUid, content, fileUrl, fileType, fileName, burnSeconds, replyToId, preview }) => {

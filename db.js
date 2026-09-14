@@ -169,6 +169,15 @@ try {
   console.error('[migration] max_messages column check failed:', e.message);
 }
 
+try {
+  const cols = db.prepare("PRAGMA table_info(accounts)").all();
+  if (!cols.some(c => c.name === 'last_seen')) {
+    db.exec('ALTER TABLE accounts ADD COLUMN last_seen INTEGER');
+  }
+} catch (e) {
+  console.error('[migration] accounts.last_seen column check failed:', e.message);
+}
+
 function generateNumber(len) {
   let n = '';
   for (let i = 0; i < len; i++) n += crypto.randomInt(0, 10);
