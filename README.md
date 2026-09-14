@@ -1,4 +1,4 @@
-# Taupe — Secure messenger (ig)
+# Taupe — your secure messenger
 
 # Screenshots
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/57d6fbe5-bca7-49d2-abdd-3076392ae801" />
@@ -12,33 +12,11 @@
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/9024d38a-9567-45b8-9220-d14c95da4d17" />
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/897d8900-fdd4-447d-8c88-b1988841a140" />
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/34344aa6-3538-4f55-8f07-7b8041469fd0" />
-
-# How to setup
-### Archlinux
-```bash
-sudo pacman -Sy
-sudo pacman -S nodejs git
-```
-
-### Ubuntu/Debian
-```bash
-sudo apt update -y
-sudo apt install git nodejs
-```
-
-### MacOS
-```bash
-brew install git node
-```
-### Windows (WSL)
-```bash
-wsl --install
-```
-(restart and open ubuntu terminal, use Ubuntu/Debian commands)
-
+# Demo
+[Taupe demo](https://tmux.mullet-pence.ts.net/)
 ## Run
 ```bash
-git clone https://github.com/itzAkss/taupe.git
+git clone https://github.com/itzAkss/taupe
 cd taupe
 npm install
 npm start
@@ -48,7 +26,6 @@ npm start
 - [x] E2E files and media
 - [x] sum animations
 - [ ] more animations
-- [ ] host public, on vps (maybe oracle freetier cuz i have no mony)
 - [x] fix avatar editor
 - [x] add reply to msg
 - [x] add voice messages
@@ -63,6 +40,5 @@ npm start
 - [x] additional safety checks
 
 ## majors
-- [ ] Develop a mobile app
-- [ ] same for linux/windows (and even macOS), electron desktop app
-- [ ] split database layers (wow, hard work)
+- [ ] Develop a mobile app (currently in progress)
+- [ ] Desktop app (Linux/Windows)
