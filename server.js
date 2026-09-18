@@ -711,7 +711,7 @@ function getChatUidBetween(a, b) {
   ).get(a, b, b, a)?.uid || null;
 }
 
-async function pushWakeup(accountId, chatUid) {
+async function pushWakeup(accountId, chatUid, preview, burn) {
   if (online.has(accountId)) return;
   const devices = DB.getPushableDevices(accountId);
   for (const d of devices) {
@@ -719,7 +719,7 @@ async function pushWakeup(accountId, chatUid) {
       await fetch(d.push_endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
-        body: JSON.stringify({ t: 'new_message', chatUid }),
+        body: JSON.stringify({ t: 'new_message', chatUid, preview: preview || '', burn: !!burn }),
       });
     } catch (e) {
       console.error('[push] failed for device', d.id, e.message);
@@ -798,7 +798,7 @@ io.on('connection', socket => {
       io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: trimmed, preview: finalPreview });
     }
     const recipientId = isInit ? chat.peer_id : chat.initiator_id;
-    pushWakeup(recipientId, chatUid).catch(e => console.error('[push] wakeup error', e.message));
+    pushWakeup(recipientId, chatUid, finalPreview, !!secs).catch(e => console.error('[push] wakeup error', e.message));
   });
 
   socket.on('msg:read', ({ chatUid }) => {
