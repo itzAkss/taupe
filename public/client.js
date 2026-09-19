@@ -22,6 +22,10 @@ const S = {
   activeBurnTimers: new Map(),
   isLoadingHistory: false,
   hasMoreHistory: true,
+  sendSeq: 0,
+  pendingSends: [],
+  outbox: [],
+  flushing: false,
 };
 
 const $   = id => document.getElementById(id);
@@ -331,21 +335,29 @@ function startPolling() {
 
 async function refreshActiveChat() {
   if (!S.activeChatUid) return;
-  const msgs = await api('GET', `/api/chats/${S.activeChatUid}/messages`);
+  const uid = S.activeChatUid;
+  const msgs = await api('GET', `/api/chats/${uid}/messages`);
   if (myRenderToken !== currentRenderToken) return;
   if (!Array.isArray(msgs)) return;
+  if (S.activeChatUid !== uid) return;
   const cont = $('messages-container');
   const rendered = new Set([...cont.querySelectorAll('[data-msg-id]')].map(el => el.dataset.msgId));
   const peerChatNum = await getActivePeerChatNum();
   const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
   for (const m of msgs) {
-    if (!rendered.has(String(m.id))) {
-      await renderMessage(m, peerChatNum, peerPub);
+    if (rendered.has(String(m.id))) continue;
+    if (m.sender_id == S.account.accountId && S.pendingSends.length) {
+      const p = takePending(uid);
+      if (p) {
+        removePendingBubble(p.pid);
+        if (isEncrypted(m.content)) m._plaintext = p.text;
+      }
     }
+    await renderMessage(m, peerChatNum, peerPub);
   }
 
   if (document.visibilityState === 'visible') {
-    S.socket?.emit('msg:read', { chatUid: S.activeChatUid });
+    S.socket?.emit('msg:read', { chatUid: uid });
   }
 }
 
@@ -364,6 +376,7 @@ function connectSocket() {
     hideUnstable();
     const indicator = $('e2e-indicator');
     if (indicator) indicator.title = 'E2E active';
+    flushOutbox();
   });
   S.socket.on('disconnect', () => { if (!S.ignored) showUnstable(); });
   S.socket.on('connect_error', () => { if (!S.ignored) showUnstable(); });
@@ -398,14 +411,21 @@ function connectSocket() {
 
   S.socket.on('msg:new', async ({ chatUid, msg, preview }) => {
     updateChatPreviewUI(chatUid, preview);
+    const isMyMsg = msg.sender_id == S.account.accountId;
+    let pendingInfo = null;
+    if (isMyMsg) {
+      pendingInfo = takePending(chatUid);
+      if (pendingInfo && S.activeChatUid === chatUid) removePendingBubble(pendingInfo.pid);
+    }
     if (S.activeChatUid === chatUid) {
       if (document.querySelector(`[data-msg-id="${msg.id}"]`)) return;
 
       const peerChatNum = await getActivePeerChatNum();
       const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-      const isMyMsg = msg.sender_id == S.account.accountId;
 
-      if (isMyMsg && S._pendingPlaintext && isEncrypted(msg.content)) {
+      if (pendingInfo) {
+        msg = { ...msg, _plaintext: pendingInfo.text };
+      } else if (isMyMsg && S._pendingPlaintext && isEncrypted(msg.content)) {
         msg = { ...msg, _plaintext: S._pendingPlaintext };
         S._pendingPlaintext = null;
       }
@@ -595,19 +615,21 @@ function connectSocket() {
 
   S.socket.on('chat:new', async ({ chat }) => {
 
-    if (!S.chats.find(c => c.uid === chat.uid)) {
+    if (S.chats.find(c => c.uid === chat.uid)) return;
 
-      const myId = S.account.accountId;
-      const peerChatNum = chat.initiator_id == myId ? chat.peer_chat_number : chat.initiator_chat_number;
-      const aliases = await api('GET', '/api/aliases');
-      const aliasMap = {};
-      (aliases || []).forEach(a => aliasMap[a.target_number] = a.alias);
-      chat.peer_alias = aliasMap[peerChatNum] || null;
-      S.chats.unshift(chat);
-      renderChatList();
+    const myId = S.account.accountId;
+    const peerChatNum = chat.initiator_id == myId ? chat.peer_chat_number : chat.initiator_chat_number;
+    const aliases = await api('GET', '/api/aliases');
 
-      S.socket.emit('chat:join', { chatUid: chat.uid });
-    }
+    if (S.chats.find(c => c.uid === chat.uid)) return;
+
+    const aliasMap = {};
+    (aliases || []).forEach(a => aliasMap[a.target_number] = a.alias);
+    chat.peer_alias = aliasMap[peerChatNum] || null;
+    S.chats.unshift(chat);
+    renderChatList();
+
+    S.socket.emit('chat:join', { chatUid: chat.uid });
   });
 
   S.socket.on('chat:burn:confirmed', ({ chatUid }) => {
@@ -662,7 +684,34 @@ $('btn-ignore').onclick = () => {
 };
 $('btn-unstable-indicator').onclick = showUnstable;
 
+function renderChatListSkeleton() {
+  const list = $('chat-list');
+  if (!list) return;
+  list.innerHTML = '';
+  for (let i = 0; i < 9; i++) {
+    const div = document.createElement('div');
+    div.className = 'skel-chat';
+    div.innerHTML = '<div class="skel skel-ava"></div><div class="skel-lines"><div class="skel skel-bar l1"></div><div class="skel skel-bar l2"></div></div>';
+    list.appendChild(div);
+  }
+}
+
+function renderMessagesSkeleton() {
+  const cont = $('messages-container');
+  if (!cont) return;
+  cont.innerHTML = '';
+  const widths = ['55%', '38%', '62%', '30%', '50%', '58%'];
+  for (let i = 0; i < 6; i++) {
+    const row = document.createElement('div');
+    row.className = 'skel-msg-row ' + (i % 2 ? 'me' : 'them');
+    const h = i % 3 === 0 ? 46 : 34;
+    row.innerHTML = `<div class="skel skel-msg" style="width:${widths[i]};height:${h}px"></div>`;
+    cont.appendChild(row);
+  }
+}
+
 async function loadChats() {
+  if (!S.chats.length) renderChatListSkeleton();
   const data = await api('GET', '/api/chats');
   if (!Array.isArray(data)) return;
   S.chats = data;
@@ -676,7 +725,10 @@ function renderChatList() {
     list.innerHTML = '<div class="chat-list-empty">No chats yet</div>';
     return;
   }
+  const seenUids = new Set();
   S.chats.forEach(c => {
+    if (seenUids.has(c.uid)) return;
+    seenUids.add(c.uid);
     const div = document.createElement('div');
     div.className = 'chat-item' +
       (c.uid === S.activeChatUid ? ' active active-chat' : '') +
@@ -869,10 +921,13 @@ async function openChat(uid) {
   currentRenderToken++;
   const myRenderToken = currentRenderToken;
 
+  const cont = $('messages-container');
+  cont.innerHTML = '';
+  renderMessagesSkeleton();
+
   const msgs = await api('GET', `/api/chats/${uid}/messages`);
   if (myRenderToken !== currentRenderToken) return;
-  
-  const cont = $('messages-container');
+
   cont.innerHTML = '';
   if (Array.isArray(msgs)) {
     for (const m of msgs) {
@@ -1130,7 +1185,9 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   const time = new Date(msg.created_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     let tickHtml = '';
   if (isMe) {
-    if (msg.is_read) {
+    if (msg._pending) {
+      tickHtml = '<span class="read-tick pending"><i class="fa-solid fa-clock"></i></span>';
+    } else if (msg.is_read) {
       tickHtml = '<span class="read-tick read"><i class="fa-solid fa-check-double"></i></span>';
     } else {
       tickHtml = '<span class="read-tick"><i class="fa-solid fa-check"></i></span>';
@@ -1322,7 +1379,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
 }
 
 function markAllRead() { 
-  document.querySelectorAll('.read-tick').forEach(t => {
+  document.querySelectorAll('.read-tick:not(.pending)').forEach(t => {
     t.classList.add('read');
     t.innerHTML = '<i class="fa-solid fa-check-double"></i>';
   }); 
@@ -1383,6 +1440,7 @@ async function sendReaction(msgId, emoji) {
 }
 
 function showMsgCtx(e, msgId, isMe) {
+  if (typeof msgId !== 'number' && !/^\d+$/.test(String(msgId))) return;
   removeCtx();
   const menu = document.createElement('div');
   menu.className = 'ctx-menu'; menu.id = 'ctx-menu';
@@ -1563,56 +1621,159 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('reply-close')?.addEventListener('click', cancelReply);
 });
 
+function peerChatNumFor(uid) {
+  const c = S.chats.find(x => x.uid === uid);
+  if (!c) return null;
+  const myId = S.account.accountId;
+  return c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
+}
+
+function renderPendingBubble(chatUid, text) {
+  S.sendSeq += 1;
+  const pid = `pending-${S.sendSeq}`;
+  const fake = {
+    id: pid,
+    sender_id: S.account.accountId,
+    content: text,
+    created_at: Math.floor(Date.now() / 1000),
+    _pending: true,
+  };
+  S.pendingSends.push({ pid, chatUid, text });
+  if (S.activeChatUid === chatUid) {
+    renderMessage(fake, null, null).then(() => scrollBottom());
+  }
+  return pid;
+}
+
+function takePending(chatUid) {
+  const idx = S.pendingSends.findIndex(p => p.chatUid === chatUid);
+  if (idx === -1) return null;
+  return S.pendingSends.splice(idx, 1)[0];
+}
+
+function removePendingBubble(pid) {
+  document.querySelector(`[data-msg-id="${pid}"]`)?.closest('.msg-wrap')?.remove();
+}
+
+function enqueueSend(job) {
+  S.outbox.push({ attempts: 0, ...job });
+}
+
+async function flushOutbox() {
+  if (S.flushing || !S.outbox.length) return;
+  S.flushing = true;
+  try {
+    while (S.outbox.length) {
+      const ok = await transmitJob(S.outbox[0]);
+      if (!ok) break;
+      S.outbox.shift();
+    }
+  } finally {
+    S.flushing = false;
+  }
+}
+
+function failJob(job) {
+  const idx = S.pendingSends.findIndex(x => x.chatUid === job.chatUid && x.text === job.text);
+  if (idx !== -1) {
+    removePendingBubble(S.pendingSends[idx].pid);
+    S.pendingSends.splice(idx, 1);
+  }
+  toast('Not sent', 'Could not deliver the message. Try again.', 'err');
+}
+
+async function transmitJob(job) {
+  try {
+    if (!S.socket?.connected) return false;
+    const peerChatNum = peerChatNumFor(job.chatUid);
+    if (!peerChatNum) { failJob(job); return true; }
+    const peerPub = await getPeerKey(peerChatNum);
+    if (!peerPub || peerPub.length === 0) {
+      job.attempts += 1;
+      if (job.attempts >= 3) { failJob(job); return true; }
+      return false;
+    }
+    const myDevices = await getMyDevicesKeys();
+    const allRecipients = [...peerPub, ...myDevices];
+    let content = job.text;
+    let preview = null;
+    try {
+      content = await encryptMsg(content, peerChatNum, allRecipients);
+      if (!job.isGif && !S.burnSeconds) {
+        preview = await encryptMsg(job.text.slice(0, 60), peerChatNum, allRecipients);
+      }
+    } catch (e) { console.warn('[E2E] encrypt failed', e); }
+    S.socket.emit('msg:send', {
+      chatUid: job.chatUid,
+      content,
+      preview,
+      fileUrl: null,
+      fileType: null,
+      fileName: null,
+      burnSeconds: S.burnSeconds || null,
+      replyToId: job.replyToId || null,
+    });
+    return true;
+  } catch (e) {
+    console.error('[send]', e);
+    return false;
+  }
+}
+
 async function sendMsg() {
   if (!S.activeChatUid) return;
-  if (!S.socket?.connected) { toast('Not connected', 'Waiting...', 'warn'); return; }
   const text = $('msg-input').value.trim();
   const file = S.pendingFile;
   if (!text && !file) return;
-  const peerChatNum = await getActivePeerChatNum();
-  const peerPub     = peerChatNum ? await getPeerKey(peerChatNum) : [];
-  const myDevices   = await getMyDevicesKeys();
-  
-  const allRecipients = [...peerPub, ...myDevices];
-  if (peerPub.length === 0) {
-    toast('Cannot send', 'Peer has not set up E2E encryption yet. Wait for them to come online.', 'err', 5000);
-    return;
-  }
+  const chatUid = S.activeChatUid;
+  const replyId = replyTo?.id || null;
 
-  let content = text || null;
-  let preview = null;
-  if (content && peerPub) {
-    try { 
-      content = await encryptMsg(content, peerChatNum, allRecipients);
-      if (!S.burnSeconds) {
-        preview = await encryptMsg(text.slice(0, 60), peerChatNum, allRecipients);
-      }
-    } catch (e) { console.warn('[E2E] encrypt failed', e); }
-  } else if (content) {
-    if (!S.burnSeconds) {
-      preview = content.slice(0, 60);
-    }
+  if (file && !S.socket?.connected) {
+    toast('Not connected', 'Waiting for connection before sending the file', 'warn');
+    return;
   }
 
   $('msg-input').value = '';
   $('msg-input').style.height = 'auto';
   S.pendingFile = null;
   hide($('file-preview'));
-  S.socket.emit('typing:stop', { chatUid: S.activeChatUid });
-
-  S.socket.emit('msg:send', {
-    chatUid:     S.activeChatUid,
-    content,
-    preview,
-    fileUrl:     file?.url  || null,
-    fileType:    file?.type || null,
-    fileName:    file?.name || null,
-    burnSeconds: S.burnSeconds || null,
-    replyToId:   replyTo?.id || null,
-  });
-
-  if (text) S._pendingPlaintext = text;
+  S.socket?.emit('typing:stop', { chatUid });
   cancelReply();
+
+  if (file) {
+    const peerChatNum = await getActivePeerChatNum();
+    const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
+    const myDevices = await getMyDevicesKeys();
+    const allRecipients = [...peerPub, ...myDevices];
+    if (peerPub.length === 0) {
+      toast('Cannot send', 'Peer has not set up E2E encryption yet. Wait for them to come online.', 'err', 5000);
+      return;
+    }
+    let content = text || null;
+    let preview = null;
+    if (content) {
+      try {
+        content = await encryptMsg(content, peerChatNum, allRecipients);
+        if (!S.burnSeconds) preview = await encryptMsg(text.slice(0, 60), peerChatNum, allRecipients);
+      } catch (e) { console.warn('[E2E] encrypt failed', e); }
+    }
+    S.socket.emit('msg:send', {
+      chatUid,
+      content,
+      preview,
+      fileUrl: file.url || null,
+      fileType: file.type || null,
+      fileName: file.name || null,
+      burnSeconds: S.burnSeconds || null,
+      replyToId: replyId,
+    });
+    if (text) S._pendingPlaintext = text;
+    return;
+  }
+
+  renderPendingBubble(chatUid, text);
+  enqueueSend({ chatUid, text, replyToId: replyId });
+  flushOutbox();
 }
 
 const MAX_FILE_SIZE   = 25 * 1024 * 1024;
@@ -2433,29 +2594,13 @@ async function loadGifs(query, isNewSearch) {
 }
 
 async function sendGif(url) {
-  const peerChatNum = await getActivePeerChatNum();
-  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
-  const myDevices = await getMyDevicesKeys();
-  const allRecipients = [...peerPub, ...myDevices];
-
-  let content = 'gif:' + url;
-  if (allRecipients.length > 0) {
-    try { content = await encryptMsg(content, peerChatNum, allRecipients); }
-    catch (e) { console.warn('[E2E] encrypt failed', e); }
-  }
-  
-  S.socket.emit('msg:send', {
-    chatUid: S.activeChatUid,
-    content,
-    fileUrl: null,
-    fileType: null,
-    fileName: null,
-    burnSeconds: S.burnSeconds || null,
-    replyToId: replyTo?.id || null,
-  });
-  
-  S._pendingPlaintext = 'gif:' + url;
+  const chatUid = S.activeChatUid;
+  if (!chatUid) return;
+  const replyId = replyTo?.id || null;
   cancelReply();
+  renderPendingBubble(chatUid, 'gif:' + url);
+  enqueueSend({ chatUid, text: 'gif:' + url, isGif: true, replyToId: replyId });
+  flushOutbox();
 }
 
  $('save-number-box').onclick = () => {
