@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 
-try { require('dotenv').config(); } catch (e) {}
+try { require('dotenv').config(); } catch (e) {  }
 
 let PEPPER = process.env.TAUPE_PEPPER || '';
 if (!PEPPER) {
@@ -125,6 +125,25 @@ db.exec(`
     emoji TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (message_id, account_id, emoji)
+  );
+
+  CREATE TABLE IF NOT EXISTS system_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    read_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_sysmsg_acct ON system_messages(account_id, id);
+
+  CREATE TABLE IF NOT EXISTS key_sync_inbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    from_public_key TEXT NOT NULL,
+    encrypted_key TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
 `);
 
@@ -285,7 +304,7 @@ function safeUnlinkUpload(relPath) {
     const resolved = resolveUploadPath(relPath);
     if (resolved !== UPLOAD_DIR && !resolved.startsWith(UPLOAD_DIR + path.sep)) return;
     if (fs.existsSync(resolved)) fs.unlinkSync(resolved);
-  } catch (e) {}
+  } catch (e) {  }
 }
 
 function deleteAccount(accountId) {
@@ -446,18 +465,18 @@ function getMessages(chatId, accountId, { beforeId = null, limit = 200 } = {}) {
   params.push(limit);
 
   const messages = db.prepare(sql).all(...params).reverse();
-  
+
   if (messages.length > 0) {
     const ids = messages.map(m => m.id);
     const placeholders = ids.map(() => '?').join(',');
     const reactions = db.prepare(`SELECT message_id, account_id, emoji FROM reactions WHERE message_id IN (${placeholders})`).all(...ids);
-    
+
     const map = {};
     reactions.forEach(r => {
       if (!map[r.message_id]) map[r.message_id] = [];
       map[r.message_id].push({ account_id: r.account_id, emoji: r.emoji });
     });
-    
+
     return messages.map(m => ({ ...m, reactions: map[m.id] || [] }));
   }
 
@@ -524,7 +543,7 @@ function getUploadUsageBytes(accountId) {
       if (resolved !== UPLOAD_DIR && !resolved.startsWith(UPLOAD_DIR + path.sep)) continue;
       const st = fs.statSync(resolved);
       if (st.isFile()) total += st.size;
-    } catch (e) {}
+    } catch (e) {  }
   }
   return total;
 }
@@ -603,6 +622,85 @@ function enforceMaxMessages(chatId) {
   return toDelete.map(m => m.id);
 }
 
+const SYS_MSG_TYPES = ['device_login', 'key_request', 'key_transfer_done'];
+
+function parseSystemRow(r) {
+  if (!r) return null;
+  let payload = {};
+  try { payload = JSON.parse(r.payload); } catch {}
+  return { ...r, payload };
+}
+
+function addSystemMessage(accountId, type, payload = {}, status = null) {
+  if (!SYS_MSG_TYPES.includes(type)) return null;
+  const info = db.prepare(
+    'INSERT INTO system_messages (account_id, type, payload, status) VALUES (?, ?, ?, ?)'
+  ).run(accountId, type, JSON.stringify(payload), status);
+  return parseSystemRow(
+    db.prepare('SELECT * FROM system_messages WHERE id=?').get(info.lastInsertRowid)
+  );
+}
+
+function getSystemMessage(accountId, id) {
+  return parseSystemRow(
+    db.prepare('SELECT * FROM system_messages WHERE id=? AND account_id=?').get(id, accountId)
+  );
+}
+
+function getSystemMessages(accountId, limit = 200) {
+  return db.prepare(
+    'SELECT * FROM system_messages WHERE account_id=? ORDER BY id DESC LIMIT ?'
+  ).all(accountId, limit).map(parseSystemRow);
+}
+
+function unreadSystemCount(accountId) {
+  return db.prepare(
+    'SELECT COUNT(*) AS c FROM system_messages WHERE account_id=? AND read_at IS NULL'
+  ).get(accountId).c;
+}
+
+function markSystemMessagesRead(accountId, id = null) {
+  const now = Math.floor(Date.now() / 1000);
+  if (id != null) {
+    db.prepare('UPDATE system_messages SET read_at=? WHERE account_id=? AND id=? AND read_at IS NULL')
+      .run(now, accountId, id);
+  } else {
+    db.prepare('UPDATE system_messages SET read_at=? WHERE account_id=? AND read_at IS NULL')
+      .run(now, accountId);
+  }
+}
+
+function resolveSystemMessage(accountId, id, status) {
+  const row = getSystemMessage(accountId, id);
+  if (!row || row.type !== 'key_request' || row.status !== 'pending') return null;
+  db.prepare('UPDATE system_messages SET status=? WHERE id=?').run(status, id);
+  return { ...row, status };
+}
+
+function pendingKeyRequestFor(accountId, deviceId) {
+  return parseSystemRow(db.prepare(
+    "SELECT * FROM system_messages WHERE account_id=? AND type='key_request' AND status='pending' AND json_extract(payload,'$.deviceId')=? ORDER BY id DESC LIMIT 1"
+  ).get(accountId, Number(deviceId)));
+}
+
+function completeKeyRequest(accountId, id) {
+  const row = getSystemMessage(accountId, id);
+  if (!row || row.type !== 'key_request' || !['pending', 'approved'].includes(row.status)) return null;
+  db.prepare("UPDATE system_messages SET status='completed' WHERE id=?").run(id);
+  return { ...row, status: 'completed' };
+}
+
+function queueKeySync(deviceId, fromPublicKey, encryptedKey) {
+  db.prepare('INSERT INTO key_sync_inbox (device_id, from_public_key, encrypted_key) VALUES (?, ?, ?)')
+    .run(deviceId, fromPublicKey, encryptedKey);
+}
+
+function takeKeySyncInbox(deviceId) {
+  const rows = db.prepare('SELECT * FROM key_sync_inbox WHERE device_id=? ORDER BY id').all(deviceId);
+  if (rows.length) db.prepare('DELETE FROM key_sync_inbox WHERE device_id=?').run(deviceId);
+  return rows;
+}
+
 module.exports = {
   db,
   createAccount, getAccountByNumber, getAccountByChatNumber, getAccountByUsername, getAccountById,
@@ -619,4 +717,7 @@ module.exports = {
   hardDeleteMessage, setBurnAt, collectExpiredBurns,
   setMaxMessages, enforceMaxMessages,
   getUploadUsageBytes, safeUnlinkUpload,
+  addSystemMessage, getSystemMessage, getSystemMessages, unreadSystemCount,
+  markSystemMessagesRead, resolveSystemMessage, pendingKeyRequestFor,
+  completeKeyRequest, queueKeySync, takeKeySyncInbox,
 };

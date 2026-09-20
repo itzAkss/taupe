@@ -9,6 +9,11 @@ const S = {
   account:    null,
   chats:      [],
   activeChatUid: null,
+  systemOpen: false,
+  sysMessages: [],
+  sysUnread:  0,
+  myPendingKeyRequestId: null,
+  myDeviceId: null,
   socket:     null,
   ignored:    false,
   pendingFile: null,
@@ -73,13 +78,13 @@ function dialog({ title, body, input, inputPlaceholder, inputDefault, inputType,
 }
 
 function toast(title, msg = '', type = 'info', duration = 4000, onClick = null) {
-  const icons = { 
-    info: 'fa-circle-info', 
-    ok: 'fa-check', 
-    warn: 'fa-triangle-exclamation', 
-    err: 'fa-circle-xmark', 
-    key: 'fa-key', 
-    msg: 'fa-comment' 
+  const icons = {
+    info: 'fa-circle-info',
+    ok: 'fa-check',
+    warn: 'fa-triangle-exclamation',
+    err: 'fa-circle-xmark',
+    key: 'fa-key',
+    msg: 'fa-comment'
   };
   const iconClass = icons[type] || 'fa-circle-info';
   const c = $('toast-container');
@@ -120,7 +125,7 @@ let pendingAccountData = null;
   localStorage.removeItem('taupe_active_chat');
   const d = await api('POST', '/api/register');
   if (d.error) { $('auth-error').textContent = d.error; return; }
-  
+
   if (localStorage.getItem('taupe_check_done') === 'true') {
     localStorage.setItem('lastNumber', d.accountNumber);
     await bootApp(d, true);
@@ -139,12 +144,12 @@ let pendingAccountData = null;
   const raw = $('input-number').value.replace(/\D/g, '');
   if (raw.length !== 16) { $('auth-error').textContent = 'Enter your 16-digit private number'; return; }
   const d = await api('POST', '/api/login', { number: raw });
-  
+
   if (d.error === 'Max 5 devices. Kick one first.') {
     showKickDevicesModal(raw);
     return;
   }
-  
+
   if (d.error) { $('auth-error').textContent = d.error; return; }
   localStorage.setItem('lastNumber', d.accountNumber);
   await bootApp(d, false);
@@ -153,7 +158,7 @@ let pendingAccountData = null;
 async function showKickDevicesModal(number) {
   const d = await api('POST', '/api/login/devices', { number });
   if (d.error) { $('auth-error').textContent = d.error; return; }
-  
+
   const list = $('kick-devices-list');
   list.innerHTML = '';
   (d.devices || []).forEach(dev => {
@@ -220,10 +225,17 @@ async function bootApp(me, isNewAccount = false) {
   $('my-number-display').textContent = fmtNum(me.chatNumber || me.accountNumber?.slice(-8));
   switchScreen('main');
 
-  if (me.deviceId) await setMyDeviceId(me.deviceId);
+  if (!me.devices) {
+    const full = await api('GET', '/api/me');
+    if (!full.error && Array.isArray(full.devices)) {
+      me = { ...full, accountNumber: me.accountNumber, chatNumber: me.chatNumber || full.chatNumber };
+    }
+  }
+
+  if (me.deviceId) { await setMyDeviceId(me.deviceId); S.myDeviceId = me.deviceId; }
   if (me.devices && me.devices.length > 1) {
     const alreadySynced = await hasSyncedKeys();
-    
+
     if (!alreadySynced) {
       S.waitingForKeySync = true;
       setTimeout(async () => {
@@ -237,9 +249,10 @@ async function bootApp(me, isNewAccount = false) {
 
   await uploadMyPublicKey();
   await loadChats();
+  await loadSystemMessages();
   connectSocket();
   startPolling();
-  
+
   const savedChat = localStorage.getItem('taupe_active_chat');
   if (savedChat && S.chats.find(c => c.uid === savedChat)) {
     openChat(savedChat);
@@ -379,30 +392,46 @@ function connectSocket() {
     reconnection: true, reconnectionDelay: 1000, reconnectionAttempts: Infinity,
   });
 
-  S.socket.on('connect', () => {
+  S.socket.on('connect', async () => {
     hideUnstable();
     const indicator = $('e2e-indicator');
     if (indicator) indicator.title = 'E2E active';
     flushOutbox();
+    if (S.waitingForKeySync) {
+      S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
+    }
   });
   S.socket.on('disconnect', () => { if (!S.ignored) showUnstable(); });
   S.socket.on('connect_error', () => { if (!S.ignored) showUnstable(); });
 
   S.socket.emit('key:presence', { myPublicKey: 'online' });
 
-  S.socket.on('key:presence', async () => {
-    if (S.waitingForKeySync) {
-      S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
+  S.socket.on('sys:new', ({ message }) => {
+    if (!message || S.sysMessages.some(m => m.id === message.id)) return;
+    S.sysMessages.unshift(message);
+    if (message.type === 'key_request' && Number(message.payload?.deviceId) === Number(S.myDeviceId)) {
+      S.myPendingKeyRequestId = message.id;
+      if (S.waitingForKeySync) toast('Waiting for approval', 'Another device must confirm the key transfer.', 'info', 6000);
     }
+    if (S.systemOpen) {
+      renderSystemMessages();
+    } else {
+      S.sysUnread++;
+      updateSystemBadge();
+    }
+    refreshSystemChatItem();
   });
 
-  S.socket.on('key:request', async ({ fromDeviceId, fromPublicKey }) => {
-    try {
-      const myPrivJwk = await exportPrivateKeyForSync();
-      const encryptedKey = await encryptKeyForSync(myPrivJwk, fromPublicKey);
-      S.socket.emit('key:sync', { targetDeviceId: fromDeviceId, encryptedKey });
-      toast('Key Sync', 'Sent encryption keys to another device.', 'ok', 3000);
-    } catch (e) { console.error('[Key Sync] Failed to send key:', e); }
+  S.socket.on('sys:updated', ({ id, status }) => {
+    const m = S.sysMessages.find(x => x.id === id);
+    if (m) m.status = status;
+    if (status === 'declined' && id === S.myPendingKeyRequestId) {
+      S.myPendingKeyRequestId = null;
+      S.waitingForKeySync = false;
+      toast('Key transfer declined', 'The request was rejected by another device.', 'warn', 5000);
+    }
+    if (S.systemOpen) renderSystemMessages();
+    refreshSystemChatItem();
   });
 
   S.socket.on('key:sync', async ({ fromPublicKey, encryptedKey }) => {
@@ -410,7 +439,11 @@ function connectSocket() {
       await decryptSyncedKey(encryptedKey, fromPublicKey);
       S.waitingForKeySync = false;
       toast('Keys Synced', 'Successfully imported keys from another device.', 'ok', 3000);
-      
+      const rid = S.myPendingKeyRequestId;
+      if (rid) {
+        S.myPendingKeyRequestId = null;
+        S.socket.emit('key:sync:done', { id: rid });
+      }
       if (S.activeChatUid) openChat(S.activeChatUid);
       else loadChats();
     } catch (e) { console.error('[Key Sync] Failed to decrypt synced key:', e); }
@@ -471,9 +504,9 @@ function connectSocket() {
         c.peer_username = username;
         c.peer_avatar = avatarPath;
       }
-      
+
       renderChatList();
-      
+
       if (S.activeChatUid === chatUid) {
         $('chat-title-display').textContent = chatLabel(c);
         const myId = S.account.accountId;
@@ -541,13 +574,13 @@ function connectSocket() {
     if (!wrap) return;
 
     let reactionsBar = wrap.querySelector('.msg-reactions');
-    
+
     const peerChatNum = await getActivePeerChatNum();
     const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-    
+
     const grouped = {};
     const myEncEmojis = {};
-    
+
     for (const r of reactions) {
       let emoji = r.emoji;
       if (isEncrypted(emoji) && peerPub) {
@@ -558,7 +591,7 @@ function connectSocket() {
       }
       grouped[emoji] = grouped[emoji] || [];
       grouped[emoji].push(r.account_id);
-      
+
       if (r.account_id === Number(S.account.accountId)) {
         myEncEmojis[emoji] = r.emoji;
       }
@@ -574,7 +607,7 @@ function connectSocket() {
       reactionsBar.className = 'msg-reactions';
       wrap.appendChild(reactionsBar);
     }
-    
+
     reactionsBar.innerHTML = '';
     for (const [emoji, users] of Object.entries(grouped)) {
       const isMine = users.includes(Number(S.account.accountId));
@@ -608,7 +641,7 @@ function connectSocket() {
     const isMe = String(by) === String(S.account.accountId);
     if (forWhom === 'both' || (forWhom === 'peer' && !isMe)) {
       const chatEl = document.querySelector(`.chat-item[data-uid="${chatUid}"]`);
-      
+
       if (chatEl) {
         chatEl.classList.add('removing');
         setTimeout(() => {
@@ -730,11 +763,165 @@ async function loadChats() {
   renderChatList();
 }
 
+function sysMsgText(m) {
+  const p = m.payload || {};
+  if (m.type === 'device_login') return `Sign-in from a new device: “${p.deviceName || 'device'}”`;
+  if (m.type === 'key_request') return `Device “${p.deviceName || 'new device'}” requests the encryption key to read message history.`;
+  if (m.type === 'key_transfer_done') return `Keys successfully transferred to “${p.deviceName || 'device'}”.`;
+  return 'System event';
+}
+
+async function loadSystemMessages() {
+  const d = await api('GET', '/api/system/messages');
+  if (!d || d.error || !Array.isArray(d.messages)) return;
+  S.sysMessages = d.messages;
+  S.sysUnread = d.unread || 0;
+  const mine = S.sysMessages.find(m => m.type === 'key_request' && m.status === 'pending' &&
+    Number(m.payload?.deviceId) === Number(S.myDeviceId));
+  if (mine) S.myPendingKeyRequestId = mine.id;
+  refreshSystemChatItem();
+  updateSystemBadge();
+}
+
+function refreshSystemChatItem() {
+  const list = $('chat-list');
+  if (!list) return;
+  const old = $('chat-item-system');
+  if (old) old.remove();
+  const div = document.createElement('div');
+  div.className = 'chat-item chat-item-system' + (S.systemOpen ? ' active active-chat' : '');
+  div.id = 'chat-item-system';
+  const last = S.sysMessages[0];
+  const preview = last ? sysMsgText(last) : 'Account events and security alerts';
+  div.innerHTML = `
+    <div class="chat-avatar sys-avatar"><i class="fa-solid fa-bell-ring"></i></div>
+    <div class="chat-item-info">
+      <div class="chat-item-top"><span class="chat-item-name">Taupe</span></div>
+      <div class="chat-item-preview" id="sys-preview">${esc(preview)}</div>
+    </div>
+    <span class="chat-item-badge sys-badge ${S.sysUnread > 0 ? '' : 'hidden'}" id="sys-badge">${S.sysUnread || ''}</span>
+  `;
+  div.onclick = () => openSystemChat();
+  const empty = list.querySelector('.chat-list-empty');
+  if (empty) list.insertBefore(div, empty);
+  else list.prepend(div);
+}
+
+function updateSystemBadge() {
+  const b = $('sys-badge');
+  if (!b) return;
+  b.textContent = S.sysUnread || '';
+  b.classList.toggle('hidden', !(S.sysUnread > 0));
+  const p = $('sys-preview');
+  const last = S.sysMessages[0];
+  if (p && last) p.textContent = sysMsgText(last);
+}
+
+async function openSystemChat() {
+  S.systemOpen = true;
+  S.activeChatUid = null;
+  localStorage.removeItem('taupe_active_chat');
+  hide($('empty-state'));
+  const cv = $('chat-view');
+  cv.classList.remove('hidden'); cv.style.display = 'flex';
+  showChatArea();
+
+  $('chat-title-display').textContent = 'Taupe';
+  $('chat-title-display').style.cursor = '';
+  $('chat-title-display').onclick = null;
+  $('chat-header-avatar').classList.add('hidden');
+  $('chat-subtitle').textContent = 'Account events and security';
+  $('chat-subtitle').onclick = null;
+  hide($('msg-input-area'));
+  hide($('btn-burn-mode'));
+  hide($('btn-chat-menu'));
+
+  document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active', 'active-chat'));
+  const item = $('chat-item-system');
+  if (item) item.classList.add('active', 'active-chat');
+
+  renderSystemMessages();
+  const d = await api('POST', '/api/system/read', {});
+  if (d && !d.error) { S.sysUnread = 0; updateSystemBadge(); }
+}
+
+function renderSystemMessages() {
+  const cont = $('messages-container');
+  cont.innerHTML = '';
+  if (!S.sysMessages.length) {
+    cont.innerHTML = '<div class="sys-empty">No events yet.<br>Sign-ins and key-transfer requests will appear here.</div>';
+    return;
+  }
+  for (const m of [...S.sysMessages].reverse()) {
+    const card = document.createElement('div');
+    card.className = 'sys-card sys-' + m.type;
+    const icon = m.type === 'key_request' ? 'fa-key'
+      : m.type === 'device_login' ? 'fa-mobile-screen-button'
+      : m.type === 'key_transfer_done' ? 'fa-shield-halved' : 'fa-bell';
+    const when = new Date((m.created_at || 0) * 1000);
+    const time = when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ', ' + when.toLocaleDateString();
+    let statusHtml = '';
+    if (m.type === 'key_request') {
+      const st = m.status || 'pending';
+      const chips = { approved: 'Approved', declined: 'Declined', completed: 'Keys transferred' };
+      if (st === 'pending') {
+        statusHtml = `
+          <div class="sys-actions">
+            <button class="sys-btn approve" data-id="${m.id}"><i class="fa-solid fa-check"></i> Approve</button>
+            <button class="sys-btn deny" data-id="${m.id}"><i class="fa-solid fa-xmark"></i> Deny</button>
+          </div>`;
+      } else if (chips[st]) {
+        statusHtml = `<div class="sys-status ${st}">${esc(chips[st])}</div>`;
+      }
+    }
+    card.innerHTML = `
+      <div class="sys-icon"><i class="fa-solid ${icon}"></i></div>
+      <div class="sys-body">
+        <div class="sys-text">${esc(sysMsgText(m))}</div>
+        ${statusHtml}
+        <div class="sys-time">${esc(time)}</div>
+      </div>`;
+    cont.appendChild(card);
+  }
+  cont.querySelectorAll('.sys-btn').forEach(btn => {
+    btn.onclick = () => resolveKeyRequest(parseInt(btn.dataset.id), btn.classList.contains('approve'));
+  });
+  cont.style.scrollBehavior = 'auto';
+  cont.scrollTop = cont.scrollHeight;
+  cont.style.scrollBehavior = '';
+}
+
+async function resolveKeyRequest(id, approve) {
+  const m = S.sysMessages.find(x => x.id === id);
+  if (!m) return;
+  if (approve) {
+    try {
+      const myPrivJwk = await exportPrivateKeyForSync();
+      const r = await api('POST', `/api/system/${id}/resolve`, { action: 'approved' });
+      if (r.error) { toast('Not approved', r.error, 'warn', 4000); return; }
+      const encryptedKey = await encryptKeyForSync(myPrivJwk, m.payload.publicKey);
+      S.socket.emit('key:sync', { targetDeviceId: m.payload.deviceId, encryptedKey });
+      toast('Keys sent', 'Encrypted keys were sent to the device.', 'ok', 4000);
+    } catch (e) {
+      console.error('[Key Sync] approve failed:', e);
+      toast('Approve failed', 'Could not export or encrypt keys on this device.', 'warn', 4000);
+      return;
+    }
+  } else {
+    const r = await api('POST', `/api/system/${id}/resolve`, { action: 'declined' });
+    if (r.error) { toast('Not declined', r.error, 'warn', 4000); return; }
+  }
+  m.status = approve ? 'approved' : 'declined';
+  renderSystemMessages();
+  refreshSystemChatItem();
+}
+
 function renderChatList() {
   const list = $('chat-list');
   list.innerHTML = '';
   if (!S.chats.length) {
     list.innerHTML = '<div class="chat-list-empty">No chats yet</div>';
+    refreshSystemChatItem();
     return;
   }
   const seenUids = new Set();
@@ -757,7 +944,7 @@ function renderChatList() {
       ? `${esc(displayName)} <span class="num-dim">${fmtNum(peerChatNum)}</span>`
       : `<span class="mono">${fmtNum(peerChatNum)}</span>`;
     const avatarSrc  = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
-    
+
     let previewText = c.last_message_preview || '';
     if (isEncrypted(previewText)) {
       previewText = '[encrypted]';
@@ -805,6 +992,7 @@ function renderChatList() {
       });
     }
   });
+  refreshSystemChatItem();
 }
 
 function chatLabel(c) {
@@ -825,7 +1013,7 @@ function getPeerDisplayName(c) {
     const lbl = c.label_initiator;
     if (lbl) return lbl;
     return c.peer_alias || c.peer_username || fmtNum(c.peer_chat_number);
-  } 
+  }
   const lbl = c.label_peer;
   if (lbl) return lbl;
   return c.initiator_username || fmtNum(c.initiator_chat_number);
@@ -846,7 +1034,7 @@ function bumpUnread(uid) {
 }
 
 function updateChatPreviewUI(uid, preview) {
-  const el = $('preview-' + uid); 
+  const el = $('preview-' + uid);
   if (el) {
     const cleanText = (preview || '').replace(/^e2e:/, '');
     if (preview && preview.startsWith('e2e:')) {
@@ -859,6 +1047,10 @@ function updateChatPreviewUI(uid, preview) {
   if (c) c.last_message_preview = preview;
 }
 async function openChat(uid) {
+  S.systemOpen = false;
+  show($('msg-input-area'));
+  show($('btn-burn-mode'));
+  show($('btn-chat-menu'));
   S.activeChatUid = uid;
   localStorage.setItem('taupe_active_chat', uid);
   hide($('empty-state'));
@@ -891,7 +1083,7 @@ async function openChat(uid) {
   } else {
     headerAvatar.classList.add('hidden');
   }
-  
+
   S.peerKeys.delete(peerChatNum);
   let peerPub = await getPeerKey(peerChatNum);
   if (!peerPub) {
@@ -920,7 +1112,7 @@ async function openChat(uid) {
       copyToClipboard(peerChatNum, 'Copied', fmtNum(peerChatNum));
     }
   };
-  
+
   updateBurnBtn();
   document.querySelectorAll('.chat-item').forEach(el => {
     const isActive = el.dataset.uid === uid;
@@ -973,7 +1165,7 @@ async function openChat(uid) {
     const oldScrollTop    = cont.scrollTop;
 
     const olderMsgs = await api('GET', `/api/chats/${uid}/messages?beforeId=${firstMsg.dataset.msgId}`);
-    
+
     if (myRenderToken !== currentRenderToken) return;
 
     if (!Array.isArray(olderMsgs) || olderMsgs.length === 0) {
@@ -1047,7 +1239,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   } else {
     prevWrap = cont.lastElementChild;
   }
-  
+
   const showLabel = false
   const prevTime = prevWrap ? parseInt(prevWrap.dataset.ts || '0') : 0;
   const showTime = true
@@ -1078,7 +1270,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       if (origMsg && !origMsg.error) {
         let origText = '';
         let isSystem = false;
-        
+
         if (origMsg.file_path) {
           isSystem = true;
           if (origMsg.file_type === 'image') origText = '<i class="fa-solid fa-image"></i> Photo';
@@ -1087,7 +1279,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         } else {
           origText = origMsg.content || '';
         }
-        
+
         if (origText && isEncrypted(origText) && decryptKeys) {
           try { origText = await decryptMsg(origText, decryptChatNum, decryptKeys); }
           catch { origText = '[decryption failed]'; }
@@ -1097,7 +1289,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
           isSystem = true;
           origText = '<i class="fa-solid fa-film"></i> GIF';
         }
-        
+
         const c = S.chats.find(x => x.uid === S.activeChatUid);
         let senderName = 'Peer';
         if (String(origMsg.sender_id) === String(S.account.accountId)) {
@@ -1105,7 +1297,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         } else {
           senderName = getPeerDisplayName(c);
         }
-        
+
         const finalText = isSystem ? origText : twemojiSafe(esc(origText || '[Media]'));
         replyHtml = `<div class="msg-reply"><div class="msg-reply-name">${esc(senderName)}</div><div class="msg-reply-text">${finalText}</div></div>`;
       } else {
@@ -1166,7 +1358,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     let text = msg._plaintext || msg.content;
     if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
       try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
-      catch { 
+      catch {
         S.peerKeys.delete(decryptChatNum);
         await invalidateSession(decryptChatNum);
         const freshKeys = await getPeerKey(decryptChatNum);
@@ -1178,7 +1370,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         }
       }
     } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted]'; }
-    
+
     if (typeof text === 'string' && text.includes('gif:')) {
       const gifData = parseGifContent(text);
       if (gifData) {
@@ -1206,19 +1398,19 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       tickHtml = '<span class="read-tick"><i class="fa-solid fa-check"></i></span>';
     }
   }
-  
+
   const isEncryptedPayload = isEncrypted(msg.content) || (msg.file_path && msg.file_path.endsWith('.bin'));
-  const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted"><i class="fa-solid fa-lock"></i></span>' : '';  
+  const lockIcon = isEncryptedPayload ? '<span class="e2e-lock" title="E2E encrypted"><i class="fa-solid fa-lock"></i></span>' : '';
   const burnMetaHtml = (hasBurn && !msg._spoilerOpened) ? `<span class="burn-countdown">${formatBurnSecs(msg.burn_seconds)}</span>` : '';
   const metaHtml = `<span class="msg-meta-inline">${burnMetaHtml}${lockIcon}${showTime ? `<span>${time}</span>` : ''}${tickHtml}</span>`;
   const isMediaContent = content.includes('msg-img') || content.includes('msg-gif') || content.includes('msg-audio-player');
   const isAudio = content.includes('msg-audio-player');
-  
+
   const isEmojiOnly = content.includes('msg-emoji-only');
   let bubbleContent = content;
   let bubbleClasses = `msg-bubble ${isMe ? 'me' : 'them'}`;
   if (isEmojiOnly) bubbleClasses += ' emoji-only';
-  
+
   if (isEmojiOnly) {
     bubbleContent = `<div class="msg-text-content">${content}</div>${metaHtml}`;
   } else if (isMediaContent) {
@@ -1237,7 +1429,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   if (msg.reactions && msg.reactions.length > 0) {
     const grouped = {};
     const myEncEmojis = {};
-    
+
     for (const r of msg.reactions) {
       let emoji = r.emoji;
       if (isEncrypted(emoji) && decryptKeys) {
@@ -1248,12 +1440,12 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       }
       grouped[emoji] = grouped[emoji] || [];
       grouped[emoji].push(r.account_id);
-      
+
       if (r.account_id === Number(S.account.accountId)) {
         myEncEmojis[emoji] = r.emoji;
       }
     }
-    
+
     reactionsHtml = '<div class="msg-reactions">';
     for (const [emoji, users] of Object.entries(grouped)) {
       const isMine = users.includes(Number(S.account.accountId));
@@ -1354,7 +1546,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
 
   let isImageType = msg.file_type === 'image';
   let isAudioType = msg.file_type === 'audio';
-  
+
   if (isEncryptedFile && msg.file_name) {
     const baseName = msg.file_name.replace(/\.bin$/, '').toLowerCase();
     if (!isImageType && /\.(png|jpe?g|gif|webp|bmp|svg)$/.test(baseName)) isImageType = true;
@@ -1368,7 +1560,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
       const encBlob = await resp.blob();
       const decBlob = await decryptFile(encBlob, decryptChatNum, decryptKeys);
       const blobUrl = URL.createObjectURL(decBlob);
-      
+
       if (isImageType) {
         return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}">`;
       } else if (isAudioType) {
@@ -1382,7 +1574,7 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
       return `<span style="color:var(--danger)">[decryption failed]</span>`;
     }
   }
-  
+
   if (isImageType) {
     return `<img class="msg-img" src="${msg.file_path}" loading="lazy" data-msg-id="${msg.id}">`;
   } else if (isAudioType) {
@@ -1391,11 +1583,11 @@ async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
   return `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
 }
 
-function markAllRead() { 
+function markAllRead() {
   document.querySelectorAll('.read-tick:not(.pending)').forEach(t => {
     t.classList.add('read');
     t.innerHTML = '<i class="fa-solid fa-check-double"></i>';
-  }); 
+  });
 }
 function scrollBottom() { const c = $('messages-container'); c.scrollTop = c.scrollHeight; }
 
@@ -1440,7 +1632,6 @@ function addRecentReaction(emoji) {
   localStorage.setItem('taupe_recent_reactions', JSON.stringify(recent));
 }
 
-
 async function sendReaction(msgId, emoji) {
   const peerChatNum = await getActivePeerChatNum();
   const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
@@ -1457,16 +1648,16 @@ function showMsgCtx(e, msgId, isMe) {
   removeCtx();
   const menu = document.createElement('div');
   menu.className = 'ctx-menu'; menu.id = 'ctx-menu';
-  
+
   const reactBar = document.createElement('div');
   reactBar.className = 'ctx-reactions';
-  
+
   const recent = getRecentReactions();
   recent.forEach(emoji => {
     const btn = document.createElement('button');
     btn.className = 'ctx-react-btn';
     btn.innerHTML = twemojiSafe(emoji);
-    btn.onclick = async (ev) => { 
+    btn.onclick = async (ev) => {
       ev.stopPropagation();
       addRecentReaction(emoji);
       const peerChatNum = await getActivePeerChatNum();
@@ -1476,8 +1667,8 @@ function showMsgCtx(e, msgId, isMe) {
         try { encEmoji = await encryptMsg(emoji, peerChatNum, peerPub); }
         catch {}
       }
-      S.socket.emit('msg:react', { msgId, emoji: encEmoji }); 
-      removeCtx(); 
+      S.socket.emit('msg:react', { msgId, emoji: encEmoji });
+      removeCtx();
     };
     reactBar.appendChild(btn);
   });
@@ -1501,7 +1692,7 @@ function showMsgCtx(e, msgId, isMe) {
   const items = isMe
     ? [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for peer', 'peer', false], ['Delete for both', 'both', true]]
     : [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for both', 'both', true]];
-    
+
   items.forEach(([lbl, action, danger]) => {
     const d = document.createElement('div');
     d.className = 'ctx-item' + (danger ? ' danger' : '');
@@ -1563,7 +1754,7 @@ $('msg-input').addEventListener('input', () => {
 function scrollToMessage(msgId) {
   const container = $('messages-container');
   const targetBubble = container.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`);
-  
+
   if (!targetBubble) {
     toast('Message not found', 'It might be too old or deleted', 'warn', 2000);
     return;
@@ -1579,10 +1770,10 @@ let replyTo = null;
 function setReplyTo(msgId) {
   const bubble = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`);
   if (!bubble) return;
-  
+
   let text = bubble.innerText;
   let iconHtml = '';
-  
+
   if (bubble.querySelector('.msg-gif') || text.startsWith('gif:')) {
     iconHtml = '<i class="fa-solid fa-film"></i> GIF';
     text = '';
@@ -1601,7 +1792,7 @@ function setReplyTo(msgId) {
   const wrap = bubble.closest('.msg-wrap');
   const isMe = wrap.classList.contains('me');
   let senderName = 'Peer';
-  
+
   if (isMe) {
     senderName = 'You';
   } else {
@@ -1920,16 +2111,16 @@ $('cm-cancel').onclick     = () => hide($('modal-chat-menu'));
   hide($('modal-chat-menu'));
   const name = await dialog({ title: 'Rename chat', body: 'New label:', input: true, inputPlaceholder: 'chat1' });
   if (!name) return;
-  
+
   const d = await api('PATCH', `/api/chats/${S.activeChatUid}/label`, { label: name });
   if (d.error) { toast('Error', d.error, 'err'); return; }
-  
+
   const c = S.chats.find(x => x.uid === S.activeChatUid);
   if (c) {
     if (c.initiator_id == S.account.accountId) c.label_initiator = name;
     else c.label_peer = name;
   }
-  
+
   $('chat-title-display').textContent = chatLabel(c);
   renderChatList();
 };
@@ -2033,15 +2224,15 @@ function openCropEditor(file) {
   _cropOriginalFile = file;
   const objectUrl = URL.createObjectURL(file);
   const img = new Image();
-  
+
   img.onload = () => {
     const canvas  = $('crop-canvas');
     const VSIZE   = 280;
     canvas.width  = VSIZE;
     canvas.height = VSIZE;
-    
+
     const maxDim = Math.max(img.width, img.height);
-    const initialScale = VSIZE / maxDim; 
+    const initialScale = VSIZE / maxDim;
 
     const scaleInput = $('crop-scale');
     scaleInput.min = initialScale * 0.8;
@@ -2057,12 +2248,12 @@ function openCropEditor(file) {
     show($('modal-crop'));
     URL.revokeObjectURL(objectUrl);
   };
-  
+
   img.onerror = () => {
      toast('Error', 'Failed to load image', 'err');
      URL.revokeObjectURL(objectUrl);
   };
-  
+
   img.src = objectUrl;
 }
 
@@ -2135,8 +2326,8 @@ document.addEventListener('touchmove', e => {
 
   const rm = toast('Uploading...', '', 'info', 0);
   const fd = new FormData();
-  
-  fd.append('avatar', _cropOriginalFile); 
+
+  fd.append('avatar', _cropOriginalFile);
   fd.append('crop', JSON.stringify({ x: cropX, y: cropY, w: cropW, h: cropH }));
 
   try {
@@ -2289,7 +2480,7 @@ function parseGifContent(text) {
   if (typeof text !== 'string' || !text.includes('gif:')) return null;
   const gifIndex = text.indexOf('gif:');
   const rest = text.substring(gifIndex + 4);
-  
+
   let urlEnd = rest.length;
   for (let i = 0; i < rest.length; i++) {
     if (/\s/.test(rest[i])) {
@@ -2297,7 +2488,7 @@ function parseGifContent(text) {
       break;
     }
   }
-  
+
   const gifUrl = rest.substring(0, urlEnd);
   const GIPHY_RE = /^https:\/\/([a-z0-9-]+\.)*giphy\.com\//i;
   let url = gifUrl;
@@ -2306,7 +2497,7 @@ function parseGifContent(text) {
   } else if (!gifUrl.startsWith('/api/gifs/media?u=')) {
     return null;
   }
-  
+
   const remainingText = text.substring(0, gifIndex) + text.substring(gifIndex + 4 + urlEnd);
   return { url, text: remainingText.trim() };
 }
@@ -2419,7 +2610,7 @@ async function loadEmojis() {
   try {
     const enRes = await fetch('/vendor/emojilib/emoji-en-US.json');
     const enData = await enRes.json();
-    
+
     let ruData = {};
     try {
       const ruRes = await fetch('/vendor/emojilib/emoji-short-ru.json');
@@ -2433,17 +2624,17 @@ async function loadEmojis() {
     } catch (e) { console.warn('RU dict failed, using EN only'); }
 
     allEmojisData = {};
-    
+
     for (const emoji in enData) {
       const enWords = enData[emoji] || [];
       const ruWords = ruData[emoji] || [];
       allEmojisData[emoji] = [...new Set([...enWords, ...ruWords])];
     }
-    
+
     EMOJIS = Object.keys(allEmojisData);
     renderEmojis(EMOJIS);
-  } catch (e) { 
-    console.error('Emoji load failed', e); 
+  } catch (e) {
+    console.error('Emoji load failed', e);
   }
 }
 
@@ -2456,7 +2647,7 @@ function renderEmojis(emojiList = EMOJIS) {
     span.innerHTML = twParse(e);
     span.onclick = async () => {
       if (pendingReactionMsgId) {
-        addRecentReaction(e); 
+        addRecentReaction(e);
         await sendReaction(pendingReactionMsgId, e);
         pendingReactionMsgId = null;
         egPanel.classList.add('hidden');
@@ -2517,24 +2708,24 @@ let gifSearchTimer;
 egSearch.oninput = () => {
   clearTimeout(emojiSearchTimer);
   clearTimeout(gifSearchTimer);
-  
+
   const q = egSearch.value.trim().toLowerCase();
   const activeTab = document.querySelector('.eg-tab.active').dataset.tab;
-  
+
   if (activeTab === 'emoji') {
     emojiSearchTimer = setTimeout(() => {
       if (!q) {
         renderEmojis(EMOJIS);
         return;
       }
-      
+
       const filtered = EMOJIS.filter(e => {
         if (e.includes(q)) return true;
-        
+
         const keywords = allEmojisData[e] || [];
         return keywords.some(kw => kw.toLowerCase().includes(q));
       });
-      
+
       renderEmojis(filtered);
     }, 150);
   } else if (activeTab === 'gif') {
@@ -2555,34 +2746,34 @@ gifGrid.addEventListener('scroll', () => {
 
 async function loadGifs(query, isNewSearch) {
   if (isFetchingGifs) return;
-  
+
   if (isNewSearch) {
     currentGifQuery = query;
     gifSearchOffset = 0;
     gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Loading...</div>';
   }
-  
+
   isFetchingGifs = true;
   const reqId = ++currentGifReqId;
-  
+
   try {
     const res = await fetch(`/api/gifs?q=${encodeURIComponent(currentGifQuery)}&offset=${gifSearchOffset}`);
     const data = await res.json();
-    
-    if (reqId !== currentGifReqId) return; 
+
+    if (reqId !== currentGifReqId) return;
     if (data.error) throw new Error(data.error);
-    
+
     if (isNewSearch) {
       gifGrid.innerHTML = '';
     }
-    
+
     let grid = gifGrid.querySelector('.eg-grid');
     if (!grid) {
       grid = document.createElement('div');
       grid.className = 'eg-grid';
       gifGrid.appendChild(grid);
     }
-    
+
     (data.gifs || []).forEach(url => {
       const img = document.createElement('img');
       img.className = 'eg-gif-item';
@@ -2594,13 +2785,13 @@ async function loadGifs(query, isNewSearch) {
       };
       grid.appendChild(img);
     });
-    
+
     gifSearchOffset += (data.gifs || []).length;
-    
+
     if ((data.gifs || []).length === 0 && isNewSearch) {
        gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">No GIFs found.</div>';
     }
-    
+
   } catch (e) {
     if (reqId !== currentGifReqId) return;
     console.error('[GIF]', e);
@@ -2659,14 +2850,14 @@ function startVerificationStep() {
 
   const container = $('verify-inputs-container');
   container.innerHTML = '';
-  
+
   verifyPositions.forEach(pos => {
     const row = document.createElement('div');
     row.className = 'verify-input-row';
     row.innerHTML = `<label>Digit ${pos}:</label><input type="text" maxlength="1" inputmode="numeric" data-pos="${pos}">`;
     container.appendChild(row);
   });
-  
+
   $('verify-error').textContent = '';
   show($('modal-verify-number'));
 }
@@ -2674,7 +2865,7 @@ function startVerificationStep() {
  $('btn-verify-check').onclick = () => {
   const inputs = $('verify-inputs-container').querySelectorAll('input');
   let isValid = true;
-  
+
   inputs.forEach(inp => {
     const pos = parseInt(inp.dataset.pos);
     const expectedDigit = pendingAccountData.accountNumber[pos - 1];
@@ -2716,11 +2907,11 @@ document.querySelectorAll('.skip-btn').forEach(btn => {
 
 function applyTheme(theme) {
   localStorage.setItem('taupe_theme', theme);
-  
+
   if (theme !== 'custom') {
     document.documentElement.style.cssText = '';
   }
-  
+
   if (theme === 'system') {
     const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
@@ -2741,7 +2932,7 @@ function applyTheme(theme) {
   document.querySelectorAll('.theme-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.setTheme === theme);
   });
-  
+
   $('custom-theme-editor').classList.toggle('hidden', theme !== 'custom');
 }
 
@@ -2781,7 +2972,7 @@ let recordingStream = null;
     recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     mediaRecorder = new MediaRecorder(recordingStream);
     audioChunks = [];
-    
+
     mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
     mediaRecorder.onstop = async () => {
       if (recordingStream) {
@@ -2793,14 +2984,14 @@ let recordingStream = null;
         await sendVoiceMessage(audioBlob);
       }
     };
-    
+
     mediaRecorder.start();
     recordStartTime = Date.now();
     updateRecordTimer();
-    
+
     $('record-ui').classList.remove('hidden');
     requestAnimationFrame(() => $('record-ui').classList.add('active'));
-    
+
     recordTimerInterval = setInterval(updateRecordTimer, 10);
   } catch (e) {
     toast('Mic Error', 'Cannot access microphone', 'err');
@@ -2813,7 +3004,7 @@ function updateRecordTimer() {
   const s = String(Math.floor((elapsed % 60000) / 1000)).padStart(2, '0');
   const ms = String(Math.floor((elapsed % 1000) / 10)).padStart(2, '0');
   $('record-timer').textContent = `${m}:${s}.${ms}`;
-  
+
   if (elapsed >= 120000) stopRecording(true);
 }
 
@@ -2822,7 +3013,7 @@ function stopRecording(send) {
   clearInterval(recordTimerInterval);
   mediaRecorder._send = send;
   mediaRecorder.stop();
-  
+
   $('record-ui').classList.remove('active');
 }
 
@@ -2851,7 +3042,7 @@ async function sendVoiceMessage(blob) {
 
   const fd = new FormData();
   fd.append('file', fileToUpload, finalName);
-  
+
   const rm = toast('Uploading...', 'Voice message', 'info', 0);
   let d;
   try {
@@ -2940,12 +3131,12 @@ function initAudioPlayer(playerEl, msg, isMe) {
   const url = playerEl.dataset.blob;
   const audio = new Audio(url);
   audio.preload = 'metadata';
-  
+
   const playBtn = playerEl.querySelector('.audio-play-btn');
   const timeEl = playerEl.querySelector('.audio-time');
   const bars = playerEl.querySelectorAll('.wave-bar');
   const waveform = playerEl.querySelector('.audio-waveform');
-  
+
   let isPlaying = false;
   let rafId = null;
 
@@ -2961,7 +3152,7 @@ function initAudioPlayer(playerEl, msg, isMe) {
       });
     }
   });
-  
+
   const updateTime = () => {
     if (audio.duration) {
       timeEl.textContent = formatAudioTime(audio.currentTime);
@@ -2975,11 +3166,11 @@ function initAudioPlayer(playerEl, msg, isMe) {
       rafId = requestAnimationFrame(updateTime);
     }
   };
-  
+
   audio.addEventListener('loadedmetadata', () => {
     timeEl.textContent = formatAudioTime(audio.duration);
   });
-  
+
   audio.addEventListener('play', () => {
     isPlaying = true;
     playBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
@@ -2988,14 +3179,14 @@ function initAudioPlayer(playerEl, msg, isMe) {
     }
     rafId = requestAnimationFrame(updateTime);
   });
-  
+
   audio.addEventListener('pause', () => {
     isPlaying = false;
     playBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
     if (rafId) cancelAnimationFrame(rafId);
     updateTime();
   });
-  
+
   audio.addEventListener('ended', () => {
     isPlaying = false;
     playBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
@@ -3003,7 +3194,7 @@ function initAudioPlayer(playerEl, msg, isMe) {
     timeEl.textContent = formatAudioTime(audio.duration);
     bars.forEach(b => b.classList.remove('played'));
   });
-  
+
   playBtn.onclick = (e) => {
     e.stopPropagation();
     if (isPlaying) {
@@ -3062,13 +3253,13 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
         html = twParse(esc(text).replace(/\n/g, '<br>'));
       }
     }
-    
+
     const burnDiv = document.createElement('div');
     burnDiv.className = 'msg-burn-open';
     burnDiv.dataset.msgId = msgId;
     burnDiv.innerHTML = `${html}`;
     spoilerBtn.replaceWith(burnDiv);
-    
+
     const wrap = getWrap();
     const metaInline = wrap?.querySelector('.msg-meta-inline');
     if (metaInline && !metaInline.querySelector('.burn-countdown')) {

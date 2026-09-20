@@ -578,3 +578,47 @@ img#chat-header-avatar { display: none !important; width: 32px; height: 32px; bo
 .skel-msg-row.me .skel-msg { border-bottom-right-radius: 4px; }
 .skel-msg-row.them .skel-msg { border-bottom-left-radius: 4px; }
 .read-tick.pending { color: rgba(255,255,255,0.65); }
+
+.chat-item-system .sys-avatar {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px;
+}
+.chat-item-system .chat-item-name { font-weight: 600; }
+.sys-empty {
+  margin: auto; text-align: center; color: var(--text2);
+  font-size: 13px; line-height: 1.6; padding: 20px;
+}
+.sys-card {
+  display: flex; gap: 12px; align-items: flex-start;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px 14px; margin: 6px 12px;
+  max-width: 640px; width: calc(100% - 24px);
+}
+.sys-icon {
+  width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+  background: var(--bg3); color: var(--accent);
+  display: flex; align-items: center; justify-content: center; font-size: 14px;
+}
+.sys-key .sys-icon { color: var(--warn); }
+.sys-key_transfer_done .sys-icon { color: var(--green); }
+.sys-body { flex: 1; min-width: 0; }
+.sys-text { font-size: 14px; line-height: 1.45; word-break: break-word; }
+.sys-time { font-size: 11px; color: var(--text2); margin-top: 4px; }
+.sys-actions { display: flex; gap: 8px; margin-top: 10px; }
+.sys-btn {
+  border: none; border-radius: 8px; padding: 7px 14px; cursor: pointer;
+  font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px;
+  min-height: 32px;
+}
+.sys-btn.approve { background: var(--green); color: #fff; }
+.sys-btn.approve:hover { filter: brightness(1.1); }
+.sys-btn.deny { background: var(--bg3); color: var(--text); border: 1px solid var(--border); }
+.sys-btn.deny:hover { border-color: var(--danger); color: var(--danger); }
+.sys-status {
+  display: inline-block; margin-top: 8px; padding: 3px 10px;
+  border-radius: 10px; font-size: 12px; font-weight: 600;
+}
+.sys-status.approved, .sys-status.completed { background: rgba(62, 207, 114, 0.15); color: var(--green); }
+.sys-status.declined { background: rgba(224, 68, 68, 0.15); color: var(--danger); }

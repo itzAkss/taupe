@@ -309,6 +309,12 @@ app.post('/api/login', (req, res) => {
   const dt = crypto.randomBytes(32).toString('hex');
   const dName = DB.addDevice(acct.id, dt);
   setCookie(res, signToken(dt));
+
+  try {
+    const sysMsg = DB.addSystemMessage(acct.id, 'device_login', { deviceName: dName });
+    if (sysMsg) io.to(`user:${acct.id}`).emit('sys:new', { message: sysMsg });
+  } catch (e) { console.error('[sysmsg]', e.message); }
+
   res.json({ accountNumber: clean, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
 });
 
@@ -389,7 +395,7 @@ app.post('/api/me/pubkey', authMiddleware, (req, res) => {
   try {
     DB.db.prepare('UPDATE devices SET public_key=? WHERE id=?').run(publicKey, req.device.id);
     DB.db.prepare('UPDATE accounts SET public_key=? WHERE id=?').run(publicKey, req.account.id);
-    
+
     const chats = DB.getChatsForAccount(req.account.id);
     chats.forEach(c => {
       io.to(roomForChat(c.uid)).emit('peer:key_update', { chatUid: c.uid });
@@ -458,7 +464,7 @@ app.patch('/api/me/username', authMiddleware, (req, res) => {
     if (existing) return res.status(409).json({ error: 'Username taken' });
   }
   DB.setUsername(req.account.id, username || null, isPublic);
-  
+
   const publicUsername = isPublic ? (username || null) : null;
 
   const chats = DB.getChatsForAccount(req.account.id);
@@ -490,7 +496,7 @@ app.patch('/api/me/presence', authMiddleware, (req, res) => {
 app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
   const outPath = req.file.path;
-  
+
   const notifyAvatarUpdate = (accountId, rel) => {
     const chats = DB.getChatsForAccount(accountId);
     chats.forEach(c => {
@@ -535,6 +541,29 @@ app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async 
   DB.setAvatar(req.account.id, rel);
   notifyAvatarUpdate(req.account.id, rel);
   res.json({ avatarPath: rel });
+});
+
+app.get('/api/system/messages', authMiddleware, (req, res) => {
+  const messages = DB.getSystemMessages(req.account.id);
+  res.json({ messages, unread: DB.unreadSystemCount(req.account.id) });
+});
+
+app.post('/api/system/read', authMiddleware, (req, res) => {
+  const id = req.body && req.body.id != null ? parseInt(req.body.id) : null;
+  DB.markSystemMessagesRead(req.account.id, Number.isInteger(id) ? id : null);
+  res.json({ ok: true, unread: DB.unreadSystemCount(req.account.id) });
+});
+
+app.post('/api/system/:id/resolve', authMiddleware, (req, res) => {
+  const id = parseInt(req.params.id);
+  const action = req.body && req.body.action;
+  if (!Number.isInteger(id) || !['approved', 'declined'].includes(action)) {
+    return res.status(400).json({ error: 'Bad request' });
+  }
+  const updated = DB.resolveSystemMessage(req.account.id, id, action);
+  if (!updated) return res.status(404).json({ error: 'Not found or already resolved' });
+  io.to(`user:${req.account.id}`).emit('sys:updated', { id, status: action });
+  res.json({ ok: true, message: updated });
 });
 
 app.get('/api/aliases', authMiddleware, (req, res) => {
@@ -697,7 +726,7 @@ app.get('/api/messages/:id', authMiddleware, (req, res) => {
   try {
     const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(parseInt(req.params.id));
     if (!msg) return res.status(404).json({ error: 'Not found' });
-    
+
     const chat = DB.getChatById(msg.chat_id);
     if (!chat || (chat.initiator_id !== req.account.id && chat.peer_id !== req.account.id)) {
       return res.status(403).json({ error: 'Forbidden' });
@@ -762,7 +791,7 @@ app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) 
       return res.status(413).json({ error: 'Upload quota exceeded' });
     }
   }
-  
+
   const isEncrypted = req.file.originalname.endsWith('.bin');
   const mime = isEncrypted ? 'application/octet-stream' : req.file.mimetype;
   const isImage = !isEncrypted && mime.startsWith('image/');
@@ -966,6 +995,12 @@ io.on('connection', socket => {
   const chats = DB.getChatsForAccount(aid);
   chats.forEach(c => socket.join(roomForChat(c.uid)));
 
+  try {
+    for (const m of DB.takeKeySyncInbox(socket.deviceId)) {
+      socket.emit('key:sync', { fromPublicKey: m.from_public_key, encryptedKey: m.encrypted_key });
+    }
+  } catch (e) { console.error('[key inbox]', e.message); }
+
   recomputePresence(aid);
 
   for (const c of chats) {
@@ -1137,7 +1172,7 @@ io.on('connection', socket => {
     if (!isChatMember(chat, aid)) return;
     if (msg.chat_id !== chat.id) return;
     DB.hardDeleteMessage(id);
-    
+
     const last = DB.db.prepare(`SELECT content,file_type,burn_seconds FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chat.id);
     const preview = last ? (last.burn_seconds ? '[burns after read]' : (last.content ? last.content : (last.file_type==='image'?'[image]':'[file]'))) : '';
     DB.updateChatPreview(chat.id, preview);
@@ -1161,12 +1196,12 @@ io.on('connection', socket => {
     if (!emoji || emoji.length > 500) return;
     const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
     if (!msg) return;
-    
+
     const chat = DB.getChatById(msg.chat_id);
     if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
 
     const existing = DB.db.prepare('SELECT 1 FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').get(msgId, aid, emoji);
-    
+
     if (existing) {
       DB.db.prepare('DELETE FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').run(msgId, aid, emoji);
     } else {
@@ -1182,7 +1217,7 @@ io.on('connection', socket => {
     if (!msg) return;
     const chat = DB.getChatById(msg.chat_id);
     if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
-    
+
     DB.db.prepare('UPDATE messages SET is_played=1 WHERE id=?').run(msgId);
     io.to(roomForChat(chat.uid)).emit('msg:played', { msgId });
   });
@@ -1243,6 +1278,21 @@ io.on('connection', socket => {
   });
 
   socket.on('key:request', ({ myPublicKey }) => {
+    if (typeof myPublicKey !== 'string' || !myPublicKey.length || myPublicKey.length > 512) return;
+
+    try {
+      const already = DB.pendingKeyRequestFor(aid, socket.deviceId);
+      if (!already) {
+        const dev = DB.db.prepare('SELECT device_name FROM devices WHERE id=?').get(socket.deviceId);
+        const msg = DB.addSystemMessage(aid, 'key_request', {
+          deviceId: socket.deviceId,
+          deviceName: (dev && dev.device_name) || 'New device',
+          publicKey: myPublicKey,
+        }, 'pending');
+        if (msg) io.to(`user:${aid}`).emit('sys:new', { message: msg });
+      }
+    } catch (e) { console.error('[key request]', e.message); }
+
     for (const [sid, sock] of io.of('/').sockets) {
       if (sock.accountId === aid && sock.id !== socket.id) {
         sock.emit('key:request', { fromDeviceId: socket.deviceId, fromPublicKey: myPublicKey });
@@ -1250,15 +1300,40 @@ io.on('connection', socket => {
     }
   });
 
-  socket.on('key:sync', async ({ targetDeviceId, encryptedKey }) => {
+  socket.on('key:sync', ({ targetDeviceId, encryptedKey }) => {
+    const tid = parseInt(targetDeviceId);
+    if (!Number.isInteger(tid)) return;
+    if (typeof encryptedKey !== 'string' || !encryptedKey.length || encryptedKey.length > 16384) return;
     const senderDevice = DB.db.prepare('SELECT public_key FROM devices WHERE id=?').get(socket.deviceId);
     if (!senderDevice || !senderDevice.public_key) return;
-    
-    for (const [sid, sock] of io.of('/').sockets) {
-      if (sock.accountId === aid && sock.deviceId === targetDeviceId) {
+
+    const target = DB.db.prepare('SELECT id, account_id FROM devices WHERE id=?').get(tid);
+    if (!target || target.account_id !== aid) return;
+
+    DB.queueKeySync(target.id, senderDevice.public_key, encryptedKey);
+
+    for (const [, sock] of io.of('/').sockets) {
+      if (sock.accountId === aid && sock.deviceId === target.id) {
         sock.emit('key:sync', { fromPublicKey: senderDevice.public_key, encryptedKey });
+        DB.takeKeySyncInbox(target.id);
       }
     }
+  });
+
+  socket.on('key:sync:done', ({ id }) => {
+    const mid = parseInt(id);
+    if (!Number.isInteger(mid)) return;
+    const msg = DB.getSystemMessage(aid, mid);
+    if (!msg || msg.type !== 'key_request') return;
+    if (!DB.completeKeyRequest(aid, mid)) return;
+    let devName = 'device';
+    try {
+      const dev = DB.db.prepare('SELECT device_name FROM devices WHERE id=?').get(msg.payload.deviceId);
+      if (dev && dev.device_name) devName = dev.device_name;
+    } catch {}
+    const done = DB.addSystemMessage(aid, 'key_transfer_done', { deviceId: msg.payload.deviceId, deviceName: devName });
+    io.to(`user:${aid}`).emit('sys:updated', { id: mid, status: 'completed' });
+    if (done) io.to(`user:${aid}`).emit('sys:new', { message: done });
   });
 });
 
