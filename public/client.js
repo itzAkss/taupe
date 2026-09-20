@@ -32,14 +32,18 @@ const $   = id => document.getElementById(id);
 const show = el => el?.classList.remove('hidden');
 const hide = el => el?.classList.add('hidden');
 
-const twemojiSafe = (str) => {
+const TWEMOJI_LOCAL_OPTS = { base: '/vendor/twemoji/', size: 'svg', ext: '.svg' };
+function twParse(str) {
   if (window.twemoji && typeof twemoji.parse === 'function') {
-    return twemoji.parse(str);
+    try { return twemoji.parse(str, TWEMOJI_LOCAL_OPTS); } catch (e) { return str; }
   }
   return str;
-};
+}
+
+const twemojiSafe = (str) => twParse(str);
 
 let currentRenderToken = 0;
+let refreshSeq = 0;
 
 function dialog({ title, body, input, inputPlaceholder, inputDefault, inputType, okText = 'OK', cancelText = 'Cancel', danger = false }) {
   return new Promise(resolve => {
@@ -336,15 +340,18 @@ function startPolling() {
 async function refreshActiveChat() {
   if (!S.activeChatUid) return;
   const uid = S.activeChatUid;
+  const myRefreshToken = ++refreshSeq;
   const msgs = await api('GET', `/api/chats/${uid}/messages`);
-  if (myRenderToken !== currentRenderToken) return;
+  if (myRefreshToken !== refreshSeq) return;
   if (!Array.isArray(msgs)) return;
   if (S.activeChatUid !== uid) return;
   const cont = $('messages-container');
   const rendered = new Set([...cont.querySelectorAll('[data-msg-id]')].map(el => el.dataset.msgId));
   const peerChatNum = await getActivePeerChatNum();
   const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+  if (myRefreshToken !== refreshSeq || S.activeChatUid !== uid) return;
   for (const m of msgs) {
+    if (myRefreshToken !== refreshSeq || S.activeChatUid !== uid) return;
     if (rendered.has(String(m.id))) continue;
     if (m.sender_id == S.account.accountId && S.pendingSends.length) {
       const p = takePending(uid);
@@ -496,6 +503,11 @@ function connectSocket() {
     await startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, { content, filePath, fileType, fileName });
   });
 
+  S.socket.on('msg:error', ({ chatUid, error }) => {
+    console.warn('[msg:error]', error);
+    toast('Not sent', error || 'The server rejected the message.', 'err');
+  });
+
   S.socket.on('peer:presence', ({ chatUid, number, online, lastSeen }) => {
     if (!number) return;
     S.presence.set(number, { online: !!online, lastSeen: lastSeen || null });
@@ -573,7 +585,7 @@ function connectSocket() {
       if (isMine) {
         btn.dataset.encEmoji = myEncEmojis[emoji];
       }
-      btn.innerHTML = `${twemoji.parse(emoji)} <span>${users.length}</span>`;
+      btn.innerHTML = `${twParse(emoji)} <span>${users.length}</span>`;
       btn.onclick = (ev) => {
         ev.stopPropagation();
         const encEmoji = btn.dataset.encEmoji;
@@ -919,6 +931,7 @@ async function openChat(uid) {
   S.peerKeys.delete(peerChatNum);
 
   currentRenderToken++;
+  refreshSeq++;
   const myRenderToken = currentRenderToken;
 
   const cont = $('messages-container');
@@ -1136,7 +1149,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
             content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
           }
         } else if (isSingleEmoji(text)) {
-          content = `<div class="msg-emoji-only">${twemoji.parse(text)}</div>`;
+          content = `<div class="msg-emoji-only">${twParse(text)}</div>`;
         } else {
           content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
         }
@@ -1176,7 +1189,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
       }
     } else if (isSingleEmoji(text)) {
-      content = `<div class="msg-emoji-only">${twemoji.parse(text)}</div>`;
+      content = `<div class="msg-emoji-only">${twParse(text)}</div>`;
     } else {
       content = twemojiSafe(esc(text).replace(/\n/g, '<br>'));
     }
@@ -2286,10 +2299,16 @@ function parseGifContent(text) {
   }
   
   const gifUrl = rest.substring(0, urlEnd);
-  if (!gifUrl.startsWith('http')) return null;
+  const GIPHY_RE = /^https:\/\/([a-z0-9-]+\.)*giphy\.com\//i;
+  let url = gifUrl;
+  if (GIPHY_RE.test(gifUrl)) {
+    url = '/api/gifs/media?u=' + encodeURIComponent(gifUrl);
+  } else if (!gifUrl.startsWith('/api/gifs/media?u=')) {
+    return null;
+  }
   
   const remainingText = text.substring(0, gifIndex) + text.substring(gifIndex + 4 + urlEnd);
-  return { url: gifUrl, text: remainingText.trim() };
+  return { url, text: remainingText.trim() };
 }
 function esc(s) {
   return String(s || '')
@@ -2398,12 +2417,12 @@ const gifGrid = $('eg-gif-grid');
 
 async function loadEmojis() {
   try {
-    const enRes = await fetch('https://raw.githubusercontent.com/muan/emojilib/master/dist/emoji-en-US.json');
+    const enRes = await fetch('/vendor/emojilib/emoji-en-US.json');
     const enData = await enRes.json();
     
     let ruData = {};
     try {
-      const ruRes = await fetch('https://raw.githubusercontent.com/emoji-gen/emoji-short-ru/master/emoji.json');
+      const ruRes = await fetch('/vendor/emojilib/emoji-short-ru.json');
       if (ruRes.ok) {
         const ruRaw = await ruRes.json();
         for (const key in ruRaw) {
@@ -2434,7 +2453,7 @@ function renderEmojis(emojiList = EMOJIS) {
   emojiList.forEach(e => {
     const span = document.createElement('span');
     span.className = 'eg-emoji';
-    span.innerHTML = twemoji.parse(e);
+    span.innerHTML = twParse(e);
     span.onclick = async () => {
       if (pendingReactionMsgId) {
         addRecentReaction(e); 
@@ -3037,10 +3056,10 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
           const safeText = esc(gifData.text).replace(/\n/g, '<br>');
           html = `${imgTag}${safeText ? `<br>${safeText}` : ''}`;
         } else {
-          html = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
+          html = twParse(esc(text).replace(/\n/g, '<br>'));
         }
       } else {
-        html = twemoji.parse(esc(text).replace(/\n/g, '<br>'));
+        html = twParse(esc(text).replace(/\n/g, '<br>'));
       }
     }
     

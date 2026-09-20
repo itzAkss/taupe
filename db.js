@@ -3,7 +3,26 @@ const path = require('path');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 
-const PEPPER = process.env.TAUPE_PEPPER
+try { require('dotenv').config(); } catch (e) {}
+
+let PEPPER = process.env.TAUPE_PEPPER || '';
+if (!PEPPER) {
+  const PEPPER_FILE = process.env.PEPPER_FILE || path.join(__dirname, '.pepper');
+  try {
+    if (fs.existsSync(PEPPER_FILE)) {
+      PEPPER = fs.readFileSync(PEPPER_FILE, 'utf8').trim();
+    }
+    if (!PEPPER) {
+      PEPPER = crypto.randomBytes(32).toString('hex');
+      fs.writeFileSync(PEPPER_FILE, PEPPER + '\n', { mode: 0o600 });
+    }
+  } catch (e) {
+    console.warn('[db] pepper file unavailable, continuing without persistent pepper:', e.message);
+  }
+}
+
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'messenger.db');
 const raw = new DatabaseSync(DB_PATH);
 
@@ -197,6 +216,13 @@ function hashNumber(num) {
   return crypto.createHash('sha256').update(num + PEPPER).digest('hex');
 }
 
+function numberHashCandidates(num) {
+  const variants = new Set([hashNumber(num)]);
+  variants.add(crypto.createHash('sha256').update(num + 'undefined').digest('hex'));
+  variants.add(crypto.createHash('sha256').update(num + '').digest('hex'));
+  return [...variants];
+}
+
 function createAccount() {
   const insert = db.prepare('INSERT INTO accounts (number, chat_number) VALUES (?, ?)');
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -213,7 +239,22 @@ function createAccount() {
 }
 
 function getAccountByNumber(rawNumber) {
-  return db.prepare('SELECT * FROM accounts WHERE number=?').get(hashNumber(rawNumber));
+  const primary = hashNumber(rawNumber);
+  let acct = db.prepare('SELECT * FROM accounts WHERE number=?').get(primary);
+  if (acct) return acct;
+  for (const candidate of numberHashCandidates(rawNumber)) {
+    if (candidate === primary) continue;
+    acct = db.prepare('SELECT * FROM accounts WHERE number=?').get(candidate);
+    if (acct) {
+      try {
+        db.prepare('UPDATE accounts SET number=? WHERE id=?').run(primary, acct.id);
+      } catch (e) {
+        console.warn('[db] number re-hash failed, keeping legacy hash:', e.message);
+      }
+      return acct;
+    }
+  }
+  return null;
 }
 function getAccountByChatNumber(chatNumber) {
   return db.prepare('SELECT * FROM accounts WHERE chat_number=?').get(chatNumber);
@@ -230,19 +271,36 @@ function setUsername(accountId, username, isPublic) {
 function setAvatar(accountId, path) {
   db.prepare('UPDATE accounts SET avatar_path=? WHERE id=?').run(path, accountId);
 }
+
+function resolveUploadPath(relPath) {
+  let p = String(relPath);
+  if (p.startsWith('/uploads/')) p = p.slice('/uploads/'.length);
+  else p = p.replace(/^\/+/, '');
+  return path.resolve(UPLOAD_DIR, p);
+}
+
+function safeUnlinkUpload(relPath) {
+  if (!relPath || typeof relPath !== 'string') return;
+  try {
+    const resolved = resolveUploadPath(relPath);
+    if (resolved !== UPLOAD_DIR && !resolved.startsWith(UPLOAD_DIR + path.sep)) return;
+    if (fs.existsSync(resolved)) fs.unlinkSync(resolved);
+  } catch (e) {}
+}
+
 function deleteAccount(accountId) {
   const acct = db.prepare('SELECT avatar_path FROM accounts WHERE id=?').get(accountId);
   const msgs = db.prepare(
     'SELECT m.file_path FROM messages m JOIN chats c ON c.id=m.chat_id WHERE (c.initiator_id=? OR c.peer_id=?) AND m.file_path IS NOT NULL'
   ).all(accountId, accountId);
   const filesToDelete = [];
-  if (acct?.avatar_path) filesToDelete.push(path.join(__dirname, acct.avatar_path));
-  for (const { file_path } of msgs) filesToDelete.push(path.join(__dirname, file_path));
+  if (acct?.avatar_path) filesToDelete.push(acct.avatar_path);
+  for (const { file_path } of msgs) filesToDelete.push(file_path);
 
   db.prepare('DELETE FROM accounts WHERE id=?').run(accountId);
 
   for (const filePath of filesToDelete) {
-    try { fs.unlinkSync(filePath); } catch {}
+    safeUnlinkUpload(filePath);
   }
 }
 
@@ -450,15 +508,25 @@ function hardDeleteMessage(msgId) {
   const msg = db.prepare('SELECT file_path FROM messages WHERE id=?').get(msgId);
   if (!msg) return;
   if (msg.file_path) {
-
-    try {
-      const fs   = require('fs');
-      const path = require('path');
-      const abs  = path.join(__dirname, msg.file_path);
-      if (fs.existsSync(abs)) fs.unlinkSync(abs);
-    } catch (e) {  }
+    safeUnlinkUpload(msg.file_path);
   }
   db.prepare('DELETE FROM messages WHERE id=?').run(msgId);
+}
+
+function getUploadUsageBytes(accountId) {
+  const rows = db.prepare(
+    'SELECT file_path FROM messages WHERE sender_id=? AND file_path IS NOT NULL'
+  ).all(accountId);
+  let total = 0;
+  for (const { file_path } of rows) {
+    try {
+      const resolved = resolveUploadPath(file_path);
+      if (resolved !== UPLOAD_DIR && !resolved.startsWith(UPLOAD_DIR + path.sep)) continue;
+      const st = fs.statSync(resolved);
+      if (st.isFile()) total += st.size;
+    } catch (e) {}
+  }
+  return total;
 }
 
 function setBurnAt(msgId, burnAt) {
@@ -550,4 +618,5 @@ module.exports = {
   getRateLimit, recordLoginFailDb, recordLoginSuccessDb, cleanupRateLimits,
   hardDeleteMessage, setBurnAt, collectExpiredBurns,
   setMaxMessages, enforceMaxMessages,
+  getUploadUsageBytes, safeUnlinkUpload,
 };
