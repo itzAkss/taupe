@@ -1,8 +1,8 @@
 import {
   getMyPublicKeyB64, encryptMsg, decryptMsg,
   encryptFile, decryptFile, isEncrypted, cryptoSupported, invalidateSession,
-  setMyDeviceId, getSafetyNumber,
-  exportPrivateKeyForSync, encryptKeyForSync, decryptSyncedKey, hasSyncedKeys
+  setMyDeviceId, getSafetyNumber, setOwnDeviceKeys,
+  exportPrivateKeyForSync, exportKeysForSync, encryptKeyForSync, decryptSyncedKey, hasSyncedKeys, clearAllSessions
 } from './crypto.js';
 
 const S = {
@@ -225,14 +225,18 @@ async function bootApp(me, isNewAccount = false) {
   $('my-number-display').textContent = fmtNum(me.chatNumber || me.accountNumber?.slice(-8));
   switchScreen('main');
 
-  if (!me.devices) {
-    const full = await api('GET', '/api/me');
-    if (!full.error && Array.isArray(full.devices)) {
-      me = { ...full, accountNumber: me.accountNumber, chatNumber: me.chatNumber || full.chatNumber };
-    }
-  }
-
   if (me.deviceId) { await setMyDeviceId(me.deviceId); S.myDeviceId = me.deviceId; }
+  try {
+    if (!me.devices) {
+      const full = await api('GET', '/api/me');
+      if (!full.error && Array.isArray(full.devices)) {
+        me = { ...full, accountNumber: me.accountNumber, chatNumber: me.chatNumber || full.chatNumber };
+      }
+    }
+    if (Array.isArray(me.devices)) {
+      await setOwnDeviceKeys(me.devices.filter(d => d.public_key).map(d => ({ deviceId: d.id, key: d.public_key })));
+    }
+  } catch {}
   if (me.devices && me.devices.length > 1) {
     const alreadySynced = await hasSyncedKeys();
 
@@ -436,9 +440,10 @@ function connectSocket() {
 
   S.socket.on('key:sync', async ({ fromPublicKey, encryptedKey }) => {
     try {
-      await decryptSyncedKey(encryptedKey, fromPublicKey);
+      const added = await decryptSyncedKey(encryptedKey, fromPublicKey);
+      await clearAllSessions();
       S.waitingForKeySync = false;
-      toast('Keys Synced', 'Successfully imported keys from another device.', 'ok', 3000);
+      toast('Keys Synced', added > 1 ? `Imported ${added} keys, history unlocked.` : 'Successfully imported keys from another device.', 'ok', 3000);
       const rid = S.myPendingKeyRequestId;
       if (rid) {
         S.myPendingKeyRequestId = null;
@@ -845,7 +850,7 @@ async function openSystemChat() {
   if (d && !d.error) { S.sysUnread = 0; updateSystemBadge(); }
 }
 
-function renderSystemMessages() {
+async function renderSystemMessages() {
   const cont = $('messages-container');
   cont.innerHTML = '';
   if (!S.sysMessages.length) {
@@ -865,7 +870,10 @@ function renderSystemMessages() {
       const st = m.status || 'pending';
       const chips = { approved: 'Approved', declined: 'Declined', completed: 'Keys transferred' };
       if (st === 'pending') {
-        statusHtml = `
+        const own = await isOwnKeyRequest(m);
+        statusHtml = own
+          ? '<div class="sys-status pending-self">Sent from this device. Approve it on another device</div>'
+          : `
           <div class="sys-actions">
             <button class="sys-btn approve" data-id="${m.id}"><i class="fa-solid fa-check"></i> Approve</button>
             <button class="sys-btn deny" data-id="${m.id}"><i class="fa-solid fa-xmark"></i> Deny</button>
@@ -891,15 +899,28 @@ function renderSystemMessages() {
   cont.style.scrollBehavior = '';
 }
 
+async function isOwnKeyRequest(m) {
+  if (!m || m.type !== 'key_request') return false;
+  if (Number(m.payload?.deviceId) === Number(S.myDeviceId)) return true;
+  try {
+    const pub = m.payload?.publicKey;
+    return !!pub && pub === await getMyPublicKeyB64();
+  } catch { return false; }
+}
+
 async function resolveKeyRequest(id, approve) {
   const m = S.sysMessages.find(x => x.id === id);
   if (!m) return;
+  if (approve && await isOwnKeyRequest(m)) {
+    toast('Not allowed', 'Approve this request on another device.', 'warn', 5000);
+    return;
+  }
   if (approve) {
     try {
-      const myPrivJwk = await exportPrivateKeyForSync();
+      const myKeys = await exportKeysForSync();
       const r = await api('POST', `/api/system/${id}/resolve`, { action: 'approved' });
       if (r.error) { toast('Not approved', r.error, 'warn', 4000); return; }
-      const encryptedKey = await encryptKeyForSync(myPrivJwk, m.payload.publicKey);
+      const encryptedKey = await encryptKeyForSync(myKeys, m.payload.publicKey);
       S.socket.emit('key:sync', { targetDeviceId: m.payload.deviceId, encryptedKey });
       toast('Keys sent', 'Encrypted keys were sent to the device.', 'ok', 4000);
     } catch (e) {

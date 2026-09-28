@@ -560,6 +560,16 @@ app.post('/api/system/:id/resolve', authMiddleware, (req, res) => {
   if (!Number.isInteger(id) || !['approved', 'declined'].includes(action)) {
     return res.status(400).json({ error: 'Bad request' });
   }
+  const existing = DB.getSystemMessage(req.account.id, id);
+  if (existing && existing.type === 'key_request' && action === 'approved') {
+    const sameRow = Number(existing.payload && existing.payload.deviceId) === Number(req.device.id);
+    const reqPub = String(existing.payload && existing.payload.publicKey || '');
+    const myPub = String(req.device.public_key || '');
+    const sameIdentity = !!reqPub && !!myPub && reqPub === myPub;
+    if (sameRow || sameIdentity) {
+      return res.status(403).json({ error: 'Approve this request on another device' });
+    }
+  }
   const updated = DB.resolveSystemMessage(req.account.id, id, action);
   if (!updated) return res.status(404).json({ error: 'Not found or already resolved' });
   io.to(`user:${req.account.id}`).emit('sys:updated', { id, status: action });
@@ -1281,8 +1291,21 @@ io.on('connection', socket => {
     if (typeof myPublicKey !== 'string' || !myPublicKey.length || myPublicKey.length > 512) return;
 
     try {
-      const already = DB.pendingKeyRequestFor(aid, socket.deviceId);
-      if (!already) {
+      const pending = DB.pendingKeyRequestsFor(aid);
+      let reusable = null;
+      for (const p of pending) {
+        if (Number(p.payload && p.payload.deviceId) === Number(socket.deviceId)) {
+          if (!reusable && p.payload && p.payload.publicKey === myPublicKey) reusable = p;
+          else {
+            const upd = DB.resolveSystemMessage(aid, p.id, 'declined');
+            if (upd) io.to(`user:${aid}`).emit('sys:updated', { id: p.id, status: 'declined' });
+          }
+        } else {
+          const upd = DB.resolveSystemMessage(aid, p.id, 'declined');
+          if (upd) io.to(`user:${aid}`).emit('sys:updated', { id: p.id, status: 'declined' });
+        }
+      }
+      if (!reusable) {
         const dev = DB.db.prepare('SELECT device_name FROM devices WHERE id=?').get(socket.deviceId);
         const msg = DB.addSystemMessage(aid, 'key_request', {
           deviceId: socket.deviceId,

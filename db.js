@@ -683,6 +683,12 @@ function pendingKeyRequestFor(accountId, deviceId) {
   ).get(accountId, Number(deviceId)));
 }
 
+function pendingKeyRequestsFor(accountId) {
+  return db.prepare(
+    "SELECT * FROM system_messages WHERE account_id=? AND type='key_request' AND status='pending' ORDER BY id ASC"
+  ).all(accountId).map(parseSystemRow);
+}
+
 function completeKeyRequest(accountId, id) {
   const row = getSystemMessage(accountId, id);
   if (!row || row.type !== 'key_request' || !['pending', 'approved'].includes(row.status)) return null;
@@ -718,6 +724,6 @@ module.exports = {
   setMaxMessages, enforceMaxMessages,
   getUploadUsageBytes, safeUnlinkUpload,
   addSystemMessage, getSystemMessage, getSystemMessages, unreadSystemCount,
-  markSystemMessagesRead, resolveSystemMessage, pendingKeyRequestFor,
+  markSystemMessagesRead, resolveSystemMessage, pendingKeyRequestFor, pendingKeyRequestsFor,
   completeKeyRequest, queueKeySync, takeKeySyncInbox,
 };
