@@ -995,6 +995,25 @@ async function pushWakeup(accountId, chatUid, preview, burn) {
   }
 }
 
+function isValidPeerKeyPayload(s) {
+  if (typeof s !== 'string') return false;
+  const t = s.trim();
+  if (!t.length || t.length > 512) return false;
+  try {
+    if (t.startsWith('{')) {
+      const j = JSON.parse(t);
+      return j && j.kty === 'EC' && typeof j.x === 'string' && j.x.length > 0 &&
+        typeof j.y === 'string' && j.y.length > 0;
+    }
+    const raw = Buffer.from(t, 'base64');
+    if (raw.length === 65 && raw[0] === 0x04) return true;
+    if (raw.length > 65 && raw[raw.length - 65] === 0x04) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 io.on('connection', socket => {
   const aid = socket.accountId;
   if (!online.has(aid)) online.set(aid, new Set());
@@ -1288,7 +1307,7 @@ io.on('connection', socket => {
   });
 
   socket.on('key:request', ({ myPublicKey }) => {
-    if (typeof myPublicKey !== 'string' || !myPublicKey.length || myPublicKey.length > 512) return;
+    if (!isValidPeerKeyPayload(myPublicKey)) return;
 
     try {
       const pending = DB.pendingKeyRequestsFor(aid);
@@ -1326,6 +1345,7 @@ io.on('connection', socket => {
   socket.on('key:sync', ({ targetDeviceId, encryptedKey }) => {
     const tid = parseInt(targetDeviceId);
     if (!Number.isInteger(tid)) return;
+    if (tid === socket.deviceId) return;
     if (typeof encryptedKey !== 'string' || !encryptedKey.length || encryptedKey.length > 16384) return;
     const senderDevice = DB.db.prepare('SELECT public_key FROM devices WHERE id=?').get(socket.deviceId);
     if (!senderDevice || !senderDevice.public_key) return;

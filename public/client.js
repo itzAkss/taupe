@@ -443,7 +443,7 @@ function connectSocket() {
       const added = await decryptSyncedKey(encryptedKey, fromPublicKey);
       await clearAllSessions();
       S.waitingForKeySync = false;
-      toast('Keys Synced', added > 1 ? `Imported ${added} keys, history unlocked.` : 'Successfully imported keys from another device.', 'ok', 3000);
+      toast('Keys Synced', added > 1 ? `Imported ${added} keys — history unlocked.` : 'Successfully imported keys from another device.', 'ok', 3000);
       const rid = S.myPendingKeyRequestId;
       if (rid) {
         S.myPendingKeyRequestId = null;
@@ -872,7 +872,7 @@ async function renderSystemMessages() {
       if (st === 'pending') {
         const own = await isOwnKeyRequest(m);
         statusHtml = own
-          ? '<div class="sys-status pending-self">Sent from this device. Approve it on another device</div>'
+          ? '<div class="sys-status pending-self">Sent from this device — approve it on another device</div>'
           : `
           <div class="sys-actions">
             <button class="sys-btn approve" data-id="${m.id}"><i class="fa-solid fa-check"></i> Approve</button>

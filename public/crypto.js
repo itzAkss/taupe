@@ -108,10 +108,29 @@ async function loadMyPrivateKey() {
   );
 }
 
+function peerRawPoint(keyStr) {
+  const t = String(keyStr).trim();
+  if (t.startsWith('{')) {
+    const jwk = JSON.parse(t);
+    const dec = s => {
+      const std = String(s).replace(/-/g, '+').replace(/_/g, '/');
+      return Uint8Array.from(atob(std + '='.repeat((4 - std.length % 4) % 4)), c => c.charCodeAt(0));
+    };
+    const x = dec(jwk.x), y = dec(jwk.y);
+    if (x.length !== 32 || y.length !== 32) throw new Error('Invalid peer JWK coordinates');
+    const raw = new Uint8Array(65);
+    raw[0] = 4; raw.set(x, 1); raw.set(y, 33);
+    return raw;
+  }
+  const raw = Uint8Array.from(atob(t.replace(/\s+/g, '')), c => c.charCodeAt(0));
+  if (raw.length === 65 && raw[0] === 4) return raw;
+  if (raw.length > 65 && raw[raw.length - 65] === 4) return raw.slice(raw.length - 65);
+  throw new Error('Unsupported peer public key format (' + raw.length + ' bytes)');
+}
+
 async function importPeerPublicKey(b64) {
-  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
   return crypto.subtle.importKey(
-    'raw', raw,
+    'raw', peerRawPoint(b64),
     { name: 'ECDH', namedCurve: 'P-256' },
     false, []
   );
