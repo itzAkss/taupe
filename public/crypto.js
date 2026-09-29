@@ -445,7 +445,10 @@ export async function decryptSyncedKey(encB64, theirPubB64) {
   const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sharedKey, ct);
   const raw = JSON.parse(new TextDecoder().decode(pt));
 
-  const incoming = Array.isArray(raw) ? raw : [raw];
+  const incoming = (Array.isArray(raw) ? raw : [raw]).map(j => {
+    if (typeof j === 'string') { try { return JSON.parse(j); } catch { return null; } }
+    return j;
+  });
   const synced = await idbGet('keys', 'synced_private_keys') || [];
   let added = 0;
   for (const jwk of incoming) {
