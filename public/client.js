@@ -1,11 +1,13 @@
 import {
-  getMyPublicKeyB64, encryptMsg, decryptMsg,
-  encryptFile, decryptFile, isEncrypted, cryptoSupported, invalidateSession,
-  setMyDeviceId, getSafetyNumber, setOwnDeviceKeys,
-  exportPrivateKeyForSync, exportKeysForSync, encryptKeyForSync, decryptSyncedKey, hasSyncedKeys, clearAllSessions
-} from './crypto.js';
+  getMyPublicKeyB64, getMyIdentityPublicKeyB64, getDeviceKeyPackage, verifyDeviceSignature,
+  encryptMsg, decryptMsg, encryptFile, decryptFile, isEncrypted, cryptoSupported,
+  setMyDeviceId, getSafetyNumber, getKeySyncCode, setOwnDeviceKeys,
+  encryptKeyForSync, decryptSyncedKey, hasSyncedKeys, clearAllSessions,
+  pinPeerKeys, getPeerPin, acknowledgePeerKeys, setPeerVerified, isPeerBlocked,
+  stripImageMetadata, encryptMeta, decryptMeta, saveImportedHistory, getHistoryForChat
+} from './crypto.js?v=3';
 
-const S = {
+const state = {
   account:    null,
   chats:      [],
   activeChatUid: null,
@@ -31,16 +33,20 @@ const S = {
   pendingSends: [],
   outbox: [],
   flushing: false,
+  deviceApproved: false,
+  keyRequest: null,
+  peerPin: null,
+  peerSecurityOpen: false,
 };
 
 const $   = id => document.getElementById(id);
 const show = el => el?.classList.remove('hidden');
 const hide = el => el?.classList.add('hidden');
 
-const TWEMOJI_LOCAL_OPTS = { base: '/vendor/twemoji/', size: 'svg', ext: '.svg' };
+const twemojiLocalOpts = { base: '/vendor/twemoji/', size: 'svg', ext: '.svg' };
 function twParse(str) {
   if (window.twemoji && typeof twemoji.parse === 'function') {
-    try { return twemoji.parse(str, TWEMOJI_LOCAL_OPTS); } catch (e) { return str; }
+    try { return twemoji.parse(str, twemojiLocalOpts); } catch (e) { return str; }
   }
   return str;
 }
@@ -120,25 +126,51 @@ async function api(method, path, body) {
 
 let pendingAccountData = null;
 
- $('btn-register').onclick = async () => {
+async function withButtonLoading(button, label, task) {
+  if (!button || button.disabled) return;
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.classList.add('loading');
+  button.innerHTML = `<span class="btn-spinner" aria-hidden="true"></span><span>${label}</span>`;
+  try {
+    return await task();
+  } finally {
+    button.disabled = false;
+    button.classList.remove('loading');
+    button.innerHTML = original;
+  }
+}
+
+ $('btn-register').onclick = () => withButtonLoading($('btn-register'), 'Creating account...', async () => {
   $('auth-error').textContent = '';
   localStorage.removeItem('taupe_active_chat');
-  const d = await api('POST', '/api/register');
-  if (d.error) { $('auth-error').textContent = d.error; return; }
-
-  if (localStorage.getItem('taupe_check_done') === 'true') {
-    localStorage.setItem('lastNumber', d.accountNumber);
-    await bootApp(d, true);
-    toast('Welcome to taupe', '', 'ok', 5000);
+  let pow;
+  try {
+    const challenge = await api('GET', '/api/register/challenge');
+    if (challenge.error) { $('auth-error').textContent = challenge.error; return; }
+    const prefix = '0'.repeat(challenge.difficulty);
+    let nonce = 0;
+    while (true) {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(challenge.challenge + nonce));
+      const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+      if (hex.startsWith(prefix)) { pow = { challenge: challenge.challenge, nonce }; break; }
+      nonce++;
+      if (nonce % 4096 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  } catch (e) {
+    $('auth-error').textContent = 'Registration proof failed';
     return;
   }
+  const d = await api('POST', '/api/register', pow);
+  if (d.error) { $('auth-error').textContent = d.error; return; }
+
 
   pendingAccountData = d;
   $('save-number-text').textContent = fmtPrivate(d.accountNumber);
   show($('modal-save-number'));
-};
+});
 
- $('btn-login').onclick = async () => {
+ $('btn-login').onclick = () => withButtonLoading($('btn-login'), 'Signing in...', async () => {
   $('auth-error').textContent = '';
   localStorage.removeItem('taupe_active_chat');
   const raw = $('input-number').value.replace(/\D/g, '');
@@ -151,9 +183,9 @@ let pendingAccountData = null;
   }
 
   if (d.error) { $('auth-error').textContent = d.error; return; }
-  localStorage.setItem('lastNumber', d.accountNumber);
+  pendingAccountData = d;
   await bootApp(d, false);
-};
+});
 
 async function showKickDevicesModal(number) {
   const d = await api('POST', '/api/login/devices', { number });
@@ -181,13 +213,12 @@ async function showKickDevicesModal(number) {
   });
 
   $('btn-kick-signin').disabled = (d.devices || []).length >= 5;
-  $('btn-kick-signin').onclick = async () => {
+  $('btn-kick-signin').onclick = () => withButtonLoading($('btn-kick-signin'), 'Signing in...', async () => {
     hide($('modal-kick-devices'));
     const loginRes = await api('POST', '/api/login', { number });
     if (loginRes.error) { $('auth-error').textContent = loginRes.error; return; }
-    localStorage.setItem('lastNumber', loginRes.accountNumber);
     await bootApp(loginRes, false);
-  };
+  });
   $('kick-cancel').onclick = () => hide($('modal-kick-devices'));
   show($('modal-kick-devices'));
 }
@@ -201,8 +232,8 @@ document.querySelectorAll('.tab').forEach(t => {
   };
 });
 
-const saved = localStorage.getItem('lastNumber');
-if (saved) $('input-number').value = fmtPrivate(saved);
+localStorage.removeItem('lastNumber');
+localStorage.removeItem('taupe_check_done');
 
 $('input-number').addEventListener('input', e => {
   const el    = e.target;
@@ -221,11 +252,11 @@ async function init() {
 }
 
 async function bootApp(me, isNewAccount = false) {
-  S.account = me;
+  state.account = me;
   $('my-number-display').textContent = fmtNum(me.chatNumber || me.accountNumber?.slice(-8));
   switchScreen('main');
 
-  if (me.deviceId) { await setMyDeviceId(me.deviceId); S.myDeviceId = me.deviceId; }
+  if (me.deviceId) { await setMyDeviceId(me.deviceId); state.myDeviceId = me.deviceId; }
   try {
     if (!me.devices) {
       const full = await api('GET', '/api/me');
@@ -237,20 +268,7 @@ async function bootApp(me, isNewAccount = false) {
       await setOwnDeviceKeys(me.devices.filter(d => d.public_key).map(d => ({ deviceId: d.id, key: d.public_key })));
     }
   } catch {}
-  if (me.devices && me.devices.length > 1) {
-    const alreadySynced = await hasSyncedKeys();
-
-    if (!alreadySynced) {
-      S.waitingForKeySync = true;
-      setTimeout(async () => {
-        toast('Waiting for key from another device', 'Please open Taupe on another device to sync history.', 'warn', 6000);
-        S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
-      }, 1000);
-    } else {
-      console.log('[Key Sync] Already synced.');
-    }
-  }
-
+  state.deviceApproved = me.deviceApproved === true;
   await uploadMyPublicKey();
   await loadChats();
   await loadSystemMessages();
@@ -258,7 +276,7 @@ async function bootApp(me, isNewAccount = false) {
   startPolling();
 
   const savedChat = localStorage.getItem('taupe_active_chat');
-  if (savedChat && S.chats.find(c => c.uid === savedChat)) {
+  if (savedChat && state.chats.find(c => c.uid === savedChat)) {
     openChat(savedChat);
   } else {
     localStorage.removeItem('taupe_active_chat');
@@ -278,41 +296,270 @@ async function uploadMyPublicKey() {
     return;
   }
   try {
-    const pubKey = await getMyPublicKeyB64();
-    const d = await api('POST', '/api/me/pubkey', { publicKey: pubKey });
-    if (d.ok) console.log('[E2E] public key uploaded');
-  } catch (e) { console.warn('[E2E] key upload failed', e); }
+    const deviceId = state.account.deviceId || await getMyDeviceId();
+    const keyPackage = await getDeviceKeyPackage(deviceId);
+    const d = await api('POST', '/api/me/pubkey', keyPackage);
+    if (d.error) {
+      if (d.code === 'identity_mismatch') {
+        state.waitingForKeySync = true;
+      } else {
+        toast('Encryption key rejected', d.error, 'err');
+      }
+      return;
+    }
+    state.deviceApproved = !!d.approved;
+    state.keyRequest = d.request || null;
+    if (d.approved) {
+      state.waitingForKeyApproval = false;
+      toast('E2E key registered', '', 'ok', 2000);
+    } else {
+      state.waitingForKeyApproval = true;
+      state.waitingForKeySync = !!d.requiresIdentity;
+      if (d.request?.id) state.myPendingKeyRequestId = d.request.id;
+      const code = d.request?.payload?.code;
+      toast(
+        d.requiresIdentity ? 'Identity sync required' : 'Device approval needed',
+        code ? `Compare code ${code} on an existing device.` : 'Approve this device from another device.',
+        'warn',
+        8000
+      );
+    }
+  } catch (e) {
+    console.warn('[E2E] key upload failed', e);
+  }
 }
 
 async function getMyDevicesKeys() {
   const me = await api('GET', '/api/me');
   if (me.error || !me.devices) return [];
   return me.devices
-    .filter(d => d.public_key && String(d.id) !== String(S.account.deviceId))
+    .filter(d => d.public_key && d.approved)
     .map(d => ({ deviceId: d.id, key: d.public_key }));
 }
 
-async function getPeerKey(peerChatNumber) {
+async function getPeerKey(peerChatNumber, force = false) {
   if (!peerChatNumber) return null;
-  if (S.peerKeys.has(peerChatNumber)) return S.peerKeys.get(peerChatNumber);
+  const cached = state.peerKeys.get(peerChatNumber) || null;
+  if (!force && cached) return cached;
   try {
     const d = await api('GET', `/api/pubkey/${peerChatNumber}`);
-
-    const keys = d.publicKeys?.length
-      ? d.publicKeys.map(dk => ({ deviceId: dk.deviceId, key: dk.key }))
-      : d.publicKey ? [{ deviceId: 0, key: d.publicKey }] : null;
-    if (keys) {
-      S.peerKeys.set(peerChatNumber, keys);
-      return keys;
+    if (d.error) return cached;
+    const identity = d.identityKey || null;
+    if (!identity) return cached;
+    const devices = [];
+    const invalid = [];
+    for (const item of d.publicKeys || []) {
+      const ok = await verifyDeviceSignature(identity, item.deviceId, item.key, item.sig);
+      if (ok) devices.push({ deviceId: item.deviceId, key: item.key });
+      else invalid.push(item.deviceId);
     }
-  } catch (e) { console.warn('[E2E] getPeerKey failed', e); }
-  return null;
+    if (!devices.length) {
+      toast('Key verification failed', 'Peer device keys could not be verified.', 'err', 6000);
+      return cached;
+    }
+    const report = await pinPeerKeys(peerChatNumber, identity, devices.map(item => ({ d: item.deviceId, k: item.key })));
+    state.peerPin = await getPeerPin(peerChatNumber);
+    if (report.blocking || invalid.length) {
+      notifyKeyAlert(peerChatNumber, report, invalid);
+    }
+    state.peerKeys.set(peerChatNumber, devices);
+    return devices;
+  } catch (e) {
+    console.warn('[E2E] getPeerKey failed', e);
+  }
+  return cached;
 }
 
+function notifyKeyAlert(peerChatNumber, report, invalid) {
+  const changed = report?.identityChanged || (report?.changed && report.changed.length);
+  const added = report?.added && report.added.length;
+  const text = changed
+    ? 'The peer security key changed. Sending is blocked until you review it.'
+    : added
+      ? 'A new device key appeared for this peer.'
+      : 'A peer device key could not be verified.';
+  if (invalid && invalid.length && !changed) {
+    toast('Invalid device key', 'A peer device key failed signature verification.', 'err', 7000);
+  } else {
+    toast('Security key changed', text, 'warn', 8000);
+  }
+  const banner = $('key-alert-banner');
+  if (banner) {
+    $('key-alert-text').textContent = text;
+    show(banner);
+  }
+}
+
+async function ensurePeerTrusted(peerChatNumber) {
+  if (!peerChatNumber) return false;
+  await getPeerKey(peerChatNumber);
+  const pin = await getPeerPin(peerChatNumber);
+  if (pin?.blocking) {
+    notifyKeyAlert(peerChatNumber, { identityChanged: true, added: [], changed: [] }, []);
+    openPeerSecurity();
+    return false;
+  }
+  return true;
+}
+
+async function openPeerSecurity() {
+  const peerChatNumber = await getActivePeerChatNum();
+  if (!peerChatNumber) return;
+  await getPeerKey(peerChatNumber);
+  const pin = await getPeerPin(peerChatNumber);
+  const myIdentity = await getMyIdentityPublicKeyB64();
+  const safety = pin?.identityPub ? await getSafetyNumber(myIdentity, pin.identityPub) : null;
+  $('security-safety-number').textContent = safety || 'Unavailable, peer identity key is missing';
+  $('security-peer-title').textContent = fmtNum(peerChatNumber);
+  $('security-devices').innerHTML = (pin?.devices || []).map(device => `
+    <div class="security-device">
+      <span>Device ${esc(String(device.d))}</span>
+      <span class="mono">${esc(String(device.k).slice(0, 16))}...</span>
+    </div>
+  `).join('');
+  updateSecurityVerifyButton(pin);
+  $('security-blocked').classList.toggle('hidden', !pin?.blocking);
+  state.peerPin = pin;
+  show($('modal-security'));
+}
+
+async function acknowledgeCurrentPeer() {
+  const peerChatNumber = await getActivePeerChatNum();
+  if (!peerChatNumber) return;
+  await acknowledgePeerKeys(peerChatNumber, false);
+  state.peerPin = await getPeerPin(peerChatNumber);
+  hide($('key-alert-banner'));
+  hide($('modal-security'));
+  updateVerifiedBadge(peerChatNumber);
+  toast('New keys trusted', 'The peer security keys were accepted without verification.', 'warn', 4000);
+}
+
+function updateSecurityVerifyButton(pin) {
+  const button = $('security-verify');
+  if (!button) return;
+  const verified = pin?.verified === true;
+  button.textContent = verified ? 'Mark unverified' : 'Mark verified';
+  button.className = verified ? 'btn-ghost' : 'btn-primary';
+}
+
+async function updateVerifiedBadge(peerChatNumber) {
+  const badge = $('chat-verified-badge');
+  if (!badge) return;
+  const pin = await getPeerPin(peerChatNumber);
+  if (pin?.verified) {
+    badge.textContent = 'verified';
+    badge.className = 'verified-badge';
+  } else {
+    badge.textContent = pin?.blocking ? 'key changed' : 'unverified';
+    badge.className = 'verified-badge ' + (pin?.blocking ? 'danger' : 'muted');
+  }
+}
+
+let infoTipTarget = null;
+let infoTipShownAt = 0;
+
+function hideInfoTip() {
+  const tooltip = $('info-tooltip');
+  if (!tooltip) return;
+  tooltip.classList.remove('visible');
+  tooltip.setAttribute('aria-hidden', 'true');
+  document.querySelectorAll('.info-tip.show-tip').forEach(item => item.classList.remove('show-tip'));
+  infoTipTarget = null;
+}
+
+function showInfoTip(button) {
+  const tooltip = $('info-tooltip');
+  if (!tooltip || !button) return;
+  const text = button.dataset.tip;
+  if (!text) return;
+  document.querySelectorAll('.info-tip.show-tip').forEach(item => {
+    if (item !== button) item.classList.remove('show-tip');
+  });
+  infoTipTarget = button;
+  infoTipShownAt = Date.now();
+  button.classList.add('show-tip');
+  tooltip.textContent = text;
+  tooltip.style.left = '0px';
+  tooltip.style.top = '0px';
+  tooltip.classList.add('visible');
+  tooltip.setAttribute('aria-hidden', 'false');
+  const anchor = button.getBoundingClientRect();
+  const box = tooltip.getBoundingClientRect();
+  let left = anchor.left + anchor.width / 2 - box.width / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - box.width - 8));
+  let top = anchor.bottom + 8;
+  if (top + box.height > window.innerHeight - 8 && anchor.top - box.height - 8 > 8) {
+    top = anchor.top - box.height - 8;
+  }
+  tooltip.style.left = left + 'px';
+  tooltip.style.top = top + 'px';
+}
+
+document.addEventListener('pointerover', event => {
+  const button = event.target.closest('.info-tip');
+  if (button && button !== infoTipTarget) showInfoTip(button);
+});
+document.addEventListener('pointerout', event => {
+  const button = event.target.closest('.info-tip');
+  if (!button) return;
+  const next = event.relatedTarget;
+  if (next && button.contains(next)) return;
+  if (infoTipTarget === button) hideInfoTip();
+});
+document.addEventListener('click', event => {
+  const button = event.target.closest('.info-tip');
+  if (!button) {
+    if (!event.target.closest('.info-tooltip')) hideInfoTip();
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  if (infoTipTarget === button && Date.now() - infoTipShownAt > 500) hideInfoTip();
+  else showInfoTip(button);
+});
+document.addEventListener('focusin', event => {
+  const button = event.target.closest('.info-tip');
+  if (button) showInfoTip(button);
+});
+document.addEventListener('focusout', event => {
+  const button = event.target.closest('.info-tip');
+  if (button && infoTipTarget === button) hideInfoTip();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') hideInfoTip();
+});
+window.addEventListener('scroll', hideInfoTip, true);
+window.addEventListener('resize', hideInfoTip);
+
+document.addEventListener('DOMContentLoaded', () => {
+  hideInfoTip();
+  $('security-close')?.addEventListener('click', () => hide($('modal-security')));
+  $('security-copy')?.addEventListener('click', () => copyToClipboard($('security-safety-number').textContent, 'Copied', 'Safety number copied'));
+  $('security-verify')?.addEventListener('click', async () => {
+    const peerChatNumber = await getActivePeerChatNum();
+    if (!peerChatNumber) return;
+    const pin = await getPeerPin(peerChatNumber);
+    const verified = pin?.verified !== true;
+    await setPeerVerified(peerChatNumber, verified);
+    state.peerPin = await getPeerPin(peerChatNumber);
+    updateSecurityVerifyButton(state.peerPin);
+    updateVerifiedBadge(peerChatNumber);
+    if (verified) hide($('key-alert-banner'));
+    toast(
+      verified ? 'Verified' : 'Unverified',
+      verified ? 'Safety number marked as verified.' : 'Verification removed for this peer.',
+      verified ? 'ok' : 'warn'
+    );
+  });
+  $('security-trust')?.addEventListener('click', acknowledgeCurrentPeer);
+  $('key-alert-review')?.addEventListener('click', openPeerSecurity);
+  $('key-alert-trust')?.addEventListener('click', acknowledgeCurrentPeer);
+  $('chat-verified-badge')?.addEventListener('click', openPeerSecurity);
+});
 async function getActivePeerChatNum() {
-  const c = S.chats.find(x => x.uid === S.activeChatUid);
+  const c = state.chats.find(x => x.uid === state.activeChatUid);
   if (!c) return null;
-  const myId = S.account.accountId;
+  const myId = state.account.accountId;
   return c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
 }
 
@@ -325,11 +572,11 @@ function formatLastSeenTs(sec) {
 function renderPresence() {
   const el = $('chat-presence');
   if (!el) return;
-  const c = S.chats.find(x => x.uid === S.activeChatUid);
+  const c = state.chats.find(x => x.uid === state.activeChatUid);
   if (!c) { el.className = 'hidden'; el.textContent = ''; return; }
-  const myId = S.account.accountId;
+  const myId = state.account.accountId;
   const num = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
-  const p = S.presence.get(num);
+  const p = state.presence.get(num);
   if (!p) { el.className = 'hidden'; el.textContent = ''; return; }
   if (p.online) {
     el.textContent = 'online';
@@ -344,44 +591,47 @@ function renderPresence() {
 }
 
 function startPolling() {
-  if (S.pollTimer) clearInterval(S.pollTimer);
-  S.pollTimer = setInterval(async () => {
-    if (!S.socket?.connected) {
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.pollTimer = setInterval(async () => {
+    if (!state.socket?.connected) {
 
       await loadChats();
-      if (S.activeChatUid) await refreshActiveChat();
+      if (state.activeChatUid) await refreshActiveChat();
     }
   }, 3000);
 }
 
 async function refreshActiveChat() {
-  if (!S.activeChatUid) return;
-  const uid = S.activeChatUid;
+  if (!state.activeChatUid) return;
+  const uid = state.activeChatUid;
   const myRefreshToken = ++refreshSeq;
   const msgs = await api('GET', `/api/chats/${uid}/messages`);
   if (myRefreshToken !== refreshSeq) return;
   if (!Array.isArray(msgs)) return;
-  if (S.activeChatUid !== uid) return;
+  if (state.activeChatUid !== uid) return;
+  await applyLocalHistory(uid, msgs);
   const cont = $('messages-container');
   const rendered = new Set([...cont.querySelectorAll('[data-msg-id]')].map(el => el.dataset.msgId));
   const peerChatNum = await getActivePeerChatNum();
-  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-  if (myRefreshToken !== refreshSeq || S.activeChatUid !== uid) return;
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum, true) : null;
+  const decryptKeys = peerPub ? [...peerPub, ...await getMyDevicesKeys()] : null;
+  if (myRefreshToken !== refreshSeq || state.activeChatUid !== uid) return;
   for (const m of msgs) {
-    if (myRefreshToken !== refreshSeq || S.activeChatUid !== uid) return;
+    if (myRefreshToken !== refreshSeq || state.activeChatUid !== uid) return;
     if (rendered.has(String(m.id))) continue;
-    if (m.sender_id == S.account.accountId && S.pendingSends.length) {
+    if (m.sender_id == state.account.accountId && state.pendingSends.length) {
       const p = takePending(uid);
       if (p) {
         removePendingBubble(p.pid);
         if (isEncrypted(m.content)) m._plaintext = p.text;
       }
     }
-    await renderMessage(m, peerChatNum, peerPub);
+    m._history = true;
+    await renderMessage(m, peerChatNum, decryptKeys);
   }
 
   if (document.visibilityState === 'visible') {
-    S.socket?.emit('msg:read', { chatUid: uid });
+    state.socket?.emit('msg:read', { chatUid: uid });
   }
 }
 
@@ -390,95 +640,105 @@ function getToken() {
 }
 
 function connectSocket() {
-  if (S.socket) S.socket.disconnect();
-  S.socket = io({
+  if (state.socket) state.socket.disconnect();
+  state.socket = io({
     auth: { token: getToken() },
     reconnection: true, reconnectionDelay: 1000, reconnectionAttempts: Infinity,
   });
 
-  S.socket.on('connect', async () => {
+  state.socket.on('connect', async () => {
     hideUnstable();
     const indicator = $('e2e-indicator');
     if (indicator) indicator.title = 'E2E active';
     flushOutbox();
-    if (S.waitingForKeySync) {
-      S.socket.emit('key:request', { myPublicKey: await getMyPublicKeyB64() });
+    if (state.waitingForKeySync) {
+      if (state.socket) state.socket.emit('key:request', {});
     }
   });
-  S.socket.on('disconnect', () => { if (!S.ignored) showUnstable(); });
-  S.socket.on('connect_error', () => { if (!S.ignored) showUnstable(); });
+  state.socket.on('disconnect', () => { if (!state.ignored) showUnstable(); });
+  state.socket.on('connect_error', () => { if (!state.ignored) showUnstable(); });
 
-  S.socket.emit('key:presence', { myPublicKey: 'online' });
+  state.socket.emit('key:presence', { myPublicKey: 'online' });
 
-  S.socket.on('sys:new', ({ message }) => {
-    if (!message || S.sysMessages.some(m => m.id === message.id)) return;
-    S.sysMessages.unshift(message);
-    if (message.type === 'key_request' && Number(message.payload?.deviceId) === Number(S.myDeviceId)) {
-      S.myPendingKeyRequestId = message.id;
-      if (S.waitingForKeySync) toast('Waiting for approval', 'Another device must confirm the key transfer.', 'info', 6000);
+  state.socket.on('sys:new', ({ message }) => {
+    if (!message || state.sysMessages.some(m => m.id === message.id)) return;
+    state.sysMessages.unshift(message);
+    if (message.type === 'key_request' && Number(message.payload?.deviceId) === Number(state.myDeviceId)) {
+      state.myPendingKeyRequestId = message.id;
+      if (state.waitingForKeySync) toast('Waiting for approval', 'Another device must confirm the key transfer.', 'info', 6000);
     }
-    if (S.systemOpen) {
+    if (state.systemOpen) {
       renderSystemMessages();
     } else {
-      S.sysUnread++;
+      state.sysUnread++;
       updateSystemBadge();
     }
     refreshSystemChatItem();
   });
 
-  S.socket.on('sys:updated', ({ id, status }) => {
-    const m = S.sysMessages.find(x => x.id === id);
+  state.socket.on('sys:updated', ({ id, status }) => {
+    const m = state.sysMessages.find(x => x.id === id);
     if (m) m.status = status;
-    if (status === 'declined' && id === S.myPendingKeyRequestId) {
-      S.myPendingKeyRequestId = null;
-      S.waitingForKeySync = false;
+    if (status === 'declined' && id === state.myPendingKeyRequestId) {
+      state.myPendingKeyRequestId = null;
+      state.waitingForKeySync = false;
       toast('Key transfer declined', 'The request was rejected by another device.', 'warn', 5000);
     }
-    if (S.systemOpen) renderSystemMessages();
+    if (state.systemOpen) renderSystemMessages();
     refreshSystemChatItem();
   });
 
-  S.socket.on('key:sync', async ({ fromPublicKey, encryptedKey }) => {
+  state.socket.on('key:sync', async ({ fromPublicKey, encryptedKey }) => {
     try {
-      const added = await decryptSyncedKey(encryptedKey, fromPublicKey);
-      await clearAllSessions();
-      S.waitingForKeySync = false;
-      toast('Keys Synced', added > 1 ? `Imported ${added} keys — history unlocked.` : 'Successfully imported keys from another device.', 'ok', 3000);
-      const rid = S.myPendingKeyRequestId;
+      await decryptSyncedKey(encryptedKey, fromPublicKey);
+      state.waitingForKeySync = false;
+      toast('Identity synced', 'Re-registering this device key.', 'ok', 3000);
+      await uploadMyPublicKey();
+      const rid = state.myPendingKeyRequestId;
       if (rid) {
-        S.myPendingKeyRequestId = null;
-        S.socket.emit('key:sync:done', { id: rid });
+        state.myPendingKeyRequestId = null;
+        state.socket.emit('key:sync:done', { id: rid });
       }
-      if (S.activeChatUid) openChat(S.activeChatUid);
+      if (state.activeChatUid) openChat(state.activeChatUid);
       else loadChats();
-    } catch (e) { console.error('[Key Sync] Failed to decrypt synced key:', e); }
+    } catch (e) {
+      console.error('[Key Sync] Failed to decrypt synced identity:', e);
+      toast('Sync failed', 'The identity key could not be imported.', 'err');
+    }
   });
 
-  S.socket.on('msg:new', async ({ chatUid, msg, preview }) => {
+  state.socket.on('key:approved', async () => {
+    state.waitingForKeyApproval = false;
+    await uploadMyPublicKey();
+    toast('Device approved', 'This device can now receive encrypted messages.', 'ok', 4000);
+  });
+
+  state.socket.on('msg:new', async ({ chatUid, msg, preview }) => {
     updateChatPreviewUI(chatUid, preview);
-    const isMyMsg = msg.sender_id == S.account.accountId;
+    const isMyMsg = msg.sender_id == state.account.accountId;
     let pendingInfo = null;
     if (isMyMsg) {
       pendingInfo = takePending(chatUid);
-      if (pendingInfo && S.activeChatUid === chatUid) removePendingBubble(pendingInfo.pid);
+      if (pendingInfo && state.activeChatUid === chatUid) removePendingBubble(pendingInfo.pid);
     }
-    if (S.activeChatUid === chatUid) {
+    if (state.activeChatUid === chatUid) {
       if (document.querySelector(`[data-msg-id="${msg.id}"]`)) return;
 
       const peerChatNum = await getActivePeerChatNum();
-      const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+      const peerPub = peerChatNum ? await getPeerKey(peerChatNum, true) : null;
+      const decryptKeys = peerPub ? [...peerPub, ...await getMyDevicesKeys()] : null;
 
       if (pendingInfo) {
         msg = { ...msg, _plaintext: pendingInfo.text };
-      } else if (isMyMsg && S._pendingPlaintext && isEncrypted(msg.content)) {
-        msg = { ...msg, _plaintext: S._pendingPlaintext };
-        S._pendingPlaintext = null;
+      } else if (isMyMsg && state._pendingPlaintext && isEncrypted(msg.content)) {
+        msg = { ...msg, _plaintext: state._pendingPlaintext };
+        state._pendingPlaintext = null;
       }
-      await renderMessage(msg, peerChatNum, peerPub);
+      await renderMessage(msg, peerChatNum, decryptKeys);
       scrollBottom();
-      if (!isMyMsg) S.socket.emit('msg:read', { chatUid });
+      if (!isMyMsg) state.socket.emit('msg:read', { chatUid });
     } else {
-      const c = S.chats.find(x => x.uid === chatUid);
+      const c = state.chats.find(x => x.uid === chatUid);
       if (c) {
         c.unread = (c.unread || 0) + 1;
         const b = $('badge-' + chatUid);
@@ -498,8 +758,8 @@ function connectSocket() {
     }
   });
 
-  S.socket.on('peer:profile_update', ({ chatUid, accountId, username, isPublic, avatarPath }) => {
-    const c = S.chats.find(x => x.uid === chatUid);
+  state.socket.on('peer:profile_update', ({ chatUid, accountId, username, isPublic, avatarPath }) => {
+    const c = state.chats.find(x => x.uid === chatUid);
     if (c) {
       if (c.initiator_id == accountId) {
         c.initiator_username = username;
@@ -512,9 +772,9 @@ function connectSocket() {
 
       renderChatList();
 
-      if (S.activeChatUid === chatUid) {
+      if (state.activeChatUid === chatUid) {
         $('chat-title-display').textContent = chatLabel(c);
-        const myId = S.account.accountId;
+        const myId = state.account.accountId;
         const avatarSrc = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
         const headerAvatar = $('chat-header-avatar');
         if (avatarSrc) {
@@ -527,40 +787,40 @@ function connectSocket() {
     }
   });
 
-  S.socket.on('msg:burned', ({ chatUid, ids, preview }) => {
+  state.socket.on('msg:burned', ({ chatUid, ids, preview }) => {
     ids.forEach(id => {
 
-      const timer = S.activeBurnTimers.get(id);
-      if (timer) { clearInterval(timer); S.activeBurnTimers.delete(id); }
+      const timer = state.activeBurnTimers.get(id);
+      if (timer) { clearInterval(timer); state.activeBurnTimers.delete(id); }
       document.querySelector(`[data-msg-id="${id}"]`)?.closest('.msg-wrap')?.remove();
     });
     if (preview !== undefined) updateChatPreviewUI(chatUid, preview);
   });
 
-  S.socket.on('msg:burn:countdown', async ({ msgId, chatUid, burnAt, burnSeconds, content, filePath, fileType, fileName }) => {
+  state.socket.on('msg:burn:countdown', async ({ msgId, chatUid, burnAt, burnSeconds, content, filePath, fileType, fileName }) => {
     await startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, { content, filePath, fileType, fileName });
   });
 
-  S.socket.on('msg:error', ({ chatUid, error }) => {
+  state.socket.on('msg:error', ({ chatUid, error }) => {
     console.warn('[msg:error]', error);
     toast('Not sent', error || 'The server rejected the message.', 'err');
   });
 
-  S.socket.on('peer:presence', ({ chatUid, number, online, lastSeen }) => {
+  state.socket.on('peer:presence', ({ chatUid, number, online, lastSeen }) => {
     if (!number) return;
-    S.presence.set(number, { online: !!online, lastSeen: lastSeen || null });
-    if (chatUid && chatUid === S.activeChatUid) renderPresence();
+    state.presence.set(number, { online: !!online, lastSeen: lastSeen || null });
+    if (chatUid && chatUid === state.activeChatUid) renderPresence();
   });
 
-  S.socket.on('msg:read:ack', ({ chatUid, by }) => {
+  state.socket.on('msg:read:ack', ({ chatUid, by }) => {
 
-    if (S.activeChatUid === chatUid && by != S.account.accountId) markAllRead();
+    if (state.activeChatUid === chatUid && by != state.account.accountId) markAllRead();
   });
 
-  S.socket.on('msg:deleted', ({ msgId, forWhom, by, previewInit, previewPeer, initiatorId, peerId }) => {
+  state.socket.on('msg:deleted', ({ msgId, forWhom, by, previewInit, previewPeer, initiatorId, peerId }) => {
     const el = document.querySelector(`[data-msg-id="${msgId}"]`);
-    const isMe = String(by) === String(S.account.accountId);
-    const amInitiator = String(S.account.accountId) === String(initiatorId);
+    const isMe = String(by) === String(state.account.accountId);
+    const amInitiator = String(state.account.accountId) === String(initiatorId);
     const myPreview = amInitiator ? previewInit : previewPeer;
 
     if (el) {
@@ -571,33 +831,35 @@ function connectSocket() {
       if (shouldHide) el.closest('.msg-wrap')?.remove();
     }
 
-    if (S.activeChatUid) updateChatPreviewUI(S.activeChatUid, myPreview ?? '');
+    if (state.activeChatUid) updateChatPreviewUI(state.activeChatUid, myPreview ?? '');
   });
 
-  S.socket.on('msg:reaction', async ({ msgId, reactions }) => {
+  state.socket.on('msg:reaction', async ({ msgId, reactions }) => {
     const wrap = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"]`)?.closest('.msg-wrap');
     if (!wrap) return;
 
     let reactionsBar = wrap.querySelector('.msg-reactions');
 
     const peerChatNum = await getActivePeerChatNum();
-    const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+    const peerPub = peerChatNum ? await getPeerKey(peerChatNum, true) : null;
+    const decryptKeys = peerPub ? [...peerPub, ...await getMyDevicesKeys()] : null;
 
     const grouped = {};
     const myEncEmojis = {};
 
     for (const r of reactions) {
       let emoji = r.emoji;
-      if (isEncrypted(emoji) && peerPub) {
-        try { emoji = await decryptMsg(emoji, peerChatNum, peerPub); }
+      if (isEncrypted(emoji) && decryptKeys) {
+        try { emoji = await decryptMsg(emoji, state.activeChatUid || peerChatNum, decryptKeys, { enforceReplay: false }); }
         catch { emoji = '?'; }
       } else if (isEncrypted(emoji)) {
         emoji = '?';
       }
+      if (!isSingleEmoji(emoji)) emoji = '?';
       grouped[emoji] = grouped[emoji] || [];
       grouped[emoji].push(r.account_id);
 
-      if (r.account_id === Number(S.account.accountId)) {
+      if (r.account_id === Number(state.account.accountId)) {
         myEncEmojis[emoji] = r.emoji;
       }
     }
@@ -615,7 +877,7 @@ function connectSocket() {
 
     reactionsBar.innerHTML = '';
     for (const [emoji, users] of Object.entries(grouped)) {
-      const isMine = users.includes(Number(S.account.accountId));
+      const isMine = users.includes(Number(state.account.accountId));
       const btn = document.createElement('button');
       btn.className = `msg-reaction ${isMine ? 'mine' : ''}`;
       btn.dataset.msgId = msgId;
@@ -623,12 +885,12 @@ function connectSocket() {
       if (isMine) {
         btn.dataset.encEmoji = myEncEmojis[emoji];
       }
-      btn.innerHTML = `${twParse(emoji)} <span>${users.length}</span>`;
+      btn.innerHTML = `${reactionHtml(emoji)} <span>${users.length}</span>`;
       btn.onclick = (ev) => {
         ev.stopPropagation();
         const encEmoji = btn.dataset.encEmoji;
         if (encEmoji) {
-          S.socket.emit('msg:react', { msgId, emoji: encEmoji });
+          state.socket.emit('msg:react', { msgId, emoji: encEmoji });
         } else {
           sendReaction(msgId, emoji);
         }
@@ -637,13 +899,13 @@ function connectSocket() {
     }
   });
 
-  S.socket.on('msg:played', ({ msgId }) => {
+  state.socket.on('msg:played', ({ msgId }) => {
     const dot = document.querySelector(`.msg-bubble[data-msg-id="${msgId}"] .audio-unplayed`);
     if (dot) dot.remove();
   });
 
-  S.socket.on('chat:deleted', ({ chatUid, forWhom, by }) => {
-    const isMe = String(by) === String(S.account.accountId);
+  state.socket.on('chat:deleted', ({ chatUid, forWhom, by }) => {
+    const isMe = String(by) === String(state.account.accountId);
     if (forWhom === 'both' || (forWhom === 'peer' && !isMe)) {
       const chatEl = document.querySelector(`.chat-item[data-uid="${chatUid}"]`);
 
@@ -651,71 +913,107 @@ function connectSocket() {
         chatEl.classList.add('removing');
         setTimeout(() => {
           chatEl.remove();
-          S.chats = S.chats.filter(c => c.uid !== chatUid);
-          if (S.activeChatUid === chatUid) closeChat();
+          state.chats = state.chats.filter(c => c.uid !== chatUid);
+          if (state.activeChatUid === chatUid) closeChat();
           if (!isMe) toast('Chat deleted', 'The other party deleted this chat', 'warn');
         }, 200);
       } else {
-        S.chats = S.chats.filter(c => c.uid !== chatUid);
+        state.chats = state.chats.filter(c => c.uid !== chatUid);
         renderChatList();
-        if (S.activeChatUid === chatUid) closeChat();
+        if (state.activeChatUid === chatUid) closeChat();
       }
     }
   });
 
-  S.socket.on('chat:new', async ({ chat }) => {
+  state.socket.on('chat:new', async ({ chat }) => {
 
-    if (S.chats.find(c => c.uid === chat.uid)) return;
+    if (state.chats.find(c => c.uid === chat.uid)) return;
 
-    const myId = S.account.accountId;
+    const myId = state.account.accountId;
     const peerChatNum = chat.initiator_id == myId ? chat.peer_chat_number : chat.initiator_chat_number;
     const aliases = await api('GET', '/api/aliases');
 
-    if (S.chats.find(c => c.uid === chat.uid)) return;
+    if (state.chats.find(c => c.uid === chat.uid)) return;
 
     const aliasMap = {};
     (aliases || []).forEach(a => aliasMap[a.target_number] = a.alias);
-    chat.peer_alias = aliasMap[peerChatNum] || null;
-    S.chats.unshift(chat);
+    chat.peer_alias = await decryptMeta(aliasMap[peerChatNum] || null);
+    chat.label_initiator = await decryptMeta(chat.label_initiator || null);
+    chat.label_peer = await decryptMeta(chat.label_peer || null);
+    state.chats.unshift(chat);
     renderChatList();
 
-    S.socket.emit('chat:join', { chatUid: chat.uid });
+    state.socket.emit('chat:join', { chatUid: chat.uid });
   });
 
-  S.socket.on('chat:burn:confirmed', ({ chatUid }) => {
-    const c = S.chats.find(x => x.uid === chatUid);
+  state.socket.on('chat:request', ({ chatUid, fromNumber }) => {
+    state.pendingChatRequest = { chatUid, fromNumber };
+    $('chat-request-text').textContent = `Account ${fmtNum(fromNumber)} wants to start a chat.`;
+    show($('modal-chat-request'));
+    toast('Chat request', `Account ${fmtNum(fromNumber)} wants to chat`, 'info', 6000);
+  });
+
+  state.socket.on('chat:accepted', async ({ chatUid }) => {
+    toast('Chat accepted', 'The chat request was accepted.', 'ok', 3000);
+    await loadChats();
+    if (state.activeChatUid === chatUid) openChat(chatUid);
+  });
+
+  state.socket.on('chat:declined', ({ chatUid }) => {
+    state.chats = state.chats.filter(c => c.uid !== chatUid);
+    renderChatList();
+    if (state.activeChatUid === chatUid) closeChat();
+    toast('Chat declined', 'The chat request was declined.', 'warn', 3000);
+  });
+
+  state.socket.on('chat:burn:pending', ({ chatUid, mode, customMin, by }) => {
+    if (Number(by) === Number(state.account.accountId)) return;
+    showBurnConfirmModal(chatUid, mode, customMin);
+  });
+
+  state.socket.on('chat:history:pending', async ({ chatUid, max, by }) => {
+    if (Number(by) === Number(state.account.accountId)) return;
+    const ok = await dialog({ title: 'History limit', body: `Peer requests a history limit of ${max === -1 ? 'unlimited' : max + ' messages'}. Accept?`, okText: 'Accept' });
+    if (ok) state.socket.emit('chat:history:confirm', { chatUid });
+  });
+
+  state.socket.on('chat:burn:confirmed', ({ chatUid }) => {
+    const c = state.chats.find(x => x.uid === chatUid);
     if (c) c.burn_confirmed = 1;
     renderChatList();
     toast('Burn confirmed', 'Long retention confirmed by both', 'warn');
   });
 
-  S.socket.on('chat:history:changed', ({ chatUid, max, sysMsg }) => {
-    const c = S.chats.find(x => x.uid === chatUid);
+  state.socket.on('chat:history:changed', ({ chatUid, max, sysMsg }) => {
+    const c = state.chats.find(x => x.uid === chatUid);
     if (c) c.max_messages = max;
-    if (S.activeChatUid === chatUid && sysMsg) {
+    if (state.activeChatUid === chatUid && sysMsg) {
       renderSystemMessage(sysMsg.text);
     }
   });
 
-  S.socket.on('typing:start', ({ chatUid }) => {
-    if (S.activeChatUid === chatUid) {
+  state.socket.on('typing:start', ({ chatUid }) => {
+    if (state.activeChatUid === chatUid) {
       $('typing-indicator').textContent = 'typing...';
       show($('typing-indicator'));
     }
   });
-  S.socket.on('typing:stop', ({ chatUid }) => {
-    if (S.activeChatUid === chatUid) hide($('typing-indicator'));
+  state.socket.on('typing:stop', ({ chatUid }) => {
+    if (state.activeChatUid === chatUid) hide($('typing-indicator'));
   });
 
-  S.socket.on('peer:key_update', async ({ chatUid }) => {
-    const c = S.chats.find(x => x.uid === chatUid);
+  state.socket.on('peer:key_update', async ({ chatUid }) => {
+    const c = state.chats.find(x => x.uid === chatUid);
     if (c) {
-      const myId = S.account.accountId;
+      const myId = state.account.accountId;
       const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
-      S.peerKeys.delete(peerChatNum);
-      await invalidateSession(peerChatNum);
-      if (S.activeChatUid === chatUid) {
-        getPeerKey(peerChatNum);
+      state.peerKeys.delete(peerChatNum);
+      const fresh = await getPeerKey(peerChatNum);
+      if (fresh) {
+        updateVerifiedBadge(peerChatNum);
+        const pin = await getPeerPin(peerChatNum);
+        const banner = $('key-alert-banner');
+        if (banner) banner.classList.toggle('hidden', !pin?.blocking);
       }
     }
   });
@@ -725,11 +1023,11 @@ function showUnstable() { $('screen-main').classList.add('blurred'); show($('ove
 function hideUnstable() {
   $('screen-main').classList.remove('blurred');
   hide($('overlay-unstable')); hide($('btn-unstable-indicator'));
-  S.ignored = false;
+  state.ignored = false;
 }
-$('btn-retry').onclick  = () => S.socket.connect();
+$('btn-retry').onclick  = () => state.socket.connect();
 $('btn-ignore').onclick = () => {
-  S.ignored = true; hide($('overlay-unstable'));
+  state.ignored = true; hide($('overlay-unstable'));
   $('screen-main').classList.remove('blurred'); show($('btn-unstable-indicator'));
 };
 $('btn-unstable-indicator').onclick = showUnstable;
@@ -760,30 +1058,47 @@ function renderMessagesSkeleton() {
   }
 }
 
+async function decryptChatLabels(chats) {
+  for (const chat of chats) {
+    if (chat.label_initiator) chat.label_initiator = await decryptMeta(chat.label_initiator);
+    if (chat.label_peer) chat.label_peer = await decryptMeta(chat.label_peer);
+    if (chat.peer_alias) chat.peer_alias = await decryptMeta(chat.peer_alias);
+  }
+  return chats;
+}
+
 async function loadChats() {
-  if (!S.chats.length) renderChatListSkeleton();
+  if (!state.chats.length) renderChatListSkeleton();
   const data = await api('GET', '/api/chats');
   if (!Array.isArray(data)) return;
-  S.chats = data;
+  state.chats = await decryptChatLabels(data);
   renderChatList();
 }
 
 function sysMsgText(m) {
   const p = m.payload || {};
-  if (m.type === 'device_login') return `Sign-in from a new device: “${p.deviceName || 'device'}”`;
-  if (m.type === 'key_request') return `Device “${p.deviceName || 'new device'}” requests the encryption key to read message history.`;
-  if (m.type === 'key_transfer_done') return `Keys successfully transferred to “${p.deviceName || 'device'}”.`;
+  if (m.type === 'device_login') return `Sign-in from a new device: "${p.deviceName || 'device'}"`;
+  if (m.type === 'key_request') {
+    const bits = [];
+    if (p.code) bits.push(`code ${p.code}`);
+    if (p.ip) bits.push(`IP ${p.ip}`);
+    if (p.country && p.country !== 'unknown') bits.push(String(p.country));
+    if (p.expiresAt) bits.push(`expires ${new Date(p.expiresAt * 1000).toLocaleTimeString()}`);
+    return `Device "${p.deviceName || 'new device'}" requests approval${bits.length ? ' (' + bits.join(', ') + ')' : ''}.`;
+  }
+  if (m.type === 'key_transfer_done') return `Identity key transferred to "${p.deviceName || 'device'}".`;
+  if (m.type === 'chat_request') return 'Incoming chat request.';
   return 'System event';
 }
 
 async function loadSystemMessages() {
   const d = await api('GET', '/api/system/messages');
   if (!d || d.error || !Array.isArray(d.messages)) return;
-  S.sysMessages = d.messages;
-  S.sysUnread = d.unread || 0;
-  const mine = S.sysMessages.find(m => m.type === 'key_request' && m.status === 'pending' &&
-    Number(m.payload?.deviceId) === Number(S.myDeviceId));
-  if (mine) S.myPendingKeyRequestId = mine.id;
+  state.sysMessages = d.messages;
+  state.sysUnread = d.unread || 0;
+  const mine = state.sysMessages.find(m => m.type === 'key_request' && m.status === 'pending' &&
+    Number(m.payload?.deviceId) === Number(state.myDeviceId));
+  if (mine) state.myPendingKeyRequestId = mine.id;
   refreshSystemChatItem();
   updateSystemBadge();
 }
@@ -794,9 +1109,9 @@ function refreshSystemChatItem() {
   const old = $('chat-item-system');
   if (old) old.remove();
   const div = document.createElement('div');
-  div.className = 'chat-item chat-item-system' + (S.systemOpen ? ' active active-chat' : '');
+  div.className = 'chat-item chat-item-system' + (state.systemOpen ? ' active active-chat' : '');
   div.id = 'chat-item-system';
-  const last = S.sysMessages[0];
+  const last = state.sysMessages[0];
   const preview = last ? sysMsgText(last) : 'Account events and security alerts';
   div.innerHTML = `
     <div class="chat-avatar sys-avatar"><i class="fa-solid fa-bell-ring"></i></div>
@@ -804,7 +1119,7 @@ function refreshSystemChatItem() {
       <div class="chat-item-top"><span class="chat-item-name">Taupe</span></div>
       <div class="chat-item-preview" id="sys-preview">${esc(preview)}</div>
     </div>
-    <span class="chat-item-badge sys-badge ${S.sysUnread > 0 ? '' : 'hidden'}" id="sys-badge">${S.sysUnread || ''}</span>
+    <span class="chat-item-badge sys-badge ${state.sysUnread > 0 ? '' : 'hidden'}" id="sys-badge">${state.sysUnread || ''}</span>
   `;
   div.onclick = () => openSystemChat();
   const empty = list.querySelector('.chat-list-empty');
@@ -815,16 +1130,16 @@ function refreshSystemChatItem() {
 function updateSystemBadge() {
   const b = $('sys-badge');
   if (!b) return;
-  b.textContent = S.sysUnread || '';
-  b.classList.toggle('hidden', !(S.sysUnread > 0));
+  b.textContent = state.sysUnread || '';
+  b.classList.toggle('hidden', !(state.sysUnread > 0));
   const p = $('sys-preview');
-  const last = S.sysMessages[0];
+  const last = state.sysMessages[0];
   if (p && last) p.textContent = sysMsgText(last);
 }
 
 async function openSystemChat() {
-  S.systemOpen = true;
-  S.activeChatUid = null;
+  state.systemOpen = true;
+  state.activeChatUid = null;
   localStorage.removeItem('taupe_active_chat');
   hide($('empty-state'));
   const cv = $('chat-view');
@@ -837,8 +1152,8 @@ async function openSystemChat() {
   $('chat-header-avatar').classList.add('hidden');
   $('chat-subtitle').textContent = 'Account events and security';
   $('chat-subtitle').onclick = null;
+  show($('chat-subtitle'));
   hide($('msg-input-area'));
-  hide($('btn-burn-mode'));
   hide($('btn-chat-menu'));
 
   document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active', 'active-chat'));
@@ -847,17 +1162,17 @@ async function openSystemChat() {
 
   renderSystemMessages();
   const d = await api('POST', '/api/system/read', {});
-  if (d && !d.error) { S.sysUnread = 0; updateSystemBadge(); }
+  if (d && !d.error) { state.sysUnread = 0; updateSystemBadge(); }
 }
 
 async function renderSystemMessages() {
   const cont = $('messages-container');
   cont.innerHTML = '';
-  if (!S.sysMessages.length) {
+  if (!state.sysMessages.length) {
     cont.innerHTML = '<div class="sys-empty">No events yet.<br>Sign-ins and key-transfer requests will appear here.</div>';
     return;
   }
-  for (const m of [...S.sysMessages].reverse()) {
+  for (const m of [...state.sysMessages].reverse()) {
     const card = document.createElement('div');
     card.className = 'sys-card sys-' + m.type;
     const icon = m.type === 'key_request' ? 'fa-key'
@@ -868,12 +1183,13 @@ async function renderSystemMessages() {
     let statusHtml = '';
     if (m.type === 'key_request') {
       const st = m.status || 'pending';
-      const chips = { approved: 'Approved', declined: 'Declined', completed: 'Keys transferred' };
+      const chips = { approved: 'Approved, waiting for identity sync', declined: 'Declined', completed: 'Identity transferred', expired: 'Expired' };
       if (st === 'pending') {
         const own = await isOwnKeyRequest(m);
+        const code = m.payload?.code ? `<div class="sys-code">${esc(m.payload.code)}</div>` : '';
         statusHtml = own
-          ? '<div class="sys-status pending-self">Sent from this device — approve it on another device</div>'
-          : `
+          ? `<div class="sys-status pending-self">Compare this code on another device: ${esc(m.payload?.code || '')}. Approve there.</div>`
+          : `${code}
           <div class="sys-actions">
             <button class="sys-btn approve" data-id="${m.id}"><i class="fa-solid fa-check"></i> Approve</button>
             <button class="sys-btn deny" data-id="${m.id}"><i class="fa-solid fa-xmark"></i> Deny</button>
@@ -901,7 +1217,7 @@ async function renderSystemMessages() {
 
 async function isOwnKeyRequest(m) {
   if (!m || m.type !== 'key_request') return false;
-  if (Number(m.payload?.deviceId) === Number(S.myDeviceId)) return true;
+  if (Number(m.payload?.deviceId) === Number(state.myDeviceId)) return true;
   try {
     const pub = m.payload?.publicKey;
     return !!pub && pub === await getMyPublicKeyB64();
@@ -909,7 +1225,7 @@ async function isOwnKeyRequest(m) {
 }
 
 async function resolveKeyRequest(id, approve) {
-  const m = S.sysMessages.find(x => x.id === id);
+  const m = state.sysMessages.find(x => x.id === id);
   if (!m) return;
   if (approve && await isOwnKeyRequest(m)) {
     toast('Not allowed', 'Approve this request on another device.', 'warn', 5000);
@@ -917,12 +1233,12 @@ async function resolveKeyRequest(id, approve) {
   }
   if (approve) {
     try {
-      const myKeys = await exportKeysForSync();
       const r = await api('POST', `/api/system/${id}/resolve`, { action: 'approved' });
       if (r.error) { toast('Not approved', r.error, 'warn', 4000); return; }
-      const encryptedKey = await encryptKeyForSync(myKeys, m.payload.publicKey);
-      S.socket.emit('key:sync', { targetDeviceId: m.payload.deviceId, encryptedKey });
-      toast('Keys sent', 'Encrypted keys were sent to the device.', 'ok', 4000);
+      const encryptedKey = await encryptKeyForSync(null, m.payload.publicKey);
+      if (!state.socket?.connected) { toast('Not connected', 'Reconnect and approve again to send the identity key.', 'warn'); return; }
+      state.socket.emit('key:sync', { targetDeviceId: m.payload.deviceId, requestId: id, encryptedKey });
+      toast('Identity sent', 'Encrypted identity key was sent to the approved device.', 'ok', 4000);
     } catch (e) {
       console.error('[Key Sync] approve failed:', e);
       toast('Approve failed', 'Could not export or encrypt keys on this device.', 'warn', 4000);
@@ -940,22 +1256,22 @@ async function resolveKeyRequest(id, approve) {
 function renderChatList() {
   const list = $('chat-list');
   list.innerHTML = '';
-  if (!S.chats.length) {
+  if (!state.chats.length) {
     list.innerHTML = '<div class="chat-list-empty">No chats yet</div>';
     refreshSystemChatItem();
     return;
   }
   const seenUids = new Set();
-  S.chats.forEach(c => {
+  state.chats.forEach(c => {
     if (seenUids.has(c.uid)) return;
     seenUids.add(c.uid);
     const div = document.createElement('div');
     div.className = 'chat-item' +
-      (c.uid === S.activeChatUid ? ' active active-chat' : '') +
+      (c.uid === state.activeChatUid ? ' active active-chat' : '') +
       (c.burn_confirmed ? ' yellow' : '');
     div.dataset.uid = c.uid;
     div.dataset.chatUid = c.uid;
-    const myId       = S.account.accountId;
+    const myId       = state.account.accountId;
     const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
     const alias      = c.peer_alias || null;
     const lbl = c.initiator_id == myId ? c.label_initiator : c.label_peer;
@@ -973,9 +1289,9 @@ function renderChatList() {
     previewText = parseSystemPreview(esc(previewText));
 
     div.innerHTML = `
-      <div class="chat-avatar">${avatarSrc
-        ? `<img src="${avatarSrc}" alt="">`
-        : `<span>${(alias||peerChatNum).charAt(0).toUpperCase()}</span>`}</div>
+      <div class="chat-avatar">${safeAvatarPath(avatarSrc)
+        ? `<img src="${esc(safeAvatarPath(avatarSrc))}" alt="">`
+        : `<span>${esc((alias||peerChatNum).charAt(0).toUpperCase())}</span>`}</div>
       <div class="chat-item-info">
         <div class="chat-item-top">
           <span class="chat-item-name">${nameHtml}</span>
@@ -985,23 +1301,23 @@ function renderChatList() {
             <span class="chat-item-badge ${(c.unread || 0) > 0 ? '' : 'hidden'}" id="badge-${c.uid}">${c.unread || 0}</span>
     `;
     div.onclick = () => openChat(c.uid);
-    if (c.uid === S.activeChatUid) div.classList.add('active-chat');
+    if (c.uid === state.activeChatUid) div.classList.add('active-chat');
     list.appendChild(div);
 
     if (isEncrypted(c.last_message_preview)) {
-      S.peerKeys.delete(peerChatNum);
+      state.peerKeys.delete(peerChatNum);
       getPeerKey(peerChatNum).then(async (peerPub) => {
         if (!peerPub) return;
         try {
-          const decrypted = await decryptMsg(c.last_message_preview, peerChatNum, peerPub);
+          const decrypted = await decryptMsg(c.last_message_preview, c.uid, peerPub, { enforceReplay: false });
           const previewEl = document.getElementById(`preview-${c.uid}`);
           if (previewEl) previewEl.textContent = decrypted;
         } catch (e) {
-          await invalidateSession(peerChatNum);
+          state.peerKeys.delete(peerChatNum);
           const freshKeys = await getPeerKey(peerChatNum);
           if (freshKeys) {
             try {
-              const decrypted = await decryptMsg(c.last_message_preview, peerChatNum, freshKeys);
+              const decrypted = await decryptMsg(c.last_message_preview, c.uid, freshKeys, { enforceReplay: false });
               const previewEl = document.getElementById(`preview-${c.uid}`);
               if (previewEl) previewEl.textContent = decrypted;
             } catch (e2) {
@@ -1017,7 +1333,7 @@ function renderChatList() {
 }
 
 function chatLabel(c) {
-  const myId = S.account.accountId;
+  const myId = state.account.accountId;
   const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
   if (c.peer_alias) return c.peer_alias;
   const lbl = c.initiator_id == myId ? c.label_initiator : c.label_peer;
@@ -1029,7 +1345,7 @@ function chatLabel(c) {
 
 function getPeerDisplayName(c) {
   if (!c) return 'Peer';
-  const myId = S.account.accountId;
+  const myId = state.account.accountId;
   if (c.initiator_id == myId) {
     const lbl = c.label_initiator;
     if (lbl) return lbl;
@@ -1064,18 +1380,17 @@ function updateChatPreviewUI(uid, preview) {
       el.innerHTML = parseSystemPreview(esc(preview || ''));
     }
   }
-  const c = S.chats.find(x => x.uid === uid);
+  const c = state.chats.find(x => x.uid === uid);
   if (c) c.last_message_preview = preview;
 }
 async function openChat(uid) {
-  S.systemOpen = false;
+  state.systemOpen = false;
   show($('msg-input-area'));
-  show($('btn-burn-mode'));
   show($('btn-chat-menu'));
-  S.activeChatUid = uid;
+  state.activeChatUid = uid;
   localStorage.setItem('taupe_active_chat', uid);
   hide($('empty-state'));
-  const c = S.chats.find(x => x.uid === uid);
+  const c = state.chats.find(x => x.uid === uid);
   if (c) c.unread = 0;
   const cv = $('chat-view');
   cv.classList.remove('hidden'); cv.style.display = 'flex';
@@ -1084,10 +1399,10 @@ async function openChat(uid) {
   const b = $('badge-' + uid); if (b) { hide(b); b.textContent = ''; }
 
   if (!c) return;
-  const myId  = S.account.accountId;
+  const myId  = state.account.accountId;
   const peerChatNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
 
-  S.socket.emit('presence:get', { number: peerChatNum });
+  state.socket.emit('presence:get', { number: peerChatNum });
   renderPresence();
 
   $('chat-title-display').textContent = chatLabel(c);
@@ -1098,50 +1413,48 @@ async function openChat(uid) {
 
   const avatarSrc = c.initiator_id == myId ? c.peer_avatar : c.initiator_avatar;
   const headerAvatar = $('chat-header-avatar');
-  if (avatarSrc) {
-    headerAvatar.src = avatarSrc;
+  const safeAvatar = safeAvatarPath(avatarSrc);
+  if (safeAvatar) {
+    headerAvatar.src = safeAvatar;
     headerAvatar.classList.remove('hidden');
   } else {
     headerAvatar.classList.add('hidden');
   }
 
-  S.peerKeys.delete(peerChatNum);
+  state.peerKeys.delete(peerChatNum);
   let peerPub = await getPeerKey(peerChatNum);
   if (!peerPub) {
     await new Promise(r => setTimeout(r, 800));
     peerPub = await getPeerKey(peerChatNum);
   }
 
-  let subtitleText = fmtNum(peerChatNum);
-  if (peerPub?.[0]?.key) {
-    try {
-      const myPub = await getMyPublicKeyB64();
-      const safetyNum = await getSafetyNumber(myPub, peerPub[0].key);
-      if (safetyNum) subtitleText += ` · ${safetyNum}`;
-    } catch {}
-  } else {
+  const pin = await getPeerPin(peerChatNum);
+  const decryptKeys = peerPub ? [...peerPub, ...await getMyDevicesKeys()] : null;
+  if (!pin?.identityPub) {
     toast('No E2E key', 'Peer has not set up encryption yet', 'warn', 5000);
   }
 
+  const peerUsername = c.initiator_id == myId ? c.peer_username : c.initiator_username;
+  const subtitleText = peerUsername ? '@' + peerUsername : '';
   $('chat-subtitle').textContent = subtitleText;
-  $('chat-subtitle').style.cursor = 'pointer';
-  $('chat-subtitle').onclick = () => {
-    const fpPart = subtitleText.includes('·') ? subtitleText.split('·')[1].trim() : '';
-    if (fpPart) {
-      copyToClipboard(fpPart, 'Fingerprint copied', fpPart);
-    } else {
-      copyToClipboard(peerChatNum, 'Copied', fmtNum(peerChatNum));
-    }
-  };
+  $('chat-subtitle').style.cursor = subtitleText ? 'pointer' : '';
+  $('chat-subtitle').onclick = subtitleText ? () => openPeerSecurity() : null;
+  if (subtitleText) show($('chat-subtitle'));
+  else hide($('chat-subtitle'));
+  updateVerifiedBadge(peerChatNum);
 
-  updateBurnBtn();
+  const alertBanner = $('key-alert-banner');
+  if (alertBanner) {
+    alertBanner.classList.toggle('hidden', !pin?.blocking);
+  }
+
   document.querySelectorAll('.chat-item').forEach(el => {
     const isActive = el.dataset.uid === uid;
     el.classList.toggle('active', isActive);
     el.classList.toggle('active-chat', isActive);
   });
 
-  S.peerKeys.delete(peerChatNum);
+  state.peerKeys.delete(peerChatNum);
 
   currentRenderToken++;
   refreshSeq++;
@@ -1156,29 +1469,31 @@ async function openChat(uid) {
 
   cont.innerHTML = '';
   if (Array.isArray(msgs)) {
+    await applyLocalHistory(uid, msgs);
     for (const m of msgs) {
       if (myRenderToken !== currentRenderToken) return;
-      try { await renderMessage(m, peerChatNum, peerPub); }
+      m._history = true;
+      try { await renderMessage(m, peerChatNum, decryptKeys); }
       catch (e) { console.error('[render error]', e); }
     }
   }
   cont.style.scrollBehavior = 'auto';
   scrollBottom();
   cont.style.scrollBehavior = '';
-  S.socket?.emit('msg:read', { chatUid: uid });
+  state.socket?.emit('msg:read', { chatUid: uid });
 
-  S.hasMoreHistory = true;
-  S.isLoadingHistory = false;
+  state.hasMoreHistory = true;
+  state.isLoadingHistory = false;
 
   cont.onscroll = async () => {
     if (myRenderToken !== currentRenderToken) return;
-    if (!S.hasMoreHistory || S.isLoadingHistory) return;
+    if (!state.hasMoreHistory || state.isLoadingHistory) return;
     if (cont.scrollTop > 80) return;
 
     const firstMsg = cont.querySelector('[data-msg-id]');
     if (!firstMsg) return;
 
-    S.isLoadingHistory = true;
+    state.isLoadingHistory = true;
     const savedHandler = cont.onscroll;
     cont.onscroll = null;
 
@@ -1190,19 +1505,22 @@ async function openChat(uid) {
     if (myRenderToken !== currentRenderToken) return;
 
     if (!Array.isArray(olderMsgs) || olderMsgs.length === 0) {
-      S.hasMoreHistory = false;
-      S.isLoadingHistory = false;
+      state.hasMoreHistory = false;
+      state.isLoadingHistory = false;
       cont.onscroll = savedHandler;
       return;
     }
+    await applyLocalHistory(uid, olderMsgs);
 
     const scrollPeerNum = await getActivePeerChatNum();
     const scrollPeerPub = scrollPeerNum ? await getPeerKey(scrollPeerNum) : null;
+    const scrollDecryptKeys = scrollPeerPub ? [...scrollPeerPub, ...await getMyDevicesKeys()] : null;
 
     for (const m of [...olderMsgs].reverse()) {
       if (myRenderToken !== currentRenderToken) return;
       m._prepend = true;
-      try { await renderMessage(m, scrollPeerNum, scrollPeerPub); }
+      m._history = true;
+      try { await renderMessage(m, scrollPeerNum, scrollDecryptKeys); }
       catch (e) { console.error('[render error]', e); }
     }
 
@@ -1211,23 +1529,19 @@ async function openChat(uid) {
     cont.scrollTop = newScrollHeight - oldScrollHeight + oldScrollTop;
     cont.style.scrollBehavior = '';
 
-    S.isLoadingHistory = false;
+    state.isLoadingHistory = false;
     setTimeout(() => { cont.onscroll = savedHandler; }, 100);
   };
 }
 
 function closeChat() {
-  S.activeChatUid = null;
+  state.activeChatUid = null;
   currentRenderToken++;
   localStorage.removeItem('taupe_active_chat');
   hide($('chat-view'));
   show($('empty-state'));
-  if (S.isMobile()) showSidebar();
+  if (state.isMobile()) showSidebar();
   renderChatList();
-}
-
-function updateBurnBtn() {
-  $('btn-burn-mode').textContent = 'History';
 }
 
 function showSidebar() {
@@ -1235,14 +1549,14 @@ function showSidebar() {
   $('chat-area').classList.add('mob-hidden');
 }
 function showChatArea() {
-  if (S.isMobile()) {
+  if (state.isMobile()) {
     $('sidebar').classList.add('mob-hidden');
     $('chat-area').classList.remove('mob-hidden');
   }
 }
-$('back-btn').onclick = () => { S.activeChatUid = null; showSidebar(); hide($('chat-view')); show($('empty-state')); };
+$('back-btn').onclick = () => { state.activeChatUid = null; showSidebar(); hide($('chat-view')); show($('empty-state')); };
 window.addEventListener('resize', () => {
-  if (!S.isMobile()) {
+  if (!state.isMobile()) {
     $('sidebar').classList.remove('mob-hidden');
     $('chat-area').classList.remove('mob-hidden');
   }
@@ -1251,7 +1565,7 @@ window.addEventListener('resize', () => {
 async function renderMessage(msg, peerChatNum, peerPubB64) {
   const cont  = $('messages-container');
   if (!cont) return;
-  const myId  = S.account.accountId;
+  const myId  = state.account.accountId;
   const isMe  = msg.sender_id == myId;
 
   let prevWrap = null;
@@ -1270,13 +1584,14 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   wrap.dataset.sender = msg.sender_id;
 
   const decryptKeys    = peerPubB64;
-  const decryptChatNum = peerChatNum;
+  const decryptChatNum = state.activeChatUid || peerChatNum;
+  const decryptOptions = msg._history ? { enforceReplay: false } : undefined;
 
   let inner = '';
   if (showLabel && !isMe && peerChatNum) {
-    const c   = S.chats.find(x => x.uid === S.activeChatUid);
+    const c   = state.chats.find(x => x.uid === state.activeChatUid);
     const alias = c?.peer_alias || null;
-    const peerUsername = c ? (c.initiator_id == S.account.accountId ? c.peer_username : c.initiator_username) : null;
+    const peerUsername = c ? (c.initiator_id == state.account.accountId ? c.peer_username : c.initiator_username) : null;
     const displayName = alias || peerUsername || null;
     const lbl = displayName
       ? `${esc(displayName)} <span class="label-num">${fmtNum(peerChatNum)}</span>`
@@ -1302,7 +1617,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
         }
 
         if (origText && isEncrypted(origText) && decryptKeys) {
-          try { origText = await decryptMsg(origText, decryptChatNum, decryptKeys); }
+          try { origText = await decryptMsg(origText, decryptChatNum, decryptKeys, decryptOptions); }
           catch { origText = '[decryption failed]'; }
         }
 
@@ -1311,9 +1626,9 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
           origText = '<i class="fa-solid fa-film"></i> GIF';
         }
 
-        const c = S.chats.find(x => x.uid === S.activeChatUid);
+        const c = state.chats.find(x => x.uid === state.activeChatUid);
         let senderName = 'Peer';
-        if (String(origMsg.sender_id) === String(S.account.accountId)) {
+        if (String(origMsg.sender_id) === String(state.account.accountId)) {
           senderName = 'You';
         } else {
           senderName = getPeerDisplayName(c);
@@ -1334,20 +1649,20 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   if (hasBurn && !msg._spoilerOpened) {
     if (isMe) {
       if (isFile) {
-        content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml);
+        content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, '', decryptOptions);
       } else if (msg.content) {
         let text = msg._plaintext || msg.content;
         if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
-          try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
+          try { text = await decryptMsg(text, decryptChatNum, decryptKeys, decryptOptions); }
           catch {
-            S.peerKeys.delete(decryptChatNum);
-            await invalidateSession(decryptChatNum);
-            const freshKeys = await getPeerKey(decryptChatNum);
+            const peerNum = await getActivePeerChatNum();
+            if (peerNum) state.peerKeys.delete(peerNum);
+            const freshKeys = peerNum ? await getPeerKey(peerNum) : null;
             if (freshKeys) {
-              try { text = await decryptMsg(text, decryptChatNum, freshKeys); }
-              catch { text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
+              try { text = await decryptMsg(text, decryptChatNum, freshKeys, decryptOptions); }
+              catch { text = state.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
             } else {
-              text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]';
+              text = state.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]';
             }
           }
         } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted]'; }
@@ -1371,23 +1686,23 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       content = `<div class="msg-burn-open" data-msg-id="${msg.id}">${content}</div>`;
     } else {
       const burnLabel = formatBurnSecs(msg.burn_seconds);
-      content = `<button class="msg-spoiler" data-msg-id="${msg.id}" data-chat-uid="${S.activeChatUid}" data-burn-secs="${msg.burn_seconds}">Show</button>`;
+      content = `<button class="msg-spoiler" data-msg-id="${msg.id}" data-chat-uid="${state.activeChatUid}" data-burn-secs="${msg.burn_seconds}">Show</button>`;
     }
   } else if (isFile) {
-    content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe);
+    content = await buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, '', decryptOptions);
   } else if (msg.content) {
     let text = msg._plaintext || msg.content;
     if (!msg._plaintext && isEncrypted(text) && decryptKeys) {
-      try { text = await decryptMsg(text, decryptChatNum, decryptKeys); }
+      try { text = await decryptMsg(text, decryptChatNum, decryptKeys, decryptOptions); }
       catch {
-        S.peerKeys.delete(decryptChatNum);
-        await invalidateSession(decryptChatNum);
-        const freshKeys = await getPeerKey(decryptChatNum);
+        const peerNum = await getActivePeerChatNum();
+        if (peerNum) state.peerKeys.delete(peerNum);
+        const freshKeys = peerNum ? await getPeerKey(peerNum) : null;
         if (freshKeys) {
-          try { text = await decryptMsg(text, decryptChatNum, freshKeys); }
-          catch { text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
+          try { text = await decryptMsg(text, decryptChatNum, freshKeys, decryptOptions); }
+          catch { text = state.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]'; }
         } else {
-          text = S.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]';
+          text = state.waitingForKeySync ? '[Waiting for key from another device...]' : '[key mismatch]';
         }
       }
     } else if (!msg._plaintext && isEncrypted(text)) { text = '[encrypted]'; }
@@ -1454,24 +1769,25 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
     for (const r of msg.reactions) {
       let emoji = r.emoji;
       if (isEncrypted(emoji) && decryptKeys) {
-        try { emoji = await decryptMsg(emoji, decryptChatNum, decryptKeys); }
+        try { emoji = await decryptMsg(emoji, decryptChatNum, decryptKeys, decryptOptions); }
         catch { emoji = '?'; }
       } else if (isEncrypted(emoji)) {
         emoji = '?';
       }
+      if (!isSingleEmoji(emoji)) emoji = '?';
       grouped[emoji] = grouped[emoji] || [];
       grouped[emoji].push(r.account_id);
 
-      if (r.account_id === Number(S.account.accountId)) {
+      if (r.account_id === Number(state.account.accountId)) {
         myEncEmojis[emoji] = r.emoji;
       }
     }
 
     reactionsHtml = '<div class="msg-reactions">';
     for (const [emoji, users] of Object.entries(grouped)) {
-      const isMine = users.includes(Number(S.account.accountId));
+      const isMine = users.includes(Number(state.account.accountId));
       const encAttr = isMine && myEncEmojis[emoji] ? `data-enc-emoji="${esc(myEncEmojis[emoji])}"` : '';
-      reactionsHtml += `<button class="msg-reaction ${isMine ? 'mine' : ''}" data-msg-id="${msg.id}" data-emoji="${esc(emoji)}" ${encAttr}>${twemojiSafe(emoji)} <span>${users.length}</span></button>`;
+      reactionsHtml += `<button class="msg-reaction ${isMine ? 'mine' : ''}" data-msg-id="${msg.id}" data-emoji="${esc(emoji)}" ${encAttr}>${reactionHtml(emoji)} <span>${users.length}</span></button>`;
     }
     reactionsHtml += '</div>';
   }
@@ -1501,7 +1817,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
       ev.stopPropagation();
       const encEmoji = btn.dataset.encEmoji;
       if (encEmoji) {
-        S.socket.emit('msg:react', { msgId: parseInt(btn.dataset.msgId), emoji: encEmoji });
+        state.socket.emit('msg:react', { msgId: parseInt(btn.dataset.msgId), emoji: encEmoji });
       } else {
         sendReaction(parseInt(btn.dataset.msgId), btn.dataset.emoji);
       }
@@ -1530,7 +1846,7 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   const spoiler = wrap.querySelector('.msg-spoiler');
   if (spoiler) {
     spoiler.addEventListener('click', () => {
-      S.socket?.emit('msg:spoiler:open', { msgId: msg.id, chatUid: S.activeChatUid });
+      state.socket?.emit('msg:spoiler:open', { msgId: msg.id, chatUid: state.activeChatUid });
       spoiler.innerHTML = '<span style="opacity:.5;font-size:12px">Opening…</span>';
     });
   }
@@ -1538,9 +1854,9 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   if (msg.burn_at && !isMe) {
     const remaining = msg.burn_at - Math.floor(Date.now() / 1000);
     if (remaining > 0) {
-      setTimeout(() => S.socket?.emit('msg:spoiler:open', { msgId: msg.id, chatUid: S.activeChatUid }), 100);
+      setTimeout(() => state.socket?.emit('msg:spoiler:open', { msgId: msg.id, chatUid: state.activeChatUid }), 100);
     } else {
-      S.socket?.emit('msg:burn:done', { msgId: msg.id, chatUid: S.activeChatUid });
+      state.socket?.emit('msg:burn:done', { msgId: msg.id, chatUid: state.activeChatUid });
     }
   }
 
@@ -1561,47 +1877,51 @@ async function renderMessage(msg, peerChatNum, peerPubB64) {
   wrap.dataset.ts = msg.created_at || Math.floor(Date.now() / 1000);
 }
 
-async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml) {
+function safeUploadPath(value) {
+  if (typeof value !== 'string') return null;
+  if (!/^\/uploads\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) return null;
+  if (value.includes('..')) return null;
+  return value;
+}
+
+async function buildFileHtml(msg, decryptChatNum, decryptKeys, isMe, metaHtml, decryptOptions) {
   if (!msg.file_path) return '';
-  const isEncryptedFile = msg.file_path.endsWith('.bin');
-
-  let isImageType = msg.file_type === 'image';
-  let isAudioType = msg.file_type === 'audio';
-
-  if (isEncryptedFile && msg.file_name) {
-    const baseName = msg.file_name.replace(/\.bin$/, '').toLowerCase();
-    if (!isImageType && /\.(png|jpe?g|gif|webp|bmp|svg)$/.test(baseName)) isImageType = true;
-    if (!isAudioType && /\.(webm|mp3|ogg|wav|m4a)$/.test(baseName)) isAudioType = true;
-  }
+  const filePath = safeUploadPath(msg.file_path);
+  if (!filePath) return '<span style="color:var(--danger)">[invalid file]</span>';
+  const isEncryptedFile = filePath.endsWith('.bin');
 
   if (isEncryptedFile) {
-    if (!decryptKeys) return `<span style="color:var(--warn)">[encrypted file]</span>`;
+    if (!decryptKeys) return '<span style="color:var(--warn)">[encrypted file]</span>';
     try {
-      const resp = await fetch(msg.file_path, { credentials: 'include' });
+      const resp = await fetch(filePath, { credentials: 'include' });
+      if (!resp.ok) throw new Error('File fetch failed');
       const encBlob = await resp.blob();
-      const decBlob = await decryptFile(encBlob, decryptChatNum, decryptKeys);
-      const blobUrl = URL.createObjectURL(decBlob);
-
-      if (isImageType) {
+      const decrypted = await decryptFile(encBlob, decryptChatNum, decryptKeys, decryptOptions);
+      const blobUrl = URL.createObjectURL(decrypted.blob);
+      const type = decrypted.type || 'application/octet-stream';
+      if (type.startsWith('image/')) {
         return `<img class="msg-img" src="${blobUrl}" loading="lazy" data-msg-id="${msg.id}">`;
-      } else if (isAudioType) {
-        return getAudioPlayerHtml(blobUrl, msg, isMe, metaHtml);
-      } else {
-        const dlName = (msg.file_name || 'file').replace('.bin', '');
-        return `<div class="msg-file">[ <a href="${blobUrl}" download="${esc(dlName)}" target="_blank" rel="noreferrer">${esc(dlName)}</a> ]</div>`;
       }
+      if (type.startsWith('audio/') || type === 'video/webm') {
+        return getAudioPlayerHtml(blobUrl, msg, isMe, metaHtml);
+      }
+      const dlName = decrypted.name || 'file';
+      return `<div class="msg-file">[ <a href="${blobUrl}" download="${esc(dlName)}" target="_blank" rel="noreferrer">${esc(dlName)}</a> ]</div>`;
     } catch (e) {
       console.error('[file decrypt]', e);
-      return `<span style="color:var(--danger)">[decryption failed]</span>`;
+      return '<span style="color:var(--danger)">[decryption failed]</span>';
     }
   }
 
+  const isImageType = msg.file_type === 'image';
+  const isAudioType = msg.file_type === 'audio';
   if (isImageType) {
-    return `<img class="msg-img" src="${msg.file_path}" loading="lazy" data-msg-id="${msg.id}">`;
-  } else if (isAudioType) {
-    return getAudioPlayerHtml(msg.file_path, msg, isMe, metaHtml);
+    return `<img class="msg-img" src="${esc(filePath)}" loading="lazy" data-msg-id="${msg.id}">`;
   }
-  return `<div class="msg-file">[ <a href="${msg.file_path}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
+  if (isAudioType) {
+    return getAudioPlayerHtml(esc(filePath), msg, isMe, metaHtml);
+  }
+  return `<div class="msg-file">[ <a href="${esc(filePath)}" target="_blank" rel="noreferrer">${esc(msg.file_name || 'file')}</a> ]</div>`;
 }
 
 function markAllRead() {
@@ -1654,14 +1974,20 @@ function addRecentReaction(emoji) {
 }
 
 async function sendReaction(msgId, emoji) {
+  if (!isSingleEmoji(emoji)) return;
   const peerChatNum = await getActivePeerChatNum();
-  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-  let encEmoji = emoji;
-  if (peerPub) {
-    try { encEmoji = await encryptMsg(emoji, peerChatNum, peerPub); }
-    catch (e) { console.warn('[E2E] react encrypt failed', e); }
+  if (!await ensurePeerTrusted(peerChatNum)) return;
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum, true) : null;
+  if (!peerPub) return;
+  const recipients = [...peerPub, ...await getMyDevicesKeys()];
+  let encEmoji;
+  try {
+    encEmoji = await encryptMsg(emoji, state.activeChatUid, state.account.deviceId, recipients);
+  } catch (e) {
+    console.error('[E2E] react encrypt failed', e);
+    return;
   }
-  S.socket.emit('msg:react', { msgId, emoji: encEmoji });
+  state.socket.emit('msg:react', { msgId, emoji: encEmoji });
 }
 
 function showMsgCtx(e, msgId, isMe) {
@@ -1677,18 +2003,20 @@ function showMsgCtx(e, msgId, isMe) {
   recent.forEach(emoji => {
     const btn = document.createElement('button');
     btn.className = 'ctx-react-btn';
-    btn.innerHTML = twemojiSafe(emoji);
+    if (!isSingleEmoji(emoji)) return;
+    btn.innerHTML = reactionHtml(emoji);
     btn.onclick = async (ev) => {
       ev.stopPropagation();
       addRecentReaction(emoji);
       const peerChatNum = await getActivePeerChatNum();
-      const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-      let encEmoji = emoji;
-      if (peerPub) {
-        try { encEmoji = await encryptMsg(emoji, peerChatNum, peerPub); }
-        catch {}
-      }
-      S.socket.emit('msg:react', { msgId, emoji: encEmoji });
+      if (!await ensurePeerTrusted(peerChatNum)) return;
+      const peerPub = peerChatNum ? await getPeerKey(peerChatNum, true) : null;
+      if (!peerPub) return;
+      const recipients = [...peerPub, ...await getMyDevicesKeys()];
+      let encEmoji;
+      try { encEmoji = await encryptMsg(emoji, state.activeChatUid, state.account.deviceId, recipients); }
+      catch (e) { return; }
+      state.socket.emit('msg:react', { msgId, emoji: encEmoji });
       removeCtx();
     };
     reactBar.appendChild(btn);
@@ -1711,8 +2039,8 @@ function showMsgCtx(e, msgId, isMe) {
   menu.appendChild(reactBar);
 
   const items = isMe
-    ? [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for peer', 'peer', false], ['Delete for both', 'both', true]]
-    : [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for both', 'both', true]];
+    ? [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for both', 'both', true]]
+    : [['Reply', 'reply', false], ['Delete for me', 'self', false]];
 
   items.forEach(([lbl, action, danger]) => {
     const d = document.createElement('div');
@@ -1720,7 +2048,7 @@ function showMsgCtx(e, msgId, isMe) {
     d.textContent = lbl;
     d.onclick = () => {
       if (action === 'reply') setReplyTo(msgId);
-      else S.socket.emit('msg:delete', { msgId, forWhom: action });
+      else state.socket.emit('msg:delete', { msgId, forWhom: action });
       removeCtx();
     };
     menu.appendChild(d);
@@ -1763,10 +2091,10 @@ $('msg-input').addEventListener('keydown', e => {
 
 let typingTimer;
 $('msg-input').addEventListener('input', () => {
-  if (!S.activeChatUid) return;
-  S.socket?.emit('typing:start', { chatUid: S.activeChatUid });
+  if (!state.activeChatUid) return;
+  state.socket?.emit('typing:start', { chatUid: state.activeChatUid });
   clearTimeout(typingTimer);
-  typingTimer = setTimeout(() => S.socket?.emit('typing:stop', { chatUid: S.activeChatUid }), 1500);
+  typingTimer = setTimeout(() => state.socket?.emit('typing:stop', { chatUid: state.activeChatUid }), 1500);
   const ta = $('msg-input');
   ta.style.height = 'auto';
   ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
@@ -1821,7 +2149,7 @@ function setReplyTo(msgId) {
     if (label) {
       senderName = label.textContent.split(' ')[0];
     } else {
-      const c = S.chats.find(x => x.uid === S.activeChatUid);
+      const c = state.chats.find(x => x.uid === state.activeChatUid);
       senderName = getPeerDisplayName(c);
     }
   }
@@ -1847,33 +2175,33 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function peerChatNumFor(uid) {
-  const c = S.chats.find(x => x.uid === uid);
+  const c = state.chats.find(x => x.uid === uid);
   if (!c) return null;
-  const myId = S.account.accountId;
+  const myId = state.account.accountId;
   return c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
 }
 
 function renderPendingBubble(chatUid, text) {
-  S.sendSeq += 1;
-  const pid = `pending-${S.sendSeq}`;
+  state.sendSeq += 1;
+  const pid = `pending-${state.sendSeq}`;
   const fake = {
     id: pid,
-    sender_id: S.account.accountId,
+    sender_id: state.account.accountId,
     content: text,
     created_at: Math.floor(Date.now() / 1000),
     _pending: true,
   };
-  S.pendingSends.push({ pid, chatUid, text });
-  if (S.activeChatUid === chatUid) {
+  state.pendingSends.push({ pid, chatUid, text });
+  if (state.activeChatUid === chatUid) {
     renderMessage(fake, null, null).then(() => scrollBottom());
   }
   return pid;
 }
 
 function takePending(chatUid) {
-  const idx = S.pendingSends.findIndex(p => p.chatUid === chatUid);
+  const idx = state.pendingSends.findIndex(p => p.chatUid === chatUid);
   if (idx === -1) return null;
-  return S.pendingSends.splice(idx, 1)[0];
+  return state.pendingSends.splice(idx, 1)[0];
 }
 
 function removePendingBubble(pid) {
@@ -1881,38 +2209,39 @@ function removePendingBubble(pid) {
 }
 
 function enqueueSend(job) {
-  S.outbox.push({ attempts: 0, ...job });
+  state.outbox.push({ attempts: 0, ...job });
 }
 
 async function flushOutbox() {
-  if (S.flushing || !S.outbox.length) return;
-  S.flushing = true;
+  if (state.flushing || !state.outbox.length) return;
+  state.flushing = true;
   try {
-    while (S.outbox.length) {
-      const ok = await transmitJob(S.outbox[0]);
+    while (state.outbox.length) {
+      const ok = await transmitJob(state.outbox[0]);
       if (!ok) break;
-      S.outbox.shift();
+      state.outbox.shift();
     }
   } finally {
-    S.flushing = false;
+    state.flushing = false;
   }
 }
 
 function failJob(job) {
-  const idx = S.pendingSends.findIndex(x => x.chatUid === job.chatUid && x.text === job.text);
+  const idx = state.pendingSends.findIndex(x => x.chatUid === job.chatUid && x.text === job.text);
   if (idx !== -1) {
-    removePendingBubble(S.pendingSends[idx].pid);
-    S.pendingSends.splice(idx, 1);
+    removePendingBubble(state.pendingSends[idx].pid);
+    state.pendingSends.splice(idx, 1);
   }
   toast('Not sent', 'Could not deliver the message. Try again.', 'err');
 }
 
 async function transmitJob(job) {
   try {
-    if (!S.socket?.connected) return false;
+    if (!state.socket?.connected) return false;
     const peerChatNum = peerChatNumFor(job.chatUid);
     if (!peerChatNum) { failJob(job); return true; }
-    const peerPub = await getPeerKey(peerChatNum);
+    if (!await ensurePeerTrusted(peerChatNum)) { failJob(job); return true; }
+    const peerPub = await getPeerKey(peerChatNum, true);
     if (!peerPub || peerPub.length === 0) {
       job.attempts += 1;
       if (job.attempts >= 3) { failJob(job); return true; }
@@ -1920,22 +2249,22 @@ async function transmitJob(job) {
     }
     const myDevices = await getMyDevicesKeys();
     const allRecipients = [...peerPub, ...myDevices];
-    let content = job.text;
-    let preview = null;
+    let content;
     try {
-      content = await encryptMsg(content, peerChatNum, allRecipients);
-      if (!job.isGif && !S.burnSeconds) {
-        preview = await encryptMsg(job.text.slice(0, 60), peerChatNum, allRecipients);
-      }
-    } catch (e) { console.warn('[E2E] encrypt failed', e); }
-    S.socket.emit('msg:send', {
+      content = await encryptMsg(job.text, job.chatUid, state.account.deviceId, allRecipients);
+    } catch (e) {
+      console.error('[E2E] encrypt failed', e);
+      failJob(job);
+      return true;
+    }
+    state.socket.emit('msg:send', {
       chatUid: job.chatUid,
       content,
-      preview,
+      preview: null,
       fileUrl: null,
       fileType: null,
       fileName: null,
-      burnSeconds: S.burnSeconds || null,
+      burnSeconds: state.burnSeconds || null,
       replyToId: job.replyToId || null,
     });
     return true;
@@ -1946,28 +2275,29 @@ async function transmitJob(job) {
 }
 
 async function sendMsg() {
-  if (!S.activeChatUid) return;
+  if (!state.activeChatUid) return;
   const text = $('msg-input').value.trim();
-  const file = S.pendingFile;
+  const file = state.pendingFile;
   if (!text && !file) return;
-  const chatUid = S.activeChatUid;
+  const chatUid = state.activeChatUid;
   const replyId = replyTo?.id || null;
 
-  if (file && !S.socket?.connected) {
+  if (file && !state.socket?.connected) {
     toast('Not connected', 'Waiting for connection before sending the file', 'warn');
     return;
   }
 
   $('msg-input').value = '';
   $('msg-input').style.height = 'auto';
-  S.pendingFile = null;
+  state.pendingFile = null;
   hide($('file-preview'));
-  S.socket?.emit('typing:stop', { chatUid });
+  state.socket?.emit('typing:stop', { chatUid });
   cancelReply();
 
   if (file) {
     const peerChatNum = await getActivePeerChatNum();
-    const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
+    if (!await ensurePeerTrusted(peerChatNum)) return;
+    const peerPub = peerChatNum ? await getPeerKey(peerChatNum, true) : [];
     const myDevices = await getMyDevicesKeys();
     const allRecipients = [...peerPub, ...myDevices];
     if (peerPub.length === 0) {
@@ -1975,24 +2305,26 @@ async function sendMsg() {
       return;
     }
     let content = text || null;
-    let preview = null;
     if (content) {
       try {
-        content = await encryptMsg(content, peerChatNum, allRecipients);
-        if (!S.burnSeconds) preview = await encryptMsg(text.slice(0, 60), peerChatNum, allRecipients);
-      } catch (e) { console.warn('[E2E] encrypt failed', e); }
+        content = await encryptMsg(content, chatUid, state.account.deviceId, allRecipients);
+      } catch (e) {
+        console.error('[E2E] encrypt failed', e);
+        toast('Not sent', 'Encryption failed, message was not sent.', 'err');
+        return;
+      }
     }
-    S.socket.emit('msg:send', {
+    state.socket.emit('msg:send', {
       chatUid,
       content,
-      preview,
+      preview: null,
       fileUrl: file.url || null,
-      fileType: file.type || null,
-      fileName: file.name || null,
-      burnSeconds: S.burnSeconds || null,
+      fileType: file.fileType || null,
+      fileName: null,
+      burnSeconds: state.burnSeconds || null,
       replyToId: replyId,
     });
-    if (text) S._pendingPlaintext = text;
+    if (text) state._pendingPlaintext = text;
     return;
   }
 
@@ -2001,8 +2333,8 @@ async function sendMsg() {
   flushOutbox();
 }
 
-const MAX_FILE_SIZE   = 25 * 1024 * 1024;
-const MAX_AVATAR_SIZE =  5 * 1024 * 1024;
+const maxFileSize   = 25 * 1024 * 1024;
+const maxAvatarSize =  5 * 1024 * 1024;
 
 async function readUploadResp(r) {
   try { return await r.json(); }
@@ -2012,30 +2344,37 @@ async function readUploadResp(r) {
 $('file-input').onchange = async e => {
   const file = e.target.files[0]; if (!file) return;
   if (file.type.startsWith('video/')) { toast('No video', 'Video files are not supported', 'warn'); e.target.value = ''; return; }
-  if (file.size > MAX_FILE_SIZE) { toast('Too large', 'File must be under 25 MB', 'warn'); e.target.value = ''; return; }
+  if (file.size > maxFileSize) { toast('Too large', 'File must be under 25 MB', 'warn'); e.target.value = ''; return; }
   const rm = toast('Uploading...', file.name, 'info', 0);
 
+  const chatUid = state.activeChatUid;
   const peerChatNum = await getActivePeerChatNum();
+  if (!await ensurePeerTrusted(peerChatNum)) { rm(); e.target.value = ''; return; }
   const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
   const myDevices = await getMyDevicesKeys();
   const allRecipients = [...peerPub, ...myDevices];
-
-  let fileToUpload = file;
-  let finalName = file.name;
-
-  if (allRecipients.length > 0) {
-    try {
-      fileToUpload = await encryptFile(file, peerChatNum, allRecipients);
-      finalName = file.name + '.bin';
-    } catch (e) {
-      console.warn('[E2E] File encryption failed', e);
-      toast('E2E Error', 'File sent unencrypted', 'warn');
-    }
+  if (!peerPub.length) {
+    rm();
+    toast('Cannot send', 'Peer encryption keys are unavailable.', 'err');
+    e.target.value = '';
+    return;
   }
+
+  let fileToUpload;
+  try {
+    const clean = await stripImageMetadata(file);
+    fileToUpload = await encryptFile(clean, chatUid, state.account.deviceId, allRecipients);
+  } catch (err) {
+    rm();
+    console.error('[E2E] File encryption failed', err);
+    toast('Not sent', 'Encryption failed, file was not uploaded.', 'err');
+    e.target.value = '';
+    return;
+  }
+  const finalName = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) + '.bin';
 
   const fd = new FormData();
   fd.append('file', fileToUpload, finalName);
-  if (peerPub) fd.append('originalType', file.type);
   let d;
   try {
     const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
@@ -2046,12 +2385,12 @@ $('file-input').onchange = async e => {
   }
   rm();
   if (d.error) { toast('Upload failed', d.error, 'err'); e.target.value = ''; return; }
-  S.pendingFile = d;
+  state.pendingFile = { ...d, displayName: file.name, fileType: file.type.startsWith('image/') ? 'image' : 'file' };
   const prev = $('file-preview');
   if (prev) {
-    prev.innerHTML = `${d.type === 'image' ? '<i class="fa-solid fa-image"></i>' : '<i class="fa-solid fa-file"></i>'} ${esc(d.name)} <button id="btn-clear-file"><i class="fa-solid fa-xmark"></i></button>`;
+    prev.innerHTML = `${d.type === 'image' ? '<i class="fa-solid fa-image"></i>' : '<i class="fa-solid fa-file"></i>'} ${esc(file.name)} <button id="btn-clear-file"><i class="fa-solid fa-xmark"></i></button>`;
     show(prev);
-    $('btn-clear-file').onclick = () => { S.pendingFile = null; hide(prev); };
+    $('btn-clear-file').onclick = () => { state.pendingFile = null; hide(prev); };
   }
   e.target.value = '';
 };
@@ -2070,7 +2409,7 @@ $('nc-create').onclick = async () => {
     peerNumber = lu.number;
   } else {
     peerNumber = raw.replace(/-/g, '');
-    if (peerNumber.length !== 8) { $('nc-error').textContent = 'Enter 8-digit chat number or @username'; return; }
+    if (peerNumber.length < 8 || peerNumber.length > 12) { $('nc-error').textContent = 'Enter a chat number or @username'; return; }
   }
 
   const label = $('nc-label').value.trim() || null;
@@ -2083,15 +2422,14 @@ $('nc-create').onclick = async () => {
   hide($('modal-new-chat'));
   $('nc-peer-number').value = ''; $('nc-label').value = ''; $('nc-error').textContent = '';
 
-  if (!S.chats.find(c => c.uid === d.uid)) {
+  if (!state.chats.find(c => c.uid === d.uid)) {
     await loadChats();
   }
   openChat(d.uid);
 };
 
-$('btn-burn-mode').onclick = async () => {
-  if (!S.activeChatUid) return;
-  const c = S.chats.find(x => x.uid === S.activeChatUid);
+async function openChatHistory(uid) {
+  const c = state.chats.find(x => x.uid === uid);
   if (!c) return;
   const current = c.max_messages ?? -1;
   const v = await dialog({
@@ -2105,73 +2443,198 @@ $('btn-burn-mode').onclick = async () => {
   });
   if (v === null || v === undefined) return;
   const n = parseInt(v);
-  if (isNaN(n) || n < -1) { toast('Invalid', 'Enter a number >= -1', 'warn'); return; }
-  S.socket.emit('chat:history', { chatUid: S.activeChatUid, max: n });
+  if (isNaN(n) || n < -1 || n === 0) { toast('Invalid', 'Enter -1 for unlimited or a positive limit', 'warn'); return; }
+  state.socket?.emit('chat:history', { chatUid: uid, max: n });
   c.max_messages = n;
-};
+}
 
 function showBurnConfirmModal(chatUid, mode, customMin) {
-  S.burnConfirmPending = { chatUid, mode, customMin };
+  state.burnConfirmPending = { chatUid, mode, customMin };
   $('burn-confirm-text').innerHTML =
     `Peer wants to set burn to <strong>${burnLabel(mode, customMin)}</strong>. Messages will persist a long time. Confirm?`;
   show($('modal-burn-confirm'));
 }
 $('burn-accept').onclick = () => {
-  if (!S.burnConfirmPending) return;
-  S.socket.emit('chat:burn:confirm', { chatUid: S.burnConfirmPending.chatUid });
-  const c = S.chats.find(x => x.uid === S.burnConfirmPending.chatUid);
+  if (!state.burnConfirmPending) return;
+  state.socket.emit('chat:burn:confirm', { chatUid: state.burnConfirmPending.chatUid });
+  const c = state.chats.find(x => x.uid === state.burnConfirmPending.chatUid);
   if (c) c.burn_confirmed = 1;
-  renderChatList(); hide($('modal-burn-confirm')); S.burnConfirmPending = null;
+  renderChatList(); hide($('modal-burn-confirm')); state.burnConfirmPending = null;
 };
-$('burn-deny').onclick = () => { hide($('modal-burn-confirm')); S.burnConfirmPending = null; };
+$('burn-deny').onclick = () => { hide($('modal-burn-confirm')); state.burnConfirmPending = null; };
 
-$('btn-chat-menu').onclick = () => show($('modal-chat-menu'));
-$('cm-cancel').onclick     = () => hide($('modal-chat-menu'));
+$('chat-request-accept').onclick = async () => {
+  const request = state.pendingChatRequest;
+  if (!request) return;
+  const d = await api('POST', `/api/chats/${request.chatUid}/accept`);
+  hide($('modal-chat-request'));
+  state.pendingChatRequest = null;
+  if (d.error) { toast('Error', d.error, 'err'); return; }
+  await loadChats();
+  openChat(request.chatUid);
+};
+$('chat-request-decline').onclick = async () => {
+  const request = state.pendingChatRequest;
+  if (!request) return;
+  await api('POST', `/api/chats/${request.chatUid}/decline`);
+  hide($('modal-chat-request'));
+  state.pendingChatRequest = null;
+};
 
- $('cm-rename').onclick = async () => {
-  hide($('modal-chat-menu'));
+async function renameChat(uid) {
+  const c = state.chats.find(x => x.uid === uid);
+  if (!c) return;
   const name = await dialog({ title: 'Rename chat', body: 'New label:', input: true, inputPlaceholder: 'chat1' });
   if (!name) return;
-
-  const d = await api('PATCH', `/api/chats/${S.activeChatUid}/label`, { label: name });
+  const encryptedLabel = await encryptMeta(name);
+  const d = await api('PATCH', `/api/chats/${uid}/label`, { label: encryptedLabel });
   if (d.error) { toast('Error', d.error, 'err'); return; }
-
-  const c = S.chats.find(x => x.uid === S.activeChatUid);
-  if (c) {
-    if (c.initiator_id == S.account.accountId) c.label_initiator = name;
-    else c.label_peer = name;
-  }
-
-  $('chat-title-display').textContent = chatLabel(c);
+  if (c.initiator_id == state.account.accountId) c.label_initiator = name;
+  else c.label_peer = name;
+  if (state.activeChatUid === uid) $('chat-title-display').textContent = chatLabel(c);
   renderChatList();
-};
+}
 
-['self','peer','both'].forEach(fw => {
-  $(`cm-delete-${fw}`).onclick = async () => {
+async function deleteChatFromMenu(uid, forWhom) {
+  const c = state.chats.find(x => x.uid === uid);
+  if (!c) return;
+  const ok = await dialog({
+    title: 'Delete chat',
+    body: `Delete for ${forWhom === 'both' ? 'everyone' : 'me'}?`,
+    okText: 'Delete',
+    danger: true
+  });
+  if (!ok) return;
+  state.socket?.emit('chat:delete', { chatUid: uid, forWhom });
+  state.chats = state.chats.filter(x => x.uid !== uid);
+  renderChatList();
+  if (state.activeChatUid === uid) closeChat();
+}
+
+async function blockChat(uid) {
+  const c = state.chats.find(x => x.uid === uid);
+  if (!c) return;
+  const myId = state.account.accountId;
+  const peerNumber = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
+  const ok = await dialog({ title: 'Block peer', body: 'Block this account and remove the chat?', okText: 'Block', danger: true });
+  if (!ok) return;
+  const d = await api('POST', '/api/blocks', { number: peerNumber });
+  if (d.error) { toast('Error', d.error, 'err'); return; }
+  await api('DELETE', `/api/chats/${uid}`, { forWhom: 'self' });
+  state.chats = state.chats.filter(x => x.uid !== uid);
+  renderChatList();
+  if (state.activeChatUid === uid) closeChat();
+  toast('Blocked', 'The account was blocked.', 'ok');
+}
+
+$('btn-chat-menu').onclick = () => {
+  if (!state.activeChatUid) return;
+  show($('modal-chat-menu'));
+};
+$('cm-cancel').onclick = () => hide($('modal-chat-menu'));
+$('cm-rename').onclick = () => {
+  const uid = state.activeChatUid;
+  hide($('modal-chat-menu'));
+  if (uid) renameChat(uid);
+};
+$('cm-history').onclick = () => {
+  const uid = state.activeChatUid;
+  hide($('modal-chat-menu'));
+  if (uid) openChatHistory(uid);
+};
+['self','both'].forEach(forWhom => {
+  $(`cm-delete-${forWhom}`).onclick = () => {
+    const uid = state.activeChatUid;
     hide($('modal-chat-menu'));
-    const ok = await dialog({ title: 'Delete chat', body: `Delete for ${fw === 'both' ? 'everyone' : fw}?`, okText: 'Delete', danger: true });
-    if (!ok) return;
-    S.socket.emit('chat:delete', { chatUid: S.activeChatUid, forWhom: fw });
-    if (fw !== 'peer') { S.chats = S.chats.filter(c => c.uid !== S.activeChatUid); renderChatList(); closeChat(); }
+    if (uid) deleteChatFromMenu(uid, forWhom);
   };
 });
+$('cm-block').onclick = () => {
+  const uid = state.activeChatUid;
+  hide($('modal-chat-menu'));
+  if (uid) blockChat(uid);
+};
+
+let chatContextUid = null;
+let chatContextTimer = null;
+
+function openChatContext(uid, x, y) {
+  const menu = $('chat-list-ctx');
+  if (!menu) return;
+  clearTimeout(chatContextTimer);
+  menu.classList.remove('closing', 'open');
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  menu.classList.add('open');
+  const box = menu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(x, window.innerWidth - box.width - 8));
+  const top = Math.max(8, Math.min(y, window.innerHeight - box.height - 8));
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+  chatContextUid = uid;
+}
+
+function hideChatContext() {
+  chatContextUid = null;
+  const menu = $('chat-list-ctx');
+  if (!menu || !menu.classList.contains('open')) return;
+  menu.classList.remove('open');
+  menu.classList.add('closing');
+  clearTimeout(chatContextTimer);
+  chatContextTimer = setTimeout(() => menu.classList.remove('closing'), 160);
+}
+
+$('chat-list').addEventListener('contextmenu', event => {
+  const item = event.target.closest('.chat-item[data-uid]');
+  if (!item) return;
+  event.preventDefault();
+  openChatContext(item.dataset.uid, event.clientX, event.clientY);
+});
+
+$('chat-list-ctx').addEventListener('click', event => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const uid = chatContextUid;
+  hideChatContext();
+  if (!uid) return;
+  const action = button.dataset.action;
+  if (action === 'rename') renameChat(uid);
+  else if (action === 'history') openChatHistory(uid);
+  else if (action === 'delete-self') deleteChatFromMenu(uid, 'self');
+  else if (action === 'delete-both') deleteChatFromMenu(uid, 'both');
+  else if (action === 'block') blockChat(uid);
+});
+
+document.addEventListener('click', event => {
+  if (!chatContextUid) return;
+  if (event.target.closest('#chat-list-ctx')) return;
+  hideChatContext();
+});
+document.addEventListener('contextmenu', event => {
+  if (!chatContextUid) return;
+  if (event.target.closest('#chat-list-ctx') || event.target.closest('.chat-item[data-uid]')) return;
+  hideChatContext();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') hideChatContext();
+});
+window.addEventListener('scroll', hideChatContext, true);
+window.addEventListener('resize', hideChatContext);
 
 $('btn-settings').onclick  = openSettings;
-$('settings-close').onclick = () => hide($('modal-settings'));
+$('settings-close').onclick = () => { hideInfoTip(); hide($('modal-settings')); };
 
 async function openSettings() {
   const me = await api('GET', '/api/me');
-  S.account = { ...S.account, ...me };
-  S.account.accountNumber = localStorage.getItem('lastNumber') || '';
+  state.account = { ...state.account, ...me };
   $('settings-chat-number').textContent = fmtNum(me.chatNumber);
-  const savedPrivateNum = localStorage.getItem('lastNumber') || 'Unknown';
-  $('settings-private-number').textContent = fmtPrivate(savedPrivateNum);
   $('settings-username').value      = me.username || '';
   $('settings-username-public').checked = !!me.usernamePublic;
-  $('settings-show-presence').checked = me.showPresence !== false;
+  $('settings-show-presence').checked = me.showPresence === true;
+  $('settings-gif-enabled').checked = me.gifEnabled === true;
   const av = $('my-avatar-preview');
   av.innerHTML = me.avatarPath
-    ? `<img src="${me.avatarPath}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`
+    ? `<img src="${esc(safeAvatarPath(me.avatarPath) || '')}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`
     : '<i class="fa-solid fa-user" style="font-size:24px"></i>';
   const list = $('devices-list'); list.innerHTML = '';
   (me.devices || []).forEach(d => {
@@ -2184,28 +2647,201 @@ async function openSettings() {
   list.querySelectorAll('.device-kick').forEach(b => {
     b.onclick = async () => { await api('DELETE', `/api/devices/${b.dataset.id}`); openSettings(); };
   });
+  const blocked = await api('GET', '/api/blocks');
+  const blockedList = $('blocked-list');
+  blockedList.innerHTML = '';
+  for (const item of Array.isArray(blocked) ? blocked : []) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="mono">${fmtNum(item.chat_number)}</span><button class="device-kick" data-number="${esc(item.chat_number)}">unblock</button>`;
+    li.querySelector('.device-kick').onclick = async () => {
+      await api('DELETE', `/api/blocks/${item.chat_number}`);
+      openSettings();
+    };
+    blockedList.appendChild(li);
+  }
   show($('modal-settings'));
 }
 
- $('settings-chat-number-box').onclick = () => {
-  copyToClipboard(S.account.chatNumber, 'Copied', 'Chat number copied');
+ $('my-number-display').onclick = () => {
+  const number = state.account?.chatNumber;
+  if (!number) return;
+  copyToClipboard(fmtNum(number), 'Copied', 'Chat number copied');
 };
 
-let privateRevealed = false;
-let privateRevealTimer = null;
- $('settings-private-number-box').onclick = () => {
-  const span = $('settings-private-number');
-  if (!privateRevealed) {
-    span.style.filter = 'none';
-    privateRevealed = true;
-    clearTimeout(privateRevealTimer);
-    privateRevealTimer = setTimeout(() => {
-      span.style.filter = 'blur(6px)';
-      privateRevealed = false;
-    }, 10000);
-  } else {
-    copyToClipboard(localStorage.getItem('lastNumber') || '', 'Copied', 'Keep this private!');
+$('settings-chat-number-box').onclick = () => {
+  copyToClipboard(state.account.chatNumber, 'Copied', 'Chat number copied');
+};
+
+const historyKdfIterations = 250000;
+
+function bufferToB64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function b64ToBuffer(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function deriveHistoryKey(passphrase, salt, iterations) {
+  const material = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function fetchAllMessages(chatUid) {
+  let all = [];
+  let before = null;
+  while (true) {
+    const suffix = before ? `?beforeId=${before}` : '';
+    const page = await api('GET', `/api/chats/${chatUid}/messages${suffix}`);
+    if (!Array.isArray(page) || page.length === 0) break;
+    all = page.concat(all);
+    before = page[0].id;
+    if (page.length < 200) break;
   }
+  return all;
+}
+
+async function buildHistoryBundle() {
+  const chats = await api('GET', '/api/chats');
+  if (!Array.isArray(chats)) return { chats: [], count: 0 };
+  const result = [];
+  let count = 0;
+  for (const chat of chats) {
+    const myId = state.account.accountId;
+    const peerChatNumber = chat.initiator_id == myId ? chat.peer_chat_number : chat.initiator_chat_number;
+    const peerPub = peerChatNumber ? await getPeerKey(peerChatNumber, true) : null;
+    if (!peerPub) continue;
+    const messages = await fetchAllMessages(chat.uid);
+    const exported = [];
+    for (const msg of messages) {
+      if (!msg.content || msg.file_path) continue;
+      let text = msg.content;
+      if (isEncrypted(text)) {
+        try { text = await decryptMsg(text, chat.uid, peerPub, { enforceReplay: false }); }
+        catch { continue; }
+      }
+      if (typeof text !== 'string') continue;
+      if (text.startsWith('[encrypted') || text.startsWith('[decryption') || text.startsWith('[key mismatch')) continue;
+      exported.push({
+        id: msg.id,
+        sender_id: msg.sender_id,
+        created_at: msg.created_at,
+        text
+      });
+      count++;
+    }
+    if (exported.length) result.push({ uid: chat.uid, messages: exported });
+  }
+  return { chats: result, count };
+}
+
+async function exportHistory() {
+  const passphrase = await dialog({
+    title: 'Export encrypted history',
+    body: 'Set a passphrase of at least 8 characters. You will need it on the new device. Text messages only, files are not included.',
+    input: true,
+    inputType: 'password',
+    inputPlaceholder: 'Passphrase',
+    okText: 'Export'
+  });
+  if (!passphrase) return;
+  if (passphrase.length < 8) { toast('Weak passphrase', 'Use at least 8 characters.', 'warn'); return; }
+  await withButtonLoading($('btn-export-history'), 'Exporting...', async () => {
+    const bundle = await buildHistoryBundle();
+    if (!bundle.count) { toast('Nothing to export', 'No readable text messages found.', 'warn'); return; }
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await deriveHistoryKey(passphrase, salt, historyKdfIterations);
+    const payload = new TextEncoder().encode(JSON.stringify({
+      v: 1,
+      exportedAt: Math.floor(Date.now() / 1000),
+      chats: bundle.chats
+    }));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, payload);
+    const file = JSON.stringify({
+      v: 1,
+      kdf: 'PBKDF2-SHA256',
+      iterations: historyKdfIterations,
+      salt: bufferToB64(salt),
+      iv: bufferToB64(iv),
+      data: bufferToB64(ciphertext)
+    });
+    const blob = new Blob([file], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `taupe-history-${new Date().toISOString().slice(0, 10)}.json.enc`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('History exported', `${bundle.count} messages encrypted with your passphrase.`, 'ok', 5000);
+  });
+}
+
+async function importHistoryFile(file) {
+  if (!file) return;
+  const passphrase = await dialog({
+    title: 'Import encrypted history',
+    body: 'Enter the passphrase that was used when exporting this history file.',
+    input: true,
+    inputType: 'password',
+    inputPlaceholder: 'Passphrase',
+    okText: 'Import'
+  });
+  if (!passphrase) return;
+  try {
+    const parsed = JSON.parse(await file.text());
+    if (!parsed || parsed.v !== 1 || parsed.kdf !== 'PBKDF2-SHA256' || !parsed.salt || !parsed.iv || !parsed.data) {
+      throw new Error('Unsupported history file');
+    }
+    const salt = b64ToBuffer(parsed.salt);
+    const iv = b64ToBuffer(parsed.iv);
+    const iterations = Math.max(100000, Math.min(Number(parsed.iterations) || historyKdfIterations, 1000000));
+    const key = await deriveHistoryKey(passphrase, salt, iterations);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, b64ToBuffer(parsed.data));
+    const bundle = JSON.parse(new TextDecoder().decode(plaintext));
+    const saved = await saveImportedHistory(bundle);
+    if (!saved) { toast('Nothing imported', 'The file contained no messages.', 'warn'); return; }
+    toast('History imported', `${saved} messages added to this device.`, 'ok', 5000);
+    if (state.activeChatUid) openChat(state.activeChatUid);
+    else loadChats();
+  } catch (e) {
+    console.error('[history import]', e);
+    toast('Import failed', 'Wrong passphrase or damaged file.', 'err', 5000);
+  }
+}
+
+async function applyLocalHistory(chatUid, messages) {
+  if (!Array.isArray(messages) || !messages.length) return messages;
+  const local = await getHistoryForChat(chatUid);
+  if (!local.length) return messages;
+  const map = new Map(local.map(message => [String(message.id), message]));
+  for (const message of messages) {
+    const saved = map.get(String(message.id));
+    if (saved && typeof saved.text === 'string') message._plaintext = saved.text;
+  }
+  return messages;
+}
+
+$('btn-export-history').onclick = exportHistory;
+$('btn-import-history').onclick = () => $('history-file-input').click();
+$('history-file-input').onchange = async event => {
+  const file = event.target.files[0];
+  event.target.value = '';
+  await importHistoryFile(file);
 };
 
 $('btn-save-username').onclick = async () => {
@@ -2216,7 +2852,20 @@ $('btn-save-username').onclick = async () => {
   const saved = d.username || username.toLowerCase();
   $('settings-username').value = saved;
   toast('Saved', 'Username updated', 'ok');
-  S.account.username = saved; S.account.usernamePublic = isPublic;
+  state.account.username = saved; state.account.usernamePublic = isPublic;
+};
+
+$('settings-gif-enabled').onchange = async () => {
+  const enabled = $('settings-gif-enabled').checked;
+  const d = await api('PATCH', '/api/me/gif', { enabled });
+  if (d.error) {
+    $('settings-gif-enabled').checked = !enabled;
+    toast('Error', d.error, 'err');
+    return;
+  }
+  state.account.gifEnabled = enabled;
+  gifGrid.innerHTML = '';
+  toast('Saved', enabled ? 'GIF search enabled, search terms go to Giphy' : 'GIF search disabled', 'ok');
 };
 
 $('settings-show-presence').onchange = async () => {
@@ -2234,7 +2883,7 @@ $('my-avatar-preview').onclick  = () => $('avatar-file-input').click();
 $('avatar-file-input').onchange = e => {
   const file = e.target.files[0]; if (!file) return;
   e.target.value = '';
-  if (file.size > MAX_AVATAR_SIZE) { toast('Too large', 'Image must be under 5 MB', 'warn'); return; }
+  if (file.size > maxAvatarSize) { toast('Too large', 'Image must be under 5 MB', 'warn'); return; }
   openCropEditor(file);
 };
 
@@ -2248,12 +2897,12 @@ function openCropEditor(file) {
 
   img.onload = () => {
     const canvas  = $('crop-canvas');
-    const VSIZE   = 280;
-    canvas.width  = VSIZE;
-    canvas.height = VSIZE;
+    const viewSize   = 280;
+    canvas.width  = viewSize;
+    canvas.height = viewSize;
 
     const maxDim = Math.max(img.width, img.height);
-    const initialScale = VSIZE / maxDim;
+    const initialScale = viewSize / maxDim;
 
     const scaleInput = $('crop-scale');
     scaleInput.min = initialScale * 0.8;
@@ -2283,10 +2932,10 @@ function drawCrop() {
   const { img, scale, offsetX, offsetY } = _cropState;
   const canvas = $('crop-canvas');
   const ctx = canvas.getContext('2d');
-  const S2  = 280;
-  ctx.clearRect(0, 0, S2, S2);
+  const canvasSize  = 280;
+  ctx.clearRect(0, 0, canvasSize, canvasSize);
   const w = img.width * scale, h = img.height * scale;
-  ctx.drawImage(img, offsetX + (S2 - w) / 2, offsetY + (S2 - h) / 2, w, h);
+  ctx.drawImage(img, offsetX + (canvasSize - w) / 2, offsetY + (canvasSize - h) / 2, w, h);
 }
 
 const cropCanvas = $('crop-canvas');
@@ -2320,9 +2969,9 @@ document.addEventListener('touchmove', e => {
   $('crop-apply').onclick = async () => {
   if (!_cropState || !_cropOriginalFile) return;
 
-  const VSIZE = 280;
-  const CROP_SIZE = 220;
-  const CROP_OFFSET = (VSIZE - CROP_SIZE) / 2;
+  const viewSize = 280;
+  const cropSize = 220;
+  const cropOffset = (viewSize - cropSize) / 2;
 
   const scale = _cropState.scale;
   const offX = _cropState.offsetX;
@@ -2330,13 +2979,13 @@ document.addEventListener('touchmove', e => {
   const imgW = _cropState.img.width;
   const imgH = _cropState.img.height;
 
-  const drawX = offX + (VSIZE - imgW * scale) / 2;
-  const drawY = offY + (VSIZE - imgH * scale) / 2;
+  const drawX = offX + (viewSize - imgW * scale) / 2;
+  const drawY = offY + (viewSize - imgH * scale) / 2;
 
-  let cropX = Math.round((CROP_OFFSET - drawX) / scale);
-  let cropY = Math.round((CROP_OFFSET - drawY) / scale);
-  let cropW = Math.round(CROP_SIZE / scale);
-  let cropH = Math.round(CROP_SIZE / scale);
+  let cropX = Math.round((cropOffset - drawX) / scale);
+  let cropY = Math.round((cropOffset - drawY) / scale);
+  let cropW = Math.round(cropSize / scale);
+  let cropH = Math.round(cropSize / scale);
 
   cropX = Math.max(0, cropX);
   cropY = Math.max(0, cropY);
@@ -2356,8 +3005,8 @@ document.addEventListener('touchmove', e => {
     const d = await readUploadResp(r);
     rm();
     if (d.error) { toast('Error', d.error, 'err'); return; }
-    S.account.avatarPath = d.avatarPath;
-    $('my-avatar-preview').innerHTML = `<img src="${d.avatarPath}?t=${Date.now()}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`;
+    state.account.avatarPath = d.avatarPath;
+    $('my-avatar-preview').innerHTML = `<img src="${esc((safeAvatarPath(d.avatarPath) || '') + '?t=' + Date.now())}" style="width:64px;height:64px;border-radius:50%;object-fit:cover" alt="">`;
     toast('Avatar updated', '', 'ok');
   } catch (err) {
     console.error('[avatar upload]', err);
@@ -2369,16 +3018,23 @@ document.addEventListener('touchmove', e => {
 
 $('btn-logout').onclick = async () => {
   await api('POST', '/api/logout');
-  localStorage.removeItem('lastNumber');
   localStorage.removeItem('taupe_active_chat');
   location.reload();
 };
 $('btn-kick-all').onclick = async () => { await api('POST', '/api/devices/kick-all'); openSettings(); };
 $('btn-delete-account').onclick = async () => {
-  const ok = await dialog({ title: 'Delete account', body: 'Permanent. Cannot be undone.', okText: 'Delete', danger: true });
-  if (!ok) return;
-  await api('DELETE', '/api/account');
-  localStorage.removeItem('lastNumber');
+  const number = await dialog({
+    title: 'Delete account',
+    body: 'Permanent. Re-enter your 16-digit private number to confirm.',
+    input: true,
+    inputType: 'password',
+    inputPlaceholder: '0000000000000000',
+    okText: 'Delete',
+    danger: true
+  });
+  if (!number) return;
+  const d = await api('DELETE', '/api/account', { number });
+  if (d.error) { toast('Not deleted', d.error, 'err'); return; }
   localStorage.removeItem('taupe_active_chat');
   location.reload();
 };
@@ -2388,10 +3044,10 @@ $('alias-cancel').onclick = () => hide($('modal-aliases'));
 
 async function openAliases() {
   await renderAliasList();
-  if (S.activeChatUid) {
-    const c = S.chats.find(x => x.uid === S.activeChatUid);
+  if (state.activeChatUid) {
+    const c = state.chats.find(x => x.uid === state.activeChatUid);
     if (c) {
-      const myId = S.account.accountId;
+      const myId = state.account.accountId;
       const peerNum = c.initiator_id == myId ? c.peer_chat_number : c.initiator_chat_number;
       $('alias-number-input').value = fmtNum(peerNum);
     }
@@ -2402,13 +3058,14 @@ async function openAliases() {
 async function renderAliasList() {
   const aliases = await api('GET', '/api/aliases');
   const list    = $('alias-list'); list.innerHTML = '';
-  (aliases || []).forEach(a => {
+  for (const a of aliases || []) {
+    const aliasText = await decryptMeta(a.alias);
     const div = document.createElement('div');
     div.className = 'alias-item';
-      div.innerHTML = `<span class="alias-name">${esc(a.alias)}</span><span class="alias-num mono">${fmtNum(a.target_number)}</span><button class="alias-del" data-n="${a.target_number}"><i class="fa-solid fa-xmark"></i></button>`;
+      div.innerHTML = `<span class="alias-name">${esc(aliasText)}</span><span class="alias-num mono">${fmtNum(a.target_number)}</span><button class="alias-del" data-n="${a.target_number}"><i class="fa-solid fa-xmark"></i></button>`;
     div.onclick = e => {
       if (e.target.classList.contains('alias-del')) return;
-      copyToClipboard(a.target_number, 'Copied', `${a.alias} - ${fmtNum(a.target_number)}`);
+      copyToClipboard(a.target_number, 'Copied', `${aliasText} - ${fmtNum(a.target_number)}`);
     };
     div.querySelector('.alias-del').onclick = async e => {
       e.stopPropagation();
@@ -2417,15 +3074,15 @@ async function renderAliasList() {
       await loadChats();
     };
     list.appendChild(div);
-  });
+  }
 }
 
 $('alias-save').onclick = async () => {
   const num   = $('alias-number-input').value.replace(/-/g, '').trim();
   const alias = $('alias-name-input').value.trim();
-  if (num.length !== 8) { $('alias-error').textContent = 'Enter 8-digit chat number'; return; }
+  if (num.length < 8 || num.length > 12) { $('alias-error').textContent = 'Enter a chat number'; return; }
   if (!alias)           { $('alias-error').textContent = 'Enter alias name'; return; }
-  const d = await api('PUT', '/api/aliases', { targetNumber: num, alias });
+  const d = await api('PUT', '/api/aliases', { targetNumber: num, alias: await encryptMeta(alias) });
   if (d.error) { $('alias-error').textContent = d.error; return; }
   $('alias-error').textContent = ''; $('alias-name-input').value = '';
   await renderAliasList();
@@ -2434,8 +3091,8 @@ $('alias-save').onclick = async () => {
 };
 
 $('alias-number-input').addEventListener('input', e => {
-  let v = e.target.value.replace(/\D/g, '').slice(0, 8);
-  e.target.value = v.length > 4 ? v.slice(0, 4) + '-' + v.slice(4) : v;
+  let v = e.target.value.replace(/\D/g, '').slice(0, 12);
+  e.target.value = v.length > 4 ? v.replace(/(\d{4})(?=\d)/g, '$1-') : v;
 });
 
 function copyToClipboard(text, successTitle = 'Copied', successMsg = '') {
@@ -2472,6 +3129,15 @@ function fallbackCopyText(text, successTitle, successMsg) {
   }
   document.body.removeChild(textArea);
 }
+function safeAvatarPath(value) {
+  if (typeof value !== 'string') return null;
+  return /^\/uploads\/avatars\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) ? value : null;
+}
+
+function reactionHtml(emoji) {
+  return isSingleEmoji(emoji) ? twParse(emoji) : esc(emoji);
+}
+
 function isSingleEmoji(text) {
   if (!text) return false;
   const cleanText = text.trim();
@@ -2511,9 +3177,9 @@ function parseGifContent(text) {
   }
 
   const gifUrl = rest.substring(0, urlEnd);
-  const GIPHY_RE = /^https:\/\/([a-z0-9-]+\.)*giphy\.com\//i;
+  const giphyRe = /^https:\/\/([a-z0-9-]+\.)*giphy\.com\//i;
   let url = gifUrl;
-  if (GIPHY_RE.test(gifUrl)) {
+  if (giphyRe.test(gifUrl)) {
     url = '/api/gifs/media?u=' + encodeURIComponent(gifUrl);
   } else if (!gifUrl.startsWith('/api/gifs/media?u=')) {
     return null;
@@ -2532,7 +3198,8 @@ function esc(s) {
 }
 function fmtNum(n) {
   const s = String(n || '').replace(/\D/g, '');
-  return s.length === 8 ? s.slice(0,4)+'-'+s.slice(4) : s;
+  if (s.length >= 8 && s.length <= 12) return s.replace(/(\d{4})(?=\d)/g, '$1-');
+  return s;
 }
 function fmtPrivate(n) {
   const s = String(n || '').replace(/\D/g, '');
@@ -2540,8 +3207,8 @@ function fmtPrivate(n) {
   return s.replace(/(\d{4})(?=\d)/g, '$1-');
 }
 
-const BURN_STEPS = [5, 10, 30, 60, 300, 600, 1800, 3600];
-const MIN_FILE_BURN = 60;
+const burnSteps = [5, 10, 30, 60, 300, 600, 1800, 3600];
+const minFileBurn = 60;
 
 function formatBurnSecs(secs) {
   if (!secs) return '';
@@ -2560,12 +3227,12 @@ function formatBurnSecs(secs) {
   if (!btn) return;
 
   function setActive(secs) {
-    S.burnSeconds = secs;
+    state.burnSeconds = secs;
 
     document.querySelectorAll('.burn-pill').forEach(p => {
       p.classList.toggle('selected',
         secs !== null && (
-          (p.dataset.secs === 'custom' && !BURN_STEPS.includes(secs)) ||
+          (p.dataset.secs === 'custom' && !burnSteps.includes(secs)) ||
           parseInt(p.dataset.secs) === secs
         )
       );
@@ -2620,7 +3287,7 @@ function formatBurnSecs(secs) {
   });
 })();
 
-let EMOJIS = [];
+let emojiCatalog = [];
 let allEmojisData = {};
 const egPanel = $('emoji-gif-panel');
 const egSearch = $('eg-search-input');
@@ -2652,14 +3319,14 @@ async function loadEmojis() {
       allEmojisData[emoji] = [...new Set([...enWords, ...ruWords])];
     }
 
-    EMOJIS = Object.keys(allEmojisData);
-    renderEmojis(EMOJIS);
+    emojiCatalog = Object.keys(allEmojisData);
+    renderEmojis(emojiCatalog);
   } catch (e) {
     console.error('Emoji load failed', e);
   }
 }
 
-function renderEmojis(emojiList = EMOJIS) {
+function renderEmojis(emojiList = emojiCatalog) {
   const grid = document.createElement('div');
   grid.className = 'eg-grid';
   emojiList.forEach(e => {
@@ -2713,7 +3380,7 @@ document.querySelectorAll('.eg-tab').forEach(tab => {
     } else {
       emojiGrid.classList.add('hidden');
       gifGrid.classList.remove('hidden');
-      if (!gifGrid.innerHTML) loadGifs('speed', true);
+      if (!gifGrid.innerHTML || /Failed to load GIFs|disabled in Settings/.test(gifGrid.textContent)) loadGifs('speed', true);
     }
   };
 });
@@ -2736,11 +3403,11 @@ egSearch.oninput = () => {
   if (activeTab === 'emoji') {
     emojiSearchTimer = setTimeout(() => {
       if (!q) {
-        renderEmojis(EMOJIS);
+        renderEmojis(emojiCatalog);
         return;
       }
 
-      const filtered = EMOJIS.filter(e => {
+      const filtered = emojiCatalog.filter(e => {
         if (e.includes(q)) return true;
 
         const keywords = allEmojisData[e] || [];
@@ -2778,11 +3445,20 @@ async function loadGifs(query, isNewSearch) {
   const reqId = ++currentGifReqId;
 
   try {
-    const res = await fetch(`/api/gifs?q=${encodeURIComponent(currentGifQuery)}&offset=${gifSearchOffset}`);
+    const res = await fetch(`/api/gifs?q=${encodeURIComponent(currentGifQuery)}&offset=${gifSearchOffset}`, {
+      credentials: 'include',
+      cache: 'no-store'
+    });
     const data = await res.json();
 
     if (reqId !== currentGifReqId) return;
-    if (data.error) throw new Error(data.error);
+    if (data.error) {
+      if (res.status === 403) {
+        gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">GIF search is disabled in Settings.</div>';
+        return;
+      }
+      throw new Error(data.error);
+    }
 
     if (isNewSearch) {
       gifGrid.innerHTML = '';
@@ -2817,7 +3493,7 @@ async function loadGifs(query, isNewSearch) {
     if (reqId !== currentGifReqId) return;
     console.error('[GIF]', e);
     if (isNewSearch) {
-      gifGrid.innerHTML = '<div style="color:var(--text2);padding:10px;font-size:12px">Failed to load GIFs.</div>';
+      gifGrid.innerHTML = `<div style="color:var(--text2);padding:10px;font-size:12px">Failed to load GIFs: ${esc(e.message || 'unknown error')}</div>`;
     }
   } finally {
     isFetchingGifs = false;
@@ -2825,7 +3501,7 @@ async function loadGifs(query, isNewSearch) {
 }
 
 async function sendGif(url) {
-  const chatUid = S.activeChatUid;
+  const chatUid = state.activeChatUid;
   if (!chatUid) return;
   const replyId = replyTo?.id || null;
   cancelReply();
@@ -2904,9 +3580,7 @@ function startVerificationStep() {
 };
 
 function finishSecurityCheck() {
-  localStorage.setItem('taupe_check_done', 'true');
   hide($('modal-verify-number'));
-  localStorage.setItem('lastNumber', pendingAccountData.accountNumber);
   localStorage.removeItem('taupe_active_chat');
   bootApp(pendingAccountData, true);
   toast('Welcome to taupe', '', 'ok', 5000);
@@ -2914,17 +3588,324 @@ function finishSecurityCheck() {
 
 document.querySelectorAll('.skip-btn').forEach(btn => {
   btn.onclick = () => {
-    localStorage.setItem('taupe_check_done', 'true');
     hide($('modal-save-number'));
     hide($('modal-verify-number'));
     if (pendingAccountData) {
-      localStorage.setItem('lastNumber', pendingAccountData.accountNumber);
       localStorage.removeItem('taupe_active_chat');
       bootApp(pendingAccountData, true);
     }
     toast('Welcome to taupe', '', 'ok', 5000);
   };
 });
+
+const themeDefaults = {
+  bg: '#0f0f0f',
+  bg2: '#161616',
+  bg3: '#1e1e1e',
+  accent: '#4f8ef7',
+  text: '#e8e8e8',
+  border: '#2a2a2a'
+};
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function hsvToRgb(h, s, v) {
+  h = ((h % 360) + 360) % 360;
+  s = clamp(s, 0, 100) / 100;
+  v = clamp(v, 0, 100) / 100;
+  const c = v * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = v - c;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  h = (h + 360) % 360;
+  return [h, max === 0 ? 0 : (d / max) * 100, max * 100];
+}
+
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  let h = 0;
+  let s = 0;
+  if (d !== 0) {
+    s = d / (1 - Math.abs(2 * l - 1));
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  h = (h + 360) % 360;
+  return [h, s * 100, l * 100];
+}
+
+function hslToRgb(h, s, l) {
+  h = ((h % 360) + 360) % 360;
+  s = clamp(s, 0, 100) / 100;
+  l = clamp(l, 0, 100) / 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(value => clamp(Math.round(value), 0, 255).toString(16).padStart(2, '0')).join('');
+}
+
+function hexToRgb(value) {
+  const match = String(value || '').trim().match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (!match) return null;
+  let hex = match[1];
+  if (hex.length === 3) hex = hex.split('').map(char => char + char).join('');
+  return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
+}
+
+const colorPresets = [
+  '#000000', '#1a1a1a', '#333333', '#666666', '#999999', '#cccccc', '#f2f2f2', '#ffffff',
+  '#e63946', '#f77f00', '#fcbf49', '#2a9d8f', '#2ec4b6', '#4f8ef7', '#5e60ce', '#9b5de5',
+  '#f15bb5', '#ff8fab', '#00bbf9', '#00f5d4', '#80ed99', '#a7c957', '#d4a373', '#7f5539'
+];
+
+const colorState = { key: null, h: 0, s: 0, v: 100, mode: 'hex', picking: false };
+let colorWheelDrawn = false;
+
+function drawColorWheel() {
+  if (colorWheelDrawn) return;
+  const canvas = $('color-wheel');
+  if (!canvas) return;
+  const size = canvas.width;
+  const ctx = canvas.getContext('2d');
+  const image = ctx.createImageData(size, size);
+  const center = size / 2;
+  const radius = center - 1;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - center;
+      const dy = y - center;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const index = (y * size + x) * 4;
+      if (distance > radius) {
+        image.data[index + 3] = 0;
+        continue;
+      }
+      const hue = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+      const saturation = Math.min(1, distance / radius) * 100;
+      const [r, g, b] = hsvToRgb(hue, saturation, 100);
+      image.data[index] = r;
+      image.data[index + 1] = g;
+      image.data[index + 2] = b;
+      image.data[index + 3] = 255;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  colorWheelDrawn = true;
+}
+
+function currentColorHex() {
+  return rgbToHex(...hsvToRgb(colorState.h, colorState.s, colorState.v));
+}
+
+function updateColorPickerUI() {
+  const hex = currentColorHex();
+  const preview = $('color-preview');
+  const hexValue = $('color-hex-value');
+  if (preview) preview.style.background = hex;
+  if (hexValue) hexValue.textContent = hex;
+  $('color-brightness').value = String(Math.round(colorState.v));
+  $('color-wheel-dim').style.opacity = String((100 - colorState.v) / 100);
+  const marker = $('color-wheel-marker');
+  if (marker) {
+    const angle = colorState.h * Math.PI / 180;
+    const radius = (colorState.s / 100) * 48;
+    marker.style.left = (50 + Math.cos(angle) * radius) + '%';
+    marker.style.top = (50 + Math.sin(angle) * radius) + '%';
+    marker.style.background = hex;
+  }
+}
+
+function setColorFromRgb(r, g, b, refreshFields) {
+  const hsv = rgbToHsv(clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255));
+  colorState.h = hsv[0];
+  colorState.s = hsv[1];
+  colorState.v = hsv[2];
+  updateColorPickerUI();
+  if (refreshFields) renderColorFields();
+}
+
+function renderColorFields() {
+  const container = $('color-fields');
+  if (!container) return;
+  const [r, g, b] = hsvToRgb(colorState.h, colorState.s, colorState.v);
+  if (colorState.mode === 'hex') {
+    container.className = 'color-fields single';
+    container.innerHTML = `<label>HEX<input id="cf-hex" maxlength="7" value="${rgbToHex(r, g, b)}"></label>`;
+    $('cf-hex').oninput = event => {
+      const rgb = hexToRgb(event.target.value);
+      if (rgb) setColorFromRgb(rgb[0], rgb[1], rgb[2], false);
+    };
+    return;
+  }
+  if (colorState.mode === 'rgb') {
+    container.className = 'color-fields';
+    container.innerHTML = `
+      <label>R<input id="cf-r" type="number" min="0" max="255" value="${r}"></label>
+      <label>G<input id="cf-g" type="number" min="0" max="255" value="${g}"></label>
+      <label>B<input id="cf-b" type="number" min="0" max="255" value="${b}"></label>`;
+    const read = () => {
+      const rr = parseInt($('cf-r').value, 10);
+      const gg = parseInt($('cf-g').value, 10);
+      const bb = parseInt($('cf-b').value, 10);
+      if ([rr, gg, bb].every(Number.isFinite)) setColorFromRgb(rr, gg, bb, false);
+    };
+    ['cf-r', 'cf-g', 'cf-b'].forEach(id => { $(id).oninput = read; });
+    return;
+  }
+  if (colorState.mode === 'hsl') {
+    const [h, s, l] = rgbToHsl(r, g, b);
+    container.className = 'color-fields';
+    container.innerHTML = `
+      <label>H<input id="cf-h" type="number" min="0" max="360" value="${Math.round(h)}"></label>
+      <label>S<input id="cf-s" type="number" min="0" max="100" value="${Math.round(s)}"></label>
+      <label>L<input id="cf-l" type="number" min="0" max="100" value="${Math.round(l)}"></label>`;
+    const read = () => {
+      const hh = parseInt($('cf-h').value, 10);
+      const ss = parseInt($('cf-s').value, 10);
+      const ll = parseInt($('cf-l').value, 10);
+      if ([hh, ss, ll].every(Number.isFinite)) setColorFromRgb(...hslToRgb(hh, ss, ll), false);
+    };
+    ['cf-h', 'cf-s', 'cf-l'].forEach(id => { $(id).oninput = read; });
+    return;
+  }
+  container.className = 'color-fields';
+  container.innerHTML = `
+    <label>H<input id="cf-h" type="number" min="0" max="360" value="${Math.round(colorState.h)}"></label>
+    <label>S<input id="cf-s" type="number" min="0" max="100" value="${Math.round(colorState.s)}"></label>
+    <label>V<input id="cf-v" type="number" min="0" max="100" value="${Math.round(colorState.v)}"></label>`;
+  const read = () => {
+    const hh = parseInt($('cf-h').value, 10);
+    const ss = parseInt($('cf-s').value, 10);
+    const vv = parseInt($('cf-v').value, 10);
+    if (![hh, ss, vv].every(Number.isFinite)) return;
+    colorState.h = ((hh % 360) + 360) % 360;
+    colorState.s = clamp(ss, 0, 100);
+    colorState.v = clamp(vv, 0, 100);
+    updateColorPickerUI();
+  };
+  ['cf-h', 'cf-s', 'cf-v'].forEach(id => { $(id).oninput = read; });
+}
+
+function openColorPicker(key) {
+  const custom = JSON.parse(localStorage.getItem('taupe_custom_theme') || '{}');
+  const rgb = hexToRgb(custom[key] || themeDefaults[key]);
+  colorState.key = key;
+  colorState.mode = 'hex';
+  colorState.picking = false;
+  setColorFromRgb(rgb[0], rgb[1], rgb[2], true);
+  document.querySelectorAll('.color-tabs button').forEach(button => {
+    button.classList.toggle('active', button.dataset.colorMode === 'hex');
+  });
+  drawColorWheel();
+  show($('modal-color-picker'));
+}
+
+function pickColorFromWheel(event) {
+  const canvas = $('color-wheel');
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const center = rect.width / 2;
+  const dx = x - center;
+  const dy = y - center;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+  if (distance > center) return;
+  colorState.h = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+  colorState.s = Math.min(100, (distance / center) * 100);
+  updateColorPickerUI();
+}
+
+function initColorPicker() {
+  document.querySelectorAll('.color-row').forEach(row => {
+    row.onclick = () => openColorPicker(row.dataset.colorKey);
+  });
+  const presetContainer = $('color-presets');
+  colorPresets.forEach(hex => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'color-preset';
+    button.style.background = hex;
+    button.title = hex;
+    button.onclick = () => {
+      const rgb = hexToRgb(hex);
+      if (rgb) setColorFromRgb(rgb[0], rgb[1], rgb[2], true);
+    };
+    presetContainer.appendChild(button);
+  });
+  const wheel = $('color-wheel');
+  wheel.addEventListener('pointerdown', event => {
+    colorState.picking = true;
+    wheel.setPointerCapture?.(event.pointerId);
+    pickColorFromWheel(event);
+  });
+  wheel.addEventListener('pointermove', event => {
+    if (colorState.picking) pickColorFromWheel(event);
+  });
+  wheel.addEventListener('pointerup', () => {
+    colorState.picking = false;
+    renderColorFields();
+  });
+  wheel.addEventListener('pointercancel', () => { colorState.picking = false; });
+  $('color-brightness').oninput = event => {
+    colorState.v = clamp(parseInt(event.target.value, 10) || 0, 0, 100);
+    updateColorPickerUI();
+    renderColorFields();
+  };
+  document.querySelectorAll('.color-tabs button').forEach(button => {
+    button.onclick = () => {
+      colorState.mode = button.dataset.colorMode;
+      document.querySelectorAll('.color-tabs button').forEach(item => item.classList.toggle('active', item === button));
+      renderColorFields();
+    };
+  });
+  $('color-cancel').onclick = () => hide($('modal-color-picker'));
+  $('color-select').onclick = () => {
+    if (!colorState.key) return;
+    const custom = JSON.parse(localStorage.getItem('taupe_custom_theme') || '{}');
+    custom[colorState.key] = currentColorHex();
+    localStorage.setItem('taupe_custom_theme', JSON.stringify(custom));
+    applyTheme('custom');
+    hide($('modal-color-picker'));
+  };
+}
 
 function applyTheme(theme) {
   localStorage.setItem('taupe_theme', theme);
@@ -2933,22 +3914,26 @@ function applyTheme(theme) {
     document.documentElement.style.cssText = '';
   }
 
+  const custom = JSON.parse(localStorage.getItem('taupe_custom_theme') || '{}');
   if (theme === 'system') {
     const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
   } else if (theme === 'custom') {
     document.documentElement.setAttribute('data-theme', 'custom');
-    const custom = JSON.parse(localStorage.getItem('taupe_custom_theme') || '{}');
     const root = document.documentElement.style;
-    root.setProperty('--bg', custom.bg || '#0f0f0f');
-    root.setProperty('--bg2', custom.bg2 || '#161616');
-    root.setProperty('--bg3', custom.bg3 || '#1e1e1e');
-    root.setProperty('--accent', custom.accent || '#4f8ef7');
-    root.setProperty('--text', custom.text || '#e8e8e8');
-    root.setProperty('--border', custom.border || '#2a2a2a');
+    root.setProperty('--bg', custom.bg || themeDefaults.bg);
+    root.setProperty('--bg2', custom.bg2 || themeDefaults.bg2);
+    root.setProperty('--bg3', custom.bg3 || themeDefaults.bg3);
+    root.setProperty('--accent', custom.accent || themeDefaults.accent);
+    root.setProperty('--text', custom.text || themeDefaults.text);
+    root.setProperty('--border', custom.border || themeDefaults.border);
   } else {
     document.documentElement.setAttribute('data-theme', theme);
   }
+  document.querySelectorAll('[data-swatch]').forEach(swatch => {
+    const key = swatch.dataset.swatch;
+    swatch.style.background = custom[key] || themeDefaults[key];
+  });
 
   document.querySelectorAll('.theme-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.setTheme === theme);
@@ -2965,21 +3950,13 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
   applyTheme(localStorage.getItem('taupe_theme') || 'dark');
   show($('modal-theme'));
 };
- $('theme-close').onclick = () => hide($('modal-theme'));
+ $('theme-close').onclick = () => { hide($('modal-color-picker')); hide($('modal-theme')); };
 
 document.querySelectorAll('.theme-btn').forEach(btn => {
   btn.onclick = () => applyTheme(btn.dataset.setTheme);
 });
 
-document.querySelectorAll('#custom-theme-editor input').forEach(inp => {
-  inp.oninput = () => {
-    const custom = JSON.parse(localStorage.getItem('taupe_custom_theme') || '{}');
-    custom[inp.id.replace('c-', '')] = inp.value;
-    localStorage.setItem('taupe_custom_theme', JSON.stringify(custom));
-    applyTheme('custom');
-  };
-});
-
+initColorPicker();
 applyTheme(localStorage.getItem('taupe_theme') || 'dark');
 
 let mediaRecorder;
@@ -3042,24 +4019,24 @@ function stopRecording(send) {
  $('btn-cancel-record').onclick = () => stopRecording(false);
 
 async function sendVoiceMessage(blob) {
-  if (!S.activeChatUid) return;
-  if (blob.size > MAX_FILE_SIZE) { toast('Too long', 'Recording must be under 25 MB', 'warn'); return; }
+  if (!state.activeChatUid) return;
+  if (blob.size > maxFileSize) { toast('Too long', 'Recording must be under 25 MB', 'warn'); return; }
   const peerChatNum = await getActivePeerChatNum();
-  const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : [];
+  if (!await ensurePeerTrusted(peerChatNum)) return;
+  const peerPub = peerChatNum ? await getPeerKey(peerChatNum, true) : [];
+  if (!peerPub.length) { toast('Cannot send', 'Peer encryption keys are unavailable.', 'err'); return; }
   const myDevices = await getMyDevicesKeys();
   const allRecipients = [...peerPub, ...myDevices];
 
-  let fileToUpload = blob;
-  let finalName = 'voice_message.webm';
-
-  if (allRecipients.length > 0) {
-    try {
-      fileToUpload = await encryptFile(blob, peerChatNum, allRecipients);
-      finalName = 'voice_message.webm.bin';
-    } catch (e) {
-      console.warn('[E2E] Voice encryption failed', e);
-    }
+  let fileToUpload;
+  try {
+    fileToUpload = await encryptFile(blob, state.activeChatUid, state.account.deviceId, allRecipients);
+  } catch (e) {
+    console.error('[E2E] Voice encryption failed', e);
+    toast('Not sent', 'Encryption failed, voice message was not uploaded.', 'err');
+    return;
   }
+  const finalName = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) + '.bin';
 
   const fd = new FormData();
   fd.append('file', fileToUpload, finalName);
@@ -3077,13 +4054,13 @@ async function sendVoiceMessage(blob) {
 
   if (d.error) { toast('Upload failed', d.error, 'err'); return; }
 
-  S.socket.emit('msg:send', {
-    chatUid: S.activeChatUid,
+  state.socket?.emit('msg:send', {
+    chatUid: state.activeChatUid,
     content: null,
     fileUrl: d.url,
     fileType: 'audio',
     fileName: d.name,
-    burnSeconds: S.burnSeconds || null,
+    burnSeconds: state.burnSeconds || null,
     replyToId: replyTo?.id || null,
   });
   cancelReply();
@@ -3196,7 +4173,7 @@ function initAudioPlayer(playerEl, msg, isMe) {
     isPlaying = true;
     playBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
     if (!isMe && !msg.is_played) {
-      S.socket.emit('msg:played', { msgId: msg.id });
+      state.socket.emit('msg:played', { msgId: msg.id });
     }
     rafId = requestAnimationFrame(updateTime);
   });
@@ -3237,7 +4214,7 @@ function initAudioPlayer(playerEl, msg, isMe) {
 }
 
 async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) {
-  if (S.activeBurnTimers.has(msgId)) return;
+  if (state.activeBurnTimers.has(msgId)) return;
 
   const getWrap = () => {
     const el = document.querySelector(`[data-msg-id="${msgId}"]`);
@@ -3247,17 +4224,25 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
   const spoilerBtn = document.querySelector(`.msg-spoiler[data-msg-id="${msgId}"]`);
   if (spoilerBtn && payload) {
     let html = '';
-    if (payload.fileType === 'image' && payload.filePath) {
-      html = `<img class="msg-img" src="${payload.filePath}" loading="lazy">`;
-    } else if (payload.fileType === 'file' && payload.filePath) {
-      html = `<div class="msg-file">[ <a href="${payload.filePath}" target="_blank" rel="noreferrer">${esc(payload.fileName || 'file')}</a> ]</div>`;
+    const burnPath = safeUploadPath(payload.filePath);
+    if (burnPath) {
+      const peerChatNum = await getActivePeerChatNum();
+      const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
+      const decryptKeys = peerPub ? [...peerPub, ...await getMyDevicesKeys()] : null;
+      html = await buildFileHtml({
+        id: msgId,
+        file_path: burnPath,
+        file_type: payload.fileType,
+        file_name: payload.fileName
+      }, chatUid, decryptKeys, false, '', { enforceReplay: false });
     } else if (payload.content) {
       let text = payload.content;
       if (isEncrypted(text)) {
         const peerChatNum = await getActivePeerChatNum();
         const peerPub = peerChatNum ? await getPeerKey(peerChatNum) : null;
-        if (peerPub) {
-          try { text = await decryptMsg(text, peerChatNum, peerPub); }
+        const decryptKeys = peerPub ? [...peerPub, ...await getMyDevicesKeys()] : null;
+        if (decryptKeys) {
+          try { text = await decryptMsg(text, chatUid, decryptKeys, { enforceReplay: false }); }
           catch { text = '[decryption failed]'; }
         } else { text = '[encrypted]'; }
       }
@@ -3301,13 +4286,13 @@ async function startBurnCountdown(msgId, chatUid, burnAt, burnSeconds, payload) 
 
     if (remaining <= 0) {
       clearInterval(interval);
-      S.activeBurnTimers.delete(msgId);
+      state.activeBurnTimers.delete(msgId);
       getWrap()?.remove();
-      S.socket?.emit('msg:burn:done', { msgId, chatUid });
+      state.socket?.emit('msg:burn:done', { msgId, chatUid });
     }
   }, 500);
 
-  S.activeBurnTimers.set(msgId, interval);
+  state.activeBurnTimers.set(msgId, interval);
 }
 
 init();

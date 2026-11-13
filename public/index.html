@@ -6,7 +6,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
   <title>Taupe</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=3">
   <link rel="stylesheet" href="/vendor/fontawesome/css/all.min.css">
   <script src="/vendor/twemoji/twemoji.min.js"></script>
 </head>
@@ -107,17 +107,24 @@
             <div style="overflow: hidden;">
               <div id="chat-title-row">
                 <div id="chat-title-display"></div>
+                <button type="button" id="chat-verified-badge" class="verified-badge muted">unverified</button>
                 <span id="chat-presence" class="hidden"></span>
               </div>
               <div id="chat-subtitle"></div>
             </div>
           </div>
           <div class="chat-header-actions">
-            <button id="btn-burn-mode" class="icon-btn" title="Chat History"><i class="fa-solid fa-clock-rotate-left"></i></button>
             <button id="btn-chat-menu" class="icon-btn" title="Menu"><i class="fa-solid fa-ellipsis-vertical"></i></button>
           </div>
         </div>
 
+        <div id="key-alert-banner" class="hidden">
+          <div id="key-alert-text"></div>
+          <div class="key-alert-actions">
+            <button id="key-alert-review" class="btn-ghost">Review</button>
+            <button id="key-alert-trust" class="btn-danger">Trust new keys</button>
+          </div>
+        </div>
         <div id="messages-container"></div>
         <div id="typing-indicator" class="hidden"></div>
 
@@ -200,13 +207,43 @@
       <button class="theme-btn" data-set-theme="custom" style="grid-column: span 2;">Custom</button>
     </div>
     <div id="custom-theme-editor" class="hidden" style="display: grid; gap: 10px; margin-bottom: 15px;">
-      <div class="custom-color-row"><label>Background</label><input type="color" id="c-bg" value="#0f0f0f"></div>
-      <div class="custom-color-row"><label>Surface</label><input type="color" id="c-bg2" value="#161616"></div>
-      <div class="custom-color-row"><label>Surface 2</label><input type="color" id="c-bg3" value="#1e1e1e"></div>
-      <div class="custom-color-row"><label>Accent</label><input type="color" id="c-accent" value="#4f8ef7"></div>
-      <div class="custom-color-row"><label>Text</label><input type="color" id="c-text" value="#e8e8e8"></div>
+      <button type="button" class="custom-color-row color-row" data-color-key="bg"><span>Background</span><span class="color-swatch" data-swatch="bg"></span></button>
+      <button type="button" class="custom-color-row color-row" data-color-key="bg2"><span>Surface</span><span class="color-swatch" data-swatch="bg2"></span></button>
+      <button type="button" class="custom-color-row color-row" data-color-key="bg3"><span>Surface 2</span><span class="color-swatch" data-swatch="bg3"></span></button>
+      <button type="button" class="custom-color-row color-row" data-color-key="accent"><span>Accent</span><span class="color-swatch" data-swatch="accent"></span></button>
+      <button type="button" class="custom-color-row color-row" data-color-key="text"><span>Text</span><span class="color-swatch" data-swatch="text"></span></button>
     </div>
     <button class="btn-primary full" id="theme-close">Done</button>
+  </div>
+</div>
+
+<div id="modal-color-picker" class="modal hidden color-picker-modal">
+  <div class="modal-box color-picker-box">
+    <h2>Choose color</h2>
+    <div class="color-wheel-wrap">
+      <canvas id="color-wheel" width="260" height="260"></canvas>
+      <div id="color-wheel-dim"></div>
+      <div id="color-wheel-marker"></div>
+    </div>
+    <label class="color-brightness">Brightness
+      <input id="color-brightness" type="range" min="0" max="100" value="100">
+    </label>
+    <div id="color-presets" class="color-presets"></div>
+    <div class="color-tabs">
+      <button type="button" data-color-mode="hex" class="active">HEX</button>
+      <button type="button" data-color-mode="rgb">RGB</button>
+      <button type="button" data-color-mode="hsl">HSL</button>
+      <button type="button" data-color-mode="hsv">HSV</button>
+    </div>
+    <div id="color-fields" class="color-fields"></div>
+    <div class="color-preview-row">
+      <span id="color-preview"></span>
+      <span id="color-hex-value" class="mono"></span>
+    </div>
+    <div class="modal-actions">
+      <button id="color-cancel" class="btn-ghost">Cancel</button>
+      <button id="color-select" class="btn-primary">Select</button>
+    </div>
   </div>
 </div>
 
@@ -214,7 +251,7 @@
   <div class="modal-box">
     <h2>New Chat</h2>
     <label>Peer Number or @username
-      <input id="nc-peer-number" type="text" placeholder="0000-0000 or @username">
+      <input id="nc-peer-number" type="text" placeholder="0000-0000-00 or @username">
     </label>
     <label>Chat label (optional)
       <input id="nc-label" type="text" placeholder="#1 auto / custom name">
@@ -245,37 +282,48 @@
       <div class="avatar-preview" id="my-avatar-preview" title="Click to change"><i class="fa-solid fa-camera"></i></div>
       <div style="flex:1;display:flex;flex-direction:column;gap:6px">
         <div>
-          <p class="label-sm">Chat Number (share this)</p>
+          <p class="label-sm">Chat Number <button type="button" class="info-tip" data-tip="Share this number so other people can start a chat with you." aria-label="About chat number">i</button></p>
           <div class="number-display-box" id="settings-chat-number-box">
             <span id="settings-chat-number"></span>
             <span style="font-size:11px;color:var(--text2)">copy</span>
           </div>
         </div>
         <div>
-          <p class="label-sm">Private Number (keep secret)</p>
-          <div class="number-display-box" id="settings-private-number-box" title="Click to reveal / copy">
-            <span id="settings-private-number" style="filter:blur(5px);transition:.2s"></span>
-            <span style="font-size:11px;color:var(--text2)">reveal</span>
-          </div>
+          <p class="label-sm">Private Number <button type="button" class="info-tip" data-tip="Shown only once at registration. It is never stored on this device. Save it somewhere safe." aria-label="About private number">i</button></p>
         </div>
       </div>
     </div>
     <input id="avatar-file-input" type="file" accept="image/*" hidden>
 
-    <label>Username (optional)
-      <input id="settings-username" type="text" placeholder="letters, numbers, _ (3–24 chars)">
+    <label class="field-with-info">
+      <span class="field-label-row">Username <button type="button" class="info-tip" data-tip="Optional. 3 to 24 characters: letters, numbers and underscore." aria-label="About username">i</button></span>
+      <input id="settings-username" type="text" placeholder="letters, numbers, _">
     </label>
     <div class="toggle-row">
-      <span style="font-size:13px">Public (findable by username)</span>
+      <span class="setting-label">Public <button type="button" class="info-tip" data-tip="If enabled, other people can find you by username." aria-label="About public username">i</button></span>
       <label class="toggle"><input type="checkbox" id="settings-username-public"><span class="toggle-slider"></span></label>
     </div>
     <button id="btn-save-username" class="btn-ghost full">Save Username</button>
     <div class="toggle-row">
-      <span style="font-size:13px">Show presence</span>
+      <span class="setting-label">Show presence <button type="button" class="info-tip" data-tip="Let peers see when you are online and your last seen time." aria-label="About presence">i</button></span>
       <label class="toggle"><input type="checkbox" id="settings-show-presence"><span class="toggle-slider"></span></label>
     </div>
+    <div class="toggle-row">
+      <span class="setting-label">GIF search <button type="button" class="info-tip" data-tip="Sends search terms to this server and Giphy. Disabled by default." aria-label="About GIF search">i</button></span>
+      <label class="toggle"><input type="checkbox" id="settings-gif-enabled"><span class="toggle-slider"></span></label>
+    </div>
 
-    <p class="label-sm">Devices (max 5)</p>
+    <p class="label-sm">Blocked accounts</p>
+    <ul id="blocked-list"></ul>
+
+    <p class="label-sm">History</p>
+    <div class="settings-actions">
+      <button id="btn-export-history" class="btn-ghost">Export Encrypted History</button>
+      <button id="btn-import-history" class="btn-ghost">Import Encrypted History</button>
+    </div>
+    <input id="history-file-input" type="file" accept=".taupe,.json,.enc,application/json" hidden>
+
+    <p class="label-sm">Devices <button type="button" class="info-tip" data-tip="Up to 5 devices can be signed in to one account. Kick old devices you do not use.">i</button></p>
     <ul id="devices-list"></ul>
     <div class="settings-actions">
       <button id="btn-kick-all" class="btn-ghost">Kick All Other Devices</button>
@@ -291,7 +339,7 @@
     <h2>@ Aliases</h2>
     <p style="font-size:12px;color:var(--text2)">Give a name to any account number. Visible only to you.</p>
     <label>Account Number
-      <input id="alias-number-input" type="text" placeholder="0000-0000">
+      <input id="alias-number-input" type="text" placeholder="0000-0000-00">
     </label>
     <label>Alias
       <input id="alias-name-input" type="text" placeholder="e.g. Alice">
@@ -308,10 +356,48 @@
 <div id="modal-chat-menu" class="modal hidden">
   <div class="modal-box compact">
     <button id="cm-rename" class="menu-item">Rename Chat</button>
+    <button id="cm-history" class="menu-item">History</button>
     <button id="cm-delete-self" class="menu-item">Delete for Me</button>
-    <button id="cm-delete-peer" class="menu-item">Delete for Peer</button>
     <button id="cm-delete-both" class="menu-item danger">Delete for Both</button>
+    <button id="cm-block" class="menu-item danger">Block Peer</button>
     <button id="cm-cancel" class="menu-item muted">Cancel</button>
+  </div>
+</div>
+
+<div id="chat-list-ctx" class="chat-ctx-menu" role="menu">
+  <button type="button" class="menu-item" data-action="rename">Rename Chat</button>
+  <button type="button" class="menu-item" data-action="history">History</button>
+  <button type="button" class="menu-item" data-action="delete-self">Delete for Me</button>
+  <button type="button" class="menu-item danger" data-action="delete-both">Delete for Both</button>
+  <button type="button" class="menu-item danger" data-action="block">Block Peer</button>
+</div>
+
+<div id="modal-security" class="modal hidden">
+  <div class="modal-box">
+    <h2>Encryption</h2>
+    <p id="security-peer-title" class="hint"></p>
+    <p class="label-sm">Safety number</p>
+    <div id="security-safety-number" class="safety-number mono"></div>
+    <button id="security-copy" class="btn-ghost full">Copy safety number</button>
+    <div id="security-blocked" class="sys-status pending-self hidden">The peer key changed. Sending is blocked until you trust the new keys.</div>
+    <p class="label-sm">Peer devices</p>
+    <div id="security-devices" class="security-devices"></div>
+    <div class="modal-actions">
+      <button id="security-trust" class="btn-danger">Trust new keys</button>
+      <button id="security-verify" class="btn-primary">Mark verified</button>
+    </div>
+    <button id="security-close" class="btn-ghost full mt">Close</button>
+  </div>
+</div>
+
+<div id="modal-chat-request" class="modal hidden">
+  <div class="modal-box">
+    <h2>Chat request</h2>
+    <p id="chat-request-text" class="hint"></p>
+    <div class="modal-actions">
+      <button id="chat-request-decline" class="btn-ghost">Decline</button>
+      <button id="chat-request-accept" class="btn-primary">Accept</button>
+    </div>
   </div>
 </div>
 
@@ -339,6 +425,8 @@
   </div>
 </div>
 <button id="btn-unstable-indicator" class="unstable-indicator hidden">! Offline</button>
+
+<div id="info-tooltip" class="info-tooltip" role="tooltip"></div>
 
 <div id="toast-container"></div>
 
@@ -378,6 +466,6 @@
   </div>
 </div>
 <script src="/socket.io/socket.io.js"></script>
-<script type="module" src="client.js"></script>
+<script type="module" src="client.js?v=3"></script>
 </body>
 </html>

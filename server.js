@@ -1,117 +1,121 @@
 require('dotenv').config();
 
-const http  = require('http');
-const https = require('https');
-const fs    = require('fs');
-const path  = require('path');
-const crypto = require('crypto');
-const dns   = require('dns').promises;
-const net   = require('net');
+const http = require('node:http');
+const https = require('node:https');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const dns = require('node:dns').promises;
+const net = require('node:net');
 const express = require('express');
 const { Server } = require('socket.io');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
-const jwt  = require('jsonwebtoken');
+const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const selfsigned = require('selfsigned');
+const ipaddr = require('ipaddr.js');
+const DB = require('./db');
+
 let sharp = null;
 try {
   sharp = require('sharp');
 } catch (e) {
-  console.warn('[taupe] sharp unavailable on this platform, images will be stored without resizing/recompression (no EXIF stripping either). Avatar/file uploads still work.');
-}
-const selfsigned = require('selfsigned');
-const DB = require('./db');
-
-function validateFileMagic(filePath, mimetype) {
-  if (!mimetype.startsWith('image/')) return true;
-  try {
-    const buf = Buffer.alloc(12);
-    const fd = fs.openSync(filePath, 'r');
-    fs.readSync(fd, buf, 0, 12, 0);
-    fs.closeSync(fd);
-    const isJpg  = buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
-    const isPng  = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47;
-    const isGif  = buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46;
-    const isWebp = buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46;
-    return isJpg || isPng || isGif || isWebp;
-  } catch (e) {
-    return false;
-  }
+  console.warn('[taupe] sharp unavailable, avatar metadata stripping is disabled');
 }
 
-const CERT_PATH = path.join(__dirname, 'cert');
-if (!fs.existsSync(CERT_PATH + '/key.pem')) {
-  fs.mkdirSync(CERT_PATH, { recursive: true });
-  const pems = selfsigned.generate([{ name:'commonName', value:'localhost' }], { days:3650, keySize:2048 });
-  fs.writeFileSync(CERT_PATH + '/key.pem', pems.private);
-  fs.writeFileSync(CERT_PATH + '/cert.pem', pems.cert);
+const port = parseInt(process.env.port || '3443', 10);
+const httpPort = process.env.http_port ? parseInt(process.env.http_port, 10) : null;
+const bindHost = process.env.bind_host || '127.0.0.1';
+const publicUrl = process.env.public_url || 'http://localhost:' + port;
+const secureCookie = process.env.secure !== 'false';
+const trustProxyHops = parseInt(process.env.trust_proxy_hops || '0', 10);
+const registrationInvite = process.env.registration_invite || '';
+const powDifficulty = Math.min(Math.max(parseInt(process.env.pow_difficulty || '4', 10), 1), 6);
+const uploadQuotaMb = parseInt(process.env.upload_quota_mb || '2048', 10);
+const globalUploadGb = parseFloat(process.env.global_upload_gb || '0');
+const orphanUploadHours = parseInt(process.env.orphan_upload_hours || '24', 10);
+const pushAllowHosts = String(process.env.push_allow_hosts || '')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+const certDir = path.join(__dirname, 'cert');
+if (!fs.existsSync(path.join(certDir, 'key.pem'))) {
+  fs.mkdirSync(certDir, { recursive: true });
+  const pems = selfsigned.generate([{ name: 'commonName', value: 'localhost' }], { days: 3650, keySize: 2048 });
+  fs.writeFileSync(path.join(certDir, 'key.pem'), pems.private);
+  fs.writeFileSync(path.join(certDir, 'cert.pem'), pems.cert);
+  console.warn('[taupe] generated a self-signed certificate, use a real certificate behind a reverse proxy');
 }
 const tlsOptions = {
-  key:  fs.readFileSync(CERT_PATH + '/key.pem'),
-  cert: fs.readFileSync(CERT_PATH + '/cert.pem'),
+  key: fs.readFileSync(path.join(certDir, 'key.pem')),
+  cert: fs.readFileSync(path.join(certDir, 'cert.pem')),
 };
 
-const PORT      = process.env.PORT      || 3443;
-const HTTP_PORT = process.env.HTTP_PORT || 3000;
-const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
-
-const SECRET_FILE = process.env.SECRET_FILE || path.join(__dirname, '.jwt_secret');
-let JWT_SECRET;
-if (fs.existsSync(SECRET_FILE)) {
-  JWT_SECRET = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+const secretFile = process.env.jwt_secret_file || path.join(__dirname, '.jwt_secret');
+let jwtSecret;
+if (fs.existsSync(secretFile)) {
+  jwtSecret = fs.readFileSync(secretFile, 'utf8').trim();
 } else {
-  JWT_SECRET = crypto.randomBytes(64).toString('hex');
-  fs.writeFileSync(SECRET_FILE, JWT_SECRET, { mode: 0o600 });
+  jwtSecret = crypto.randomBytes(64).toString('hex');
+  fs.writeFileSync(secretFile, jwtSecret, { mode: 0o600 });
 }
 
-const UPLOADS = path.join(__dirname, 'uploads');
-const AVATARS = path.join(__dirname, 'uploads', 'avatars');
-fs.mkdirSync(UPLOADS, { recursive: true });
-fs.mkdirSync(AVATARS, { recursive: true });
-
-function checkLoginRateLimit(ip) {
-  const now = Math.floor(Date.now() / 1000);
-  const row = DB.getRateLimit(ip);
-  if (row && row.blocked_until > now) {
-    const remaining = Math.ceil((row.blocked_until - now) / 60);
-    return { blocked: true, remaining };
-  }
-  return { blocked: false };
-}
-function recordLoginFail(ip) { DB.recordLoginFailDb(ip); }
-function recordLoginSuccess(ip) { DB.recordLoginSuccessDb(ip); }
-
-setInterval(() => DB.cleanupRateLimits(), 15 * 60 * 1000);
+const uploadsDir = path.resolve(process.env.upload_dir || path.join(__dirname, 'uploads'));
+const avatarsDir = path.join(uploadsDir, 'avatars');
+fs.mkdirSync(uploadsDir, { recursive: true });
+fs.mkdirSync(avatarsDir, { recursive: true });
 
 const app = express();
-const publicUrl = process.env.PUBLIC_URL || 'http://localhost:3000';
-const cspHost = publicUrl.replace(/^https?:\/\//, '');
-const extraScriptHashes = String(process.env.CSP_SCRIPT_HASHES || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+app.disable('x-powered-by');
+if (trustProxyHops > 0) app.set('trust proxy', trustProxyHops);
 
+let forwardedWarningShown = false;
+app.use((req, res, next) => {
+  if (trustProxyHops === 0 && !forwardedWarningShown && (req.headers['x-forwarded-for'] || req.headers['x-real-ip'])) {
+    forwardedWarningShown = true;
+    console.warn('[taupe] forwarded headers seen but trust_proxy_hops is unset, every client shares one rate limit bucket');
+  }
+  next();
+});
+
+const cspHost = publicUrl.replace(/^https?:\/\//, '');
+const cspConnect = ["'self'", `ws://${cspHost}`, `wss://${cspHost}`];
 app.use(helmet({
   contentSecurityPolicy: {
+    useDefaults: false,
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", ...extraScriptHashes],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "blob:"],
-      mediaSrc: ["'self'", "blob:", "data:"],
-      connectSrc: ["'self'", `ws://${cspHost}`, `wss://${cspHost}`, `http://${cspHost}`, `https://${cspHost}`, "blob:", "data:"],
+      baseUri: ["'none'"],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],
+      scriptSrc: ["'self'"],
+      scriptSrcAttr: ["'none'"],
+      styleSrc: ["'self'"],
+      styleSrcAttr: ["'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'blob:'],
+      mediaSrc: ["'self'", 'blob:', 'data:'],
+      connectSrc: cspConnect,
       fontSrc: ["'self'"],
       objectSrc: ["'none'"],
       upgradeInsecureRequests: [],
-    }
-  }
+    },
+  },
+  hsts: secureCookie ? { maxAge: 15552000, includeSubDomains: true } : false,
+  crossOriginResourcePolicy: { policy: 'same-origin' },
+  referrerPolicy: { policy: 'no-referrer' },
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use((req, res, next) => {
+  res.set('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
+  next();
+});
+app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const ROOT_PUBLIC_FILES = ['index.html', 'style.css', 'client.js', 'crypto.js', 'favicon.png'];
-ROOT_PUBLIC_FILES.forEach(name => {
+const rootPublicFiles = ['index.html', 'style.css', 'client.js', 'crypto.js', 'favicon.png'];
+rootPublicFiles.forEach(name => {
   const abs = path.join(__dirname, name);
-  app.get(name === 'index.html' ? '/' : `/${name}`, (req, res, next) => {
+  app.get(name === 'index.html' ? '/' : '/' + name, (req, res, next) => {
     res.sendFile(abs, err => { if (err) next(); });
   });
 });
@@ -120,10 +124,8 @@ let twemojiPack = null;
 function getTwemojiPack() {
   if (!twemojiPack) {
     try {
-      twemojiPack = JSON.parse(fs.readFileSync(
-        path.join(__dirname, 'public', 'vendor', 'twemoji', 'svg-pack.json'), 'utf8'));
+      twemojiPack = JSON.parse(fs.readFileSync(path.join(__dirname, 'public', 'vendor', 'twemoji', 'svg-pack.json'), 'utf8'));
     } catch (e) {
-      console.warn('[taupe] twemoji svg-pack.json not found, emoji images disabled');
       twemojiPack = {};
     }
   }
@@ -141,448 +143,730 @@ app.get('/vendor/twemoji/svg/:name', (req, res) => {
   res.send(svg);
 });
 
-app.set('trust proxy', process.env.TRUST_PROXY === '1');
-
-const rlBuckets = new Map();
+const buckets = new Map();
 function rateLimit(key, max, windowSec) {
   const now = Math.floor(Date.now() / 1000);
-  let b = rlBuckets.get(key);
-  if (!b || now - b.start >= windowSec) {
-    b = { start: now, count: 0 };
-    rlBuckets.set(key, b);
+  let bucket = buckets.get(key);
+  if (!bucket || now - bucket.start >= windowSec) {
+    bucket = { start: now, count: 0 };
+    buckets.set(key, bucket);
   }
-  b.count++;
-  return b.count <= max ? null : Math.max(1, b.start + windowSec - now);
+  bucket.count++;
+  return bucket.count <= max ? null : Math.max(1, bucket.start + windowSec - now);
 }
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
-  for (const [k, b] of rlBuckets) {
-    if (now - b.start > 3600) rlBuckets.delete(k);
+  for (const [key, bucket] of buckets) {
+    if (now - bucket.start > 3600) buckets.delete(key);
   }
 }, 10 * 60 * 1000);
-
-function limitMiddleware(name, max, windowSec) {
+function limitByIp(name, max, windowSec) {
   return (req, res, next) => {
-    const key = `${name}:${req.ip || req.socket?.remoteAddress || 'unknown'}`;
-    const retry = rateLimit(key, max, windowSec);
-    if (retry !== null) return res.status(429).json({ error: `Too many requests. Retry in ${retry}s.` });
+    const retry = rateLimit(`${name}:${req.ip || req.socket.remoteAddress || 'unknown'}`, max, windowSec);
+    if (retry !== null) return res.status(429).json({ error: `Too many requests, retry in ${retry}s` });
     next();
   };
 }
-const registerLimiter   = limitMiddleware('register', 5, 3600);
-const lookupLimiter     = limitMiddleware('lookup', 30, 60);
-const loginInfoLimiter  = limitMiddleware('logininfo', 10, 60);
-const gifLimiter        = limitMiddleware('gif', 30, 60);
+const registerLimiter = limitByIp('register', 5, 3600);
+const lookupLimiter = limitByIp('lookup', 30, 60);
+const loginLimiter = limitByIp('login', 20, 60);
+const loginInfoLimiter = limitByIp('logininfo', 10, 60);
+const gifLimiter = limitByIp('gif', 30, 60);
+const chatLimiter = limitByIp('chat', 20, 60);
+const uploadLimiter = limitByIp('upload', 60, 60);
 
-const SAFE_UPLOAD_EXTS = new Set([
-  '.png', '.jpg', '.jpeg', '.gif', '.webp',
-  '.bin', '.txt', '.pdf',
-  '.mp3', '.m4a', '.ogg', '.oga', '.opus', '.wav', '.webm',
-  '.zip', '.7z', '.tar', '.gz', '.apk',
-]);
-function sanitizeExt(originalname) {
-  let ext = path.extname(originalname || '').toLowerCase();
-  if (!/^\.[a-z0-9]{1,8}$/.test(ext) || !SAFE_UPLOAD_EXTS.has(ext)) ext = '';
-  return ext;
+const powChallenges = new Map();
+function issueChallenge() {
+  const challenge = crypto.randomBytes(16).toString('hex');
+  powChallenges.set(challenge, Date.now() + 10 * 60 * 1000);
+  return challenge;
 }
-
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, UPLOADS),
-  filename: (_, file, cb) => {
-    cb(null, Date.now() + '_' + crypto.randomBytes(6).toString('hex') + sanitizeExt(file.originalname));
+function verifyChallenge(challenge, nonce) {
+  const expires = powChallenges.get(String(challenge));
+  if (!expires || expires < Date.now()) return false;
+  powChallenges.delete(String(challenge));
+  const hash = crypto.createHash('sha256').update(String(challenge) + String(nonce)).digest('hex');
+  return hash.startsWith('0'.repeat(powDifficulty));
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [challenge, expires] of powChallenges) {
+    if (expires < now) powChallenges.delete(challenge);
   }
+}, 10 * 60 * 1000);
+
+function safeUploadExt(originalname) {
+  const ext = path.extname(originalname || '').toLowerCase();
+  return ext === '.bin' ? '.bin' : '';
+}
+function makeUploadName(originalname) {
+  return Date.now() + '_' + crypto.randomBytes(12).toString('hex') + safeUploadExt(originalname);
+}
+const chatStorage = multer.diskStorage({
+  destination: (_, __, cb) => cb(null, uploadsDir),
+  filename: (_, file, cb) => cb(null, makeUploadName(file.originalname)),
 });
-const upload = multer({
-  storage,
+const chatUpload = multer({
+  storage: chatStorage,
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_, file, cb) => {
+    if (!file.originalname.toLowerCase().endsWith('.bin')) return cb(new Error('Chat attachments must be encrypted .bin files'));
     if (file.mimetype.startsWith('video/')) return cb(new Error('Video not allowed'));
     cb(null, true);
-  }
+  },
 });
-
 const avatarStorage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, AVATARS),
-  filename: (_, file, cb) => {
-    const ext = '.webp';
-    cb(null, Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext);
-  }
+  destination: (_, __, cb) => cb(null, avatarsDir),
+  filename: (_, file, cb) => cb(null, Date.now() + '_' + crypto.randomBytes(8).toString('hex') + '.webp'),
 });
-const uploadAvatar = multer({
+const avatarUpload = multer({
   storage: avatarStorage,
-  limits: { fileSize: 5*1024*1024 },
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_, file, cb) => {
     if (!file.mimetype || !file.mimetype.startsWith('image/')) return cb(new Error('Only images allowed'));
     cb(null, true);
-  }
+  },
 });
 
-function signToken(dt) { return jwt.sign({ dt }, JWT_SECRET, { expiresIn: '30d' }); }
-
-function authMiddleware(req, res, next) {
-  const raw = req.cookies?.token || req.headers.authorization?.split(' ')[1];
-  if (!raw) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const { dt } = jwt.verify(raw, JWT_SECRET);
-    const device  = DB.getDeviceByToken(dt);
-    if (!device) return res.status(401).json({ error: 'Device not found' });
-    DB.touchDevice(dt);
-    req.device  = device;
-    req.account = DB.getAccountById(device.account_id);
-    req.rawToken = dt;
-    next();
-  } catch { res.status(401).json({ error: 'Bad token' }); }
+function signToken(deviceToken) {
+  return jwt.sign({ dt: deviceToken }, jwtSecret, { algorithm: 'HS256', expiresIn: '30d' });
 }
-
-const IS_SECURE = process.env.SECURE !== 'false';
+function verifyToken(raw) {
+  return jwt.verify(raw, jwtSecret, { algorithms: ['HS256'] });
+}
 function setCookie(res, token) {
   res.cookie('token', token, {
-    httpOnly: true, secure: IS_SECURE,
-    sameSite: IS_SECURE ? 'strict' : 'lax',
-    maxAge: 30*24*3600*1000
+    httpOnly: true,
+    secure: secureCookie,
+    sameSite: secureCookie ? 'strict' : 'lax',
+    maxAge: 30 * 24 * 3600 * 1000,
   });
 }
+function getToken(req) {
+  return req.cookies?.token || req.headers.authorization?.split(' ')[1];
+}
 
-const INLINE_SERVE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
-
-app.use('/uploads', authMiddleware, (req, res, next) => {
-  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
-  const rel  = req.path.replace(/^\/+/, '');
-  const safe = path.resolve(UPLOADS, '.' + (rel ? '/' + rel : ''));
-  if (!safe.startsWith(UPLOADS + path.sep) && safe !== UPLOADS) {
-    return res.status(403).json({ error: 'Forbidden' });
+function authMiddleware(req, res, next) {
+  const raw = getToken(req);
+  if (!raw) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const { dt } = verifyToken(raw);
+    const device = DB.getDeviceByToken(dt);
+    if (!device) return res.status(401).json({ error: 'Device not found' });
+    const account = DB.getAccountById(device.account_id);
+    if (!account) return res.status(401).json({ error: 'Account not found' });
+    DB.touchDevice(dt);
+    req.device = device;
+    req.account = account;
+    req.rawToken = dt;
+    next();
+  } catch (e) {
+    res.status(401).json({ error: 'Bad token' });
   }
+}
 
-  res.set('X-Content-Type-Options', 'nosniff');
+function deviceName(device) {
+  return device?.device_name || 'device';
+}
+function clientIp(req) {
+  return String(req.ip || req.socket?.remoteAddress || 'unknown');
+}
+function clientCountry(req) {
+  const headers = req.headers || {};
+  return String(headers['cf-ipcountry'] || headers['x-country-code'] || 'unknown').toUpperCase();
+}
 
-  if (rel.startsWith('avatars/')) {
-    return res.sendFile(safe, err => { if (err && !res.headersSent) res.status(404).json({ error: 'Not found' }); });
+const p256SpkiPrefix = Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex');
+function rawEcPublicKey(rawB64) {
+  const raw = Buffer.from(String(rawB64 || ''), 'base64');
+  if (raw.length !== 65 || raw[0] !== 0x04) return null;
+  try {
+    return crypto.createPublicKey({
+      key: Buffer.concat([p256SpkiPrefix, raw]),
+      format: 'der',
+      type: 'spki',
+    });
+  } catch (e) {
+    return null;
   }
-
-  const fileUrl = '/uploads/' + rel;
-  const msg = DB.db.prepare(`
-    SELECT m.id, m.file_type, c.initiator_id, c.peer_id
-    FROM messages m JOIN chats c ON c.id = m.chat_id
-    WHERE m.file_path = ? LIMIT 1
-  `).get(fileUrl);
-  if (!msg || (msg.initiator_id !== req.account.id && msg.peer_id !== req.account.id)) {
-    return res.status(403).json({ error: 'Forbidden' });
+}
+function validEcdhPublicKey(rawB64) {
+  const raw = Buffer.from(String(rawB64 || ''), 'base64');
+  if (raw.length !== 65 || raw[0] !== 0x04) return false;
+  try {
+    crypto.ECDH.convertKey(raw, 'prime256v1', null, null, 'uncompressed');
+    return true;
+  } catch (e) {
+    return false;
   }
+}
+function p1363ToDer(signature) {
+  if (!signature || signature.length !== 64) return signature;
+  const integer = bytes => {
+    let start = 0;
+    while (start < bytes.length - 1 && bytes[start] === 0) start++;
+    const value = bytes.slice(start);
+    const needsZero = value[0] & 0x80;
+    const content = needsZero ? Buffer.concat([Buffer.from([0]), value]) : value;
+    return Buffer.concat([Buffer.from([0x02, content.length]), content]);
+  };
+  const r = integer(signature.slice(0, 32));
+  const sPart = integer(signature.slice(32));
+  const body = Buffer.concat([r, sPart]);
+  return Buffer.concat([Buffer.from([0x30, body.length]), body]);
+}
 
-  const ext = path.extname(safe).toLowerCase();
-  if (INLINE_SERVE_EXTS.has(ext)) {
-    return res.sendFile(safe, err => { if (err && !res.headersSent) res.status(404).json({ error: 'Not found' }); });
+function deviceSignatureMessage(deviceId, rawB64) {
+  return Buffer.concat([
+    Buffer.from('taupe-device-key'),
+    Buffer.from([0]),
+    Buffer.from(String(deviceId)),
+    Buffer.from([0]),
+    Buffer.from(String(rawB64), 'base64'),
+  ]);
+}
+function verifyDeviceSignature(identityPubB64, deviceId, publicKeyB64, signatureB64) {
+  const key = rawEcPublicKey(identityPubB64);
+  if (!key) return false;
+  const sig = Buffer.from(String(signatureB64 || ''), 'base64');
+  if (!sig.length || sig.length > 256) return false;
+  const message = deviceSignatureMessage(deviceId, publicKeyB64);
+  for (const encoding of ['ieee-p1363', 'der']) {
+    try {
+      if (crypto.verify('sha256', message, { key, dsaEncoding: encoding }, sig)) return true;
+    } catch (e) {}
   }
+  return false;
+}
+function keyRequestCode(identityPubB64, devicePubB64) {
+  const first = Buffer.from(String(identityPubB64 || ''), 'base64');
+  const second = Buffer.from(String(devicePubB64 || ''), 'base64');
+  const sorted = Buffer.compare(first, second) <= 0
+    ? Buffer.concat([first, second])
+    : Buffer.concat([second, first]);
+  const out = crypto.hkdfSync('sha256', sorted, Buffer.from('taupe-sync-code'), Buffer.from('taupe-sync-code'), 3);
+  return Array.from(Buffer.from(out)).map(b => String(b % 100).padStart(2, '0')).join('');
+}
+function isPublicIp(address) {
+  try {
+    let parsed = ipaddr.parse(String(address));
+    if (parsed.kind() === 'ipv6' && parsed.isIPv4MappedAddress()) parsed = parsed.toIPv4Address();
+    return parsed.range() === 'unicast';
+  } catch (e) {
+    return false;
+  }
+}
+async function resolvePushAddresses(hostname) {
+  const addrs = await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!addrs.length) throw new Error('No addresses');
+  for (const addr of addrs) {
+    if (!isPublicIp(addr.address)) throw new Error('Private address');
+  }
+  return addrs;
+}
+async function validatePushEndpoint(rawUrl) {
+  let url;
+  try { url = new URL(rawUrl); } catch (e) { return null; }
+  if (url.protocol !== 'https:') return null;
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return null;
+  if (pushAllowHosts.length && !pushAllowHosts.some(h => host === h || host.endsWith('.' + h))) return null;
+  let addrs;
+  if (net.isIP(host)) {
+    if (!isPublicIp(host)) return null;
+    addrs = [{ address: host, family: net.isIP(host) === 6 ? 6 : 4 }];
+  } else {
+    try { addrs = await resolvePushAddresses(host); } catch (e) { return null; }
+  }
+  return { url, address: addrs[0].address, family: addrs[0].family };
+}
+function pushRequest(endpoint, payload) {
+  return new Promise(resolve => {
+    const body = Buffer.from(JSON.stringify(payload));
+    const req = https.request({
+      protocol: 'https:',
+      hostname: endpoint.url.hostname,
+      port: endpoint.url.port || 443,
+      path: endpoint.url.pathname + endpoint.url.search,
+      method: 'POST',
+      servername: endpoint.url.hostname,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': body.length,
+      },
+      lookup: (hostname, options, callback) => {
+        callback(null, endpoint.address, endpoint.family);
+      },
+      timeout: 5000,
+    }, res => {
+      let size = 0;
+      res.on('data', chunk => {
+        size += chunk.length;
+        if (size > 16384) req.destroy();
+      });
+      res.on('end', () => resolve(true));
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(false));
+    req.end(body);
+  });
+}
+async function pushWakeup(accountId, chatUid) {
+  if (online.has(accountId)) return;
+  const devices = DB.getPushableDevices(accountId);
+  for (const device of devices) {
+    try {
+      if (!device.push_endpoint) continue;
+      const endpoint = await validatePushEndpoint(device.push_endpoint);
+      if (!endpoint) continue;
+      await pushRequest(endpoint, { t: 'new_message', chatUid });
+    } catch (e) {
+      console.error('[push] failed for device', device.id, e.message);
+    }
+  }
+}
 
-  res.set('Content-Type', 'application/octet-stream');
-  res.set('Content-Disposition', `attachment; filename="${path.basename(safe).replace(/[^\x20-\x7e]/g, '_')}"`);
-  res.set('Content-Security-Policy', 'sandbox');
-  res.sendFile(safe, err => { if (err && !res.headersSent) res.status(404).json({ error: 'Not found' }); });
+function isValidChatAttachmentUrl(value) {
+  return typeof value === 'string' && /^\/uploads\/[A-Za-z0-9][A-Za-z0-9._-]*\.bin$/.test(value) && !value.includes('..');
+}
+function validateChatContent(content) {
+  return typeof content === 'string' && content.startsWith('e2e:') && content.length <= 65536;
+}
+
+function checkLoginBlock(ip, account) {
+  const keys = [`login:ip:${ip}`];
+  if (account) keys.push(`login:acct:${account.id}`);
+  for (const key of keys) {
+    if (DB.isRateLimited(key)) return true;
+  }
+  return false;
+}
+function recordLoginFailure(ip, account, number) {
+  DB.recordFailure(`login:ip:${ip}`);
+  if (account) DB.recordFailure(`login:acct:${account.id}`);
+  else DB.recordFailure(`login:acct:${crypto.createHash('sha256').update(String(number)).digest('hex')}`);
+}
+function accountPublic(account) {
+  return {
+    accountId: account.id,
+    chatNumber: account.chat_number,
+    username: account.username,
+    usernamePublic: account.username_public,
+    avatarPath: account.avatar_path,
+    showPresence: account.show_presence === 1,
+    gifEnabled: account.gif_enabled === 1,
+    identityKey: account.identity_key || null,
+  };
+}
+
+function disconnectDevice(accountId, deviceId) {
+  for (const [, socket] of io.of('/').sockets) {
+    if (socket.accountId === accountId && socket.deviceId === deviceId) socket.disconnect(true);
+  }
+}
+function disconnectAccount(accountId) {
+  for (const [, socket] of io.of('/').sockets) {
+    if (socket.accountId === accountId) socket.disconnect(true);
+  }
+}
+
+app.get('/api/register/challenge', registerLimiter, (req, res) => {
+  res.json({ challenge: issueChallenge(), difficulty: powDifficulty });
 });
 
 app.post('/api/register', registerLimiter, (req, res) => {
   try {
-    const acct = DB.createAccount();
-    const dt = crypto.randomBytes(32).toString('hex');
-    const dName = DB.addDevice(acct.id, dt);
-    setCookie(res, signToken(dt));
-    res.json({ accountNumber: acct.number, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
+    const { challenge, nonce, invite } = req.body || {};
+    if (registrationInvite && String(invite || '') !== registrationInvite) {
+      return res.status(403).json({ error: 'Invite required' });
+    }
+    if (!verifyChallenge(challenge, nonce)) {
+      return res.status(400).json({ error: 'Registration proof invalid or expired' });
+    }
+    const account = DB.createAccount();
+    const token = crypto.randomBytes(32).toString('hex');
+    const created = DB.addDevice(account.id, token);
+    setCookie(res, signToken(token));
+    res.json({
+      accountNumber: account.number,
+      chatNumber: account.chat_number,
+      accountId: account.id,
+      deviceId: created.id,
+      deviceName: created.name,
+    });
   } catch (e) {
     console.error('[register]', e);
     res.status(500).json({ error: 'Failed to create account' });
   }
 });
-app.post('/api/login', (req, res) => {
-  const ip = req.ip;
-  const { blocked, remaining } = checkLoginRateLimit(ip);
-  if (blocked) return res.status(429).json({ error: `Too many attempts. Try in ${remaining} min.` });
 
-  const { number } = req.body;
-  const clean = (number||'').replace(/\D/g,'');
+app.post('/api/login', loginLimiter, (req, res) => {
+  const ip = clientIp(req);
+  const { number } = req.body || {};
+  const clean = String(number || '').replace(/\D/g, '');
   if (clean.length !== 16) return res.status(400).json({ error: 'Enter your 16-digit private number' });
-
-  const acct = DB.getAccountByNumber(clean);
-  if (!acct) { recordLoginFail(ip); return res.status(404).json({ error: 'Account not found' }); }
-  if (DB.countDevices(acct.id) >= 5) return res.status(400).json({ error: 'Max 5 devices. Kick one first.' });
-
-  recordLoginSuccess(ip);
-  const dt = crypto.randomBytes(32).toString('hex');
-  const dName = DB.addDevice(acct.id, dt);
-  setCookie(res, signToken(dt));
-
+  const account = DB.getAccountByNumber(clean);
+  if (checkLoginBlock(ip, account)) return res.status(429).json({ error: 'Too many attempts, try later' });
+  if (!account) {
+    recordLoginFailure(ip, null, clean);
+    return res.status(404).json({ error: 'Account not found' });
+  }
+  if (DB.countDevices(account.id) >= 5) return res.status(400).json({ error: 'Max 5 devices. Kick one first.' });
+  const token = crypto.randomBytes(32).toString('hex');
+  const created = DB.addDevice(account.id, token);
+  setCookie(res, signToken(token));
   try {
-    const sysMsg = DB.addSystemMessage(acct.id, 'device_login', { deviceName: dName });
-    if (sysMsg) io.to(`user:${acct.id}`).emit('sys:new', { message: sysMsg });
-  } catch (e) { console.error('[sysmsg]', e.message); }
-
-  res.json({ accountNumber: clean, chatNumber: acct.chat_number, accountId: acct.id, deviceName: dName });
+    const sys = DB.addSystemMessage(account.id, 'device_login', {
+      deviceName: created.name,
+      ip,
+      country: clientCountry(req),
+      time: Math.floor(Date.now() / 1000),
+    });
+    if (sys) io.to(`user:${account.id}`).emit('sys:new', { message: sys });
+  } catch (e) {}
+  res.json({
+    accountNumber: clean,
+    chatNumber: account.chat_number,
+    accountId: account.id,
+    deviceId: created.id,
+    deviceName: created.name,
+    identityKey: account.identity_key || null,
+  });
 });
 
 app.post('/api/login/devices', loginInfoLimiter, (req, res) => {
-  const { number } = req.body;
-  const clean = (number||'').replace(/\D/g,'');
+  const ip = clientIp(req);
+  const { number } = req.body || {};
+  const clean = String(number || '').replace(/\D/g, '');
   if (clean.length !== 16) return res.status(400).json({ error: 'Invalid number' });
-
-  const acct = DB.getAccountByNumber(clean);
-  if (!acct) return res.status(404).json({ error: 'Account not found' });
-
-  const devices = DB.getDevices(acct.id);
-  res.json({ devices });
+  const account = DB.getAccountByNumber(clean);
+  if (!account) {
+    recordLoginFailure(ip, null, clean);
+    return res.status(404).json({ error: 'Account not found' });
+  }
+  if (checkLoginBlock(ip, account)) return res.status(429).json({ error: 'Too many attempts, try later' });
+  res.json({ devices: DB.getDevices(account.id).map(d => ({
+    id: d.id, device_name: d.device_name, last_seen: d.last_seen, created_at: d.created_at,
+  })) });
 });
 
 app.post('/api/login/kick', loginInfoLimiter, (req, res) => {
-  const { number, deviceId } = req.body;
-  const clean = (number||'').replace(/\D/g,'');
+  const ip = clientIp(req);
+  const { number, deviceId } = req.body || {};
+  const clean = String(number || '').replace(/\D/g, '');
   if (clean.length !== 16) return res.status(400).json({ error: 'Invalid number' });
-
-  const acct = DB.getAccountByNumber(clean);
-  if (!acct) return res.status(404).json({ error: 'Account not found' });
-
-  DB.kickDevice(parseInt(deviceId), acct.id);
-  res.json({ ok: true, count: DB.countDevices(acct.id) });
-});
-
-app.post('/api/login/username', (req, res) => {
-  const { username } = req.body;
-  if (!username) return res.status(400).json({ error: 'No username' });
-  const acct = DB.getAccountByUsername(username);
-  if (!acct) return res.status(404).json({ error: 'Username not found or private' });
-
-  res.json({ chatNumber: acct.chat_number });
+  const account = DB.getAccountByNumber(clean);
+  if (!account) {
+    recordLoginFailure(ip, null, clean);
+    return res.status(404).json({ error: 'Account not found' });
+  }
+  if (checkLoginBlock(ip, account)) return res.status(429).json({ error: 'Too many attempts, try later' });
+  const id = parseInt(deviceId, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid device' });
+  DB.kickDevice(id, account.id);
+  disconnectDevice(account.id, id);
+  res.json({ ok: true, count: DB.countDevices(account.id) });
 });
 
 app.get('/api/me', authMiddleware, (req, res) => {
-  const devices = DB.getDevices(req.account.id);
-  const aliases = DB.getAliases(req.account.id);
+  const devices = DB.getDevices(req.account.id).map(d => ({
+    id: d.id,
+    device_name: d.device_name,
+    last_seen: d.last_seen,
+    created_at: d.created_at,
+    public_key: d.public_key,
+    identity_key: d.identity_key,
+    sig: d.key_sig,
+    approved: d.key_approved === 1,
+  }));
   res.json({
-    chatNumber:    req.account.chat_number,
-    accountId:     req.account.id,
-    username:      req.account.username,
-    usernamePublic: req.account.username_public,
-    avatarPath:    req.account.avatar_path,
-    showPresence:  req.account.show_presence === 0 ? false : true,
-    deviceName:    req.device.device_name,
-    deviceId:      req.device.id,
-    devices, aliases,
+    ...accountPublic(req.account),
+    deviceName: req.device.device_name,
+    deviceId: req.device.id,
+    deviceApproved: req.device.key_approved === 1,
+    devices,
+    aliases: DB.getAliases(req.account.id),
   });
 });
 
 app.post('/api/logout', authMiddleware, (req, res) => {
   DB.kickDevice(req.device.id, req.account.id);
+  disconnectDevice(req.account.id, req.device.id);
   res.clearCookie('token');
   res.json({ ok: true });
 });
 
 app.delete('/api/devices/:id', authMiddleware, (req, res) => {
-  DB.kickDevice(parseInt(req.params.id), req.account.id);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid device' });
+  DB.kickDevice(id, req.account.id);
+  disconnectDevice(req.account.id, id);
   res.json({ ok: true });
 });
 
 app.post('/api/devices/kick-all', authMiddleware, (req, res) => {
   DB.kickAllDevicesExcept(req.account.id, req.rawToken);
+  for (const [, socket] of io.of('/').sockets) {
+    if (socket.accountId === req.account.id && socket.deviceId !== req.device.id) socket.disconnect(true);
+  }
   res.json({ ok: true });
 });
 
 app.delete('/api/account', authMiddleware, (req, res) => {
+  const number = String(req.body?.number || '').replace(/\D/g, '');
+  if (number.length !== 16) return res.status(400).json({ error: 'Enter your 16-digit number to confirm' });
+  const account = DB.getAccountByNumber(number);
+  if (!account || account.id !== req.account.id) return res.status(403).json({ error: 'Invalid number' });
+  disconnectAccount(req.account.id);
   DB.deleteAccount(req.account.id);
   res.clearCookie('token');
   res.json({ ok: true });
 });
 
 app.post('/api/me/pubkey', authMiddleware, (req, res) => {
-  const { publicKey } = req.body;
-  if (!publicKey) return res.status(400).json({ error: 'Missing publicKey' });
-  try {
-    DB.db.prepare('UPDATE devices SET public_key=? WHERE id=?').run(publicKey, req.device.id);
-    DB.db.prepare('UPDATE accounts SET public_key=? WHERE id=?').run(publicKey, req.account.id);
+  const body = req.body || {};
+  const publicKey = String(body.publicKey || body.deviceKey || '');
+  const identityPub = String(body.identityPub || body.identityKey || '');
+  const keySig = String(body.keySig || body.signature || '');
+  if (!validEcdhPublicKey(publicKey)) return res.status(400).json({ error: 'Invalid device key' });
+  if (!rawEcPublicKey(identityPub)) return res.status(400).json({ error: 'Invalid identity key' });
+  if (!keySig) return res.status(400).json({ error: 'Missing key signature' });
+  if (!verifyDeviceSignature(identityPub, req.device.id, publicKey, keySig)) {
+    return res.status(400).json({ error: 'Bad device signature' });
+  }
 
+  const storedIdentity = DB.getAccountIdentity(req.account.id);
+  const identityMatches = !storedIdentity || storedIdentity === identityPub;
+  if (!storedIdentity && !DB.setAccountIdentity(req.account.id, identityPub)) {
+    return res.status(409).json({ error: 'Identity already set', code: 'identity_mismatch' });
+  }
+
+  const storedSignature = p1363ToDer(Buffer.from(keySig, 'base64')).toString('base64');
+  DB.setDeviceKey(req.device.id, req.account.id, publicKey, identityPub, storedSignature);
+  let approved = req.device.key_approved === 1;
+
+  if (!approved && !storedIdentity) {
+    DB.approveDevice(req.device.id, req.account.id, req.device.id);
+    approved = true;
+  }
+
+  let request = null;
+  if (!approved && identityMatches) {
+    const approvedRequest = DB.getSystemMessages(req.account.id).find(m =>
+      m.type === 'key_request' && m.status === 'approved' && Number(m.payload?.deviceId) === req.device.id
+    );
+    if (approvedRequest) {
+      DB.approveDevice(req.device.id, req.account.id, approvedRequest.payload?.approvedBy || req.device.id);
+      DB.completeKeyRequest(req.account.id, approvedRequest.id);
+      approved = true;
+    }
+  }
+
+  if (!approved) {
+    request = ensureKeyRequest(req, publicKey, identityPub, storedSignature);
+  } else {
     const chats = DB.getChatsForAccount(req.account.id);
-    chats.forEach(c => {
-      io.to(roomForChat(c.uid)).emit('peer:key_update', { chatUid: c.uid });
-    });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[pubkey]', e.message);
-    res.status(500).json({ error: e.message });
+    for (const chat of chats) {
+      io.to(roomForChat(chat.uid)).emit('peer:key_update', { chatUid: chat.uid });
+    }
   }
+
+  res.json({
+    ok: true,
+    approved,
+    identityKey: storedIdentity || identityPub,
+    requiresIdentity: !identityMatches,
+    request,
+  });
 });
 
-app.post('/api/me/push', authMiddleware, (req, res) => {
-  const { endpoint, provider } = req.body;
-  if (endpoint && typeof endpoint !== 'string') {
-    return res.status(400).json({ error: 'Invalid endpoint' });
+function ensureKeyRequest(req, publicKey, identityPub, keySig) {
+  const existing = DB.getSystemMessages(req.account.id).find(m =>
+    m.type === 'key_request' && ['pending', 'approved'].includes(m.status) && Number(m.payload?.deviceId) === req.device.id
+  );
+  if (existing) return existing;
+  const now = Math.floor(Date.now() / 1000);
+  const accountIdentity = DB.getAccountIdentity(req.account.id) || identityPub;
+  const payload = {
+    deviceId: req.device.id,
+    deviceName: deviceName(req.device),
+    publicKey,
+    identityPub,
+    keySig,
+    code: keyRequestCode(accountIdentity, publicKey),
+    ip: clientIp(req),
+    country: clientCountry(req),
+    createdAt: now,
+    expiresAt: now + 600,
+  };
+  const message = DB.addSystemMessage(req.account.id, 'key_request', payload, 'pending');
+  if (message) {
+    io.to(`user:${req.account.id}`).emit('sys:new', { message });
+    for (const [, socket] of io.of('/').sockets) {
+      if (socket.accountId === req.account.id && socket.deviceId !== req.device.id) {
+        socket.emit('key:request', { request: message });
+      }
+    }
   }
-  if (endpoint) {
-    validatePushEndpoint(endpoint)
-      .then(ok => {
-        if (!ok) return res.status(400).json({ error: 'Endpoint must be a public https:// URL' });
-        try {
-          DB.setPushEndpoint(req.device.id, req.account.id, endpoint, provider || null);
-          res.json({ ok: true });
-        } catch (e) {
-          console.error('[push register]', e.message);
-          res.status(500).json({ error: e.message });
-        }
-      })
-      .catch(() => res.status(400).json({ error: 'Endpoint validation failed' }));
-    return;
-  }
-  try {
-    DB.setPushEndpoint(req.device.id, req.account.id, endpoint || null, provider || null);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[push register]', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
+  return message;
+}
 
 app.get('/api/pubkey/:chatNumber', authMiddleware, (req, res) => {
-  try {
-    const acct = DB.getAccountByChatNumber(req.params.chatNumber.replace(/-/g, ''));
-    if (!acct) return res.status(404).json({ error: 'Not found' });
-    const devices = DB.db.prepare(
-      'SELECT id, device_name, public_key FROM devices WHERE account_id=? AND public_key IS NOT NULL'
-    ).all(acct.id);
-    res.json({
-      publicKey:  acct.public_key || null,
-      publicKeys: devices.map(d => ({ deviceId: d.id, deviceName: d.device_name, key: d.public_key })),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  const peer = DB.getAccountByChatNumber(req.params.chatNumber);
+  if (!peer || peer.id === req.account.id) return res.status(404).json({ error: 'Not available' });
+  if (DB.isBlocked(peer.id, req.account.id) || DB.isBlocked(req.account.id, peer.id)) {
+    return res.status(404).json({ error: 'Not available' });
   }
+  if (!DB.getChatUidBetween(req.account.id, peer.id)) return res.status(404).json({ error: 'Not available' });
+  const devices = DB.getApprovedDevices(peer.id);
+  res.json({
+    identityKey: peer.identity_key || null,
+    publicKeys: devices.map(d => ({
+      deviceId: d.id,
+      deviceName: d.device_name,
+      key: d.public_key,
+      sig: d.key_sig,
+    })),
+  });
 });
 
 app.patch('/api/me/username', authMiddleware, (req, res) => {
-  let { username, isPublic } = req.body;
+  let { username, isPublic } = req.body || {};
   if (username) {
-    if (!/^[a-zA-Z0-9_]{3,24}$/.test(username))
+    if (!/^[a-zA-Z0-9_]{3,24}$/.test(username)) {
       return res.status(400).json({ error: 'Username: 3-24 chars, letters/numbers/underscore' });
+    }
     username = username.toLowerCase();
-    const existing = DB.db.prepare(
-      'SELECT id FROM accounts WHERE LOWER(username)=LOWER(?) AND id!=?'
-    ).get(username, req.account.id);
+    const existing = DB.db.prepare('SELECT id FROM accounts WHERE LOWER(username)=LOWER(?) AND id!=?').get(username, req.account.id);
     if (existing) return res.status(409).json({ error: 'Username taken' });
   }
   DB.setUsername(req.account.id, username || null, isPublic);
-
   const publicUsername = isPublic ? (username || null) : null;
-
   const chats = DB.getChatsForAccount(req.account.id);
-  chats.forEach(c => {
-    io.to(roomForChat(c.uid)).emit('peer:profile_update', {
-      chatUid: c.uid,
+  for (const chat of chats) {
+    io.to(roomForChat(chat.uid)).emit('peer:profile_update', {
+      chatUid: chat.uid,
       accountId: req.account.id,
       username: publicUsername,
       isPublic: isPublic ? 1 : 0,
-      avatarPath: req.account.avatar_path
+      avatarPath: req.account.avatar_path,
     });
-  });
-
+  }
   res.json({ ok: true, username: username || null });
 });
 
 app.patch('/api/me/presence', authMiddleware, (req, res) => {
-  const { show } = req.body;
-  try {
-    DB.db.prepare('UPDATE accounts SET show_presence=? WHERE id=?').run(show ? 1 : 0, req.account.id);
-    broadcastPresence(req.account.id);
-    res.json({ ok: true, showPresence: !!show });
-  } catch (e) {
-    console.error('[presence setting]', e.message);
-    res.status(500).json({ error: e.message });
-  }
+  const show = req.body?.show === true;
+  DB.db.prepare('UPDATE accounts SET show_presence=? WHERE id=?').run(show ? 1 : 0, req.account.id);
+  broadcastPresence(req.account.id);
+  res.json({ ok: true, showPresence: show });
 });
 
-app.post('/api/me/avatar', authMiddleware, uploadAvatar.single('avatar'), async (req, res) => {
+app.patch('/api/me/gif', authMiddleware, (req, res) => {
+  const enabled = req.body?.enabled === true;
+  DB.setGifEnabled(req.account.id, enabled);
+  res.json({ ok: true, gifEnabled: enabled });
+});
+
+app.post('/api/me/avatar', authMiddleware, uploadLimiter, avatarUpload.single('avatar'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
-  const outPath = req.file.path;
-
-  const notifyAvatarUpdate = (accountId, rel) => {
-    const chats = DB.getChatsForAccount(accountId);
-    chats.forEach(c => {
-      io.to(roomForChat(c.uid)).emit('peer:profile_update', {
-        chatUid: c.uid,
-        accountId: accountId,
-        username: req.account.username,
+  const input = req.file.path;
+  if (!sharp) {
+    try { fs.unlinkSync(input); } catch (e) {}
+    return res.status(503).json({ error: 'Image processing unavailable, refusing to store unstripped metadata' });
+  }
+  try {
+    const output = input.replace(/\.webp$/, '_out.webp');
+    await sharp(input).resize(128, 128, { fit: 'cover' }).webp({ quality: 85 }).toFile(output);
+    try { fs.unlinkSync(input); } catch (e) {}
+    const rel = '/uploads/avatars/' + path.basename(output);
+    const old = req.account.avatar_path;
+    DB.setAvatar(req.account.id, rel);
+    if (old) DB.unlinkUploadIfUnreferenced(old, -1);
+    const chats = DB.getChatsForAccount(req.account.id);
+    for (const chat of chats) {
+      io.to(roomForChat(chat.uid)).emit('peer:profile_update', {
+        chatUid: chat.uid,
+        accountId: req.account.id,
+        username: req.account.username_public ? req.account.username : null,
         isPublic: req.account.username_public,
-        avatarPath: rel
+        avatarPath: rel,
       });
-    });
-  };
-
-  if (!validateFileMagic(outPath, req.file.mimetype)) {
-    try { fs.unlinkSync(outPath); } catch {}
-    return res.status(400).json({ error: 'Invalid image format' });
-  }
-
-  if (sharp) {
-    try {
-      let pipeline = sharp(outPath);
-      if (req.body.crop) {
-        try {
-          const { x, y, w, h } = JSON.parse(req.body.crop);
-          pipeline = pipeline.extract({ left: parseInt(x), top: parseInt(y), width: parseInt(w), height: parseInt(h) });
-        } catch (e) { console.warn('[Avatar] Invalid crop data'); }
-      }
-      await pipeline.resize(128, 128, { fit: 'cover' }).webp({ quality: 85 }).toFile(outPath + '.webp');
-      fs.unlinkSync(outPath);
-      const rel = '/uploads/avatars/' + path.basename(outPath + '.webp');
-      DB.setAvatar(req.account.id, rel);
-      notifyAvatarUpdate(req.account.id, rel);
-      return res.json({ avatarPath: rel });
-    } catch (e) {
-      console.error('[Avatar] Sharp processing failed:', e.message);
-      try { fs.unlinkSync(outPath); } catch {}
-      return res.status(500).json({ error: 'Image processing failed' });
     }
+    res.json({ avatarPath: rel });
+  } catch (e) {
+    try { fs.unlinkSync(input); } catch (e2) {}
+    console.error('[avatar]', e.message);
+    res.status(500).json({ error: 'Image processing failed' });
   }
-
-  const rel = '/uploads/avatars/' + path.basename(outPath);
-  DB.setAvatar(req.account.id, rel);
-  notifyAvatarUpdate(req.account.id, rel);
-  res.json({ avatarPath: rel });
 });
 
 app.get('/api/system/messages', authMiddleware, (req, res) => {
-  const messages = DB.getSystemMessages(req.account.id);
-  res.json({ messages, unread: DB.unreadSystemCount(req.account.id) });
+  res.json({
+    messages: DB.getSystemMessages(req.account.id),
+    unread: DB.unreadSystemCount(req.account.id),
+  });
 });
 
 app.post('/api/system/read', authMiddleware, (req, res) => {
-  const id = req.body && req.body.id != null ? parseInt(req.body.id) : null;
+  const id = req.body && req.body.id != null ? parseInt(req.body.id, 10) : null;
   DB.markSystemMessagesRead(req.account.id, Number.isInteger(id) ? id : null);
   res.json({ ok: true, unread: DB.unreadSystemCount(req.account.id) });
 });
 
 app.post('/api/system/:id/resolve', authMiddleware, (req, res) => {
-  const id = parseInt(req.params.id);
-  const action = req.body && req.body.action;
+  const id = parseInt(req.params.id, 10);
+  const action = req.body?.action;
   if (!Number.isInteger(id) || !['approved', 'declined'].includes(action)) {
     return res.status(400).json({ error: 'Bad request' });
   }
   const existing = DB.getSystemMessage(req.account.id, id);
-  if (existing && existing.type === 'key_request' && action === 'approved') {
-    const sameRow = Number(existing.payload && existing.payload.deviceId) === Number(req.device.id);
-    const reqPub = String(existing.payload && existing.payload.publicKey || '');
-    const myPub = String(req.device.public_key || '');
-    const sameIdentity = !!reqPub && !!myPub && reqPub === myPub;
-    if (sameRow || sameIdentity) {
-      return res.status(403).json({ error: 'Approve this request on another device' });
-    }
+  if (!existing || existing.type !== 'key_request' || existing.status !== 'pending') {
+    return res.status(404).json({ error: 'Not found or already resolved' });
   }
-  const updated = DB.resolveSystemMessage(req.account.id, id, action);
-  if (!updated) return res.status(404).json({ error: 'Not found or already resolved' });
+  if (existing.payload?.expiresAt && Number(existing.payload.expiresAt) <= Math.floor(Date.now() / 1000)) {
+    DB.resolveSystemMessage(req.account.id, id, 'expired');
+    return res.status(410).json({ error: 'Request expired' });
+  }
+  const targetDeviceId = Number(existing.payload?.deviceId);
+  if (!Number.isInteger(targetDeviceId)) return res.status(400).json({ error: 'Bad request' });
+  if (targetDeviceId === req.device.id) {
+    return res.status(403).json({ error: 'Approve this request on another device' });
+  }
+  if (!req.device.key_approved) return res.status(403).json({ error: 'This device is not approved' });
+  const target = DB.getDeviceById(targetDeviceId);
+  if (!target || target.account_id !== req.account.id) return res.status(404).json({ error: 'Device not found' });
+
+  if (action === 'approved') {
+    const identity = DB.getAccountIdentity(req.account.id);
+    const code = keyRequestCode(identity, target.public_key || existing.payload?.publicKey);
+    if (String(code) !== String(existing.payload?.code)) {
+      return res.status(400).json({ error: 'Request code mismatch' });
+    }
+    const approved = DB.resolveSystemMessage(req.account.id, id, 'approved');
+    if (approved) {
+      DB.db.prepare("UPDATE system_messages SET payload=json_set(payload,'$.approvedBy',?) WHERE id=?")
+        .run(req.device.id, id);
+    }
+    for (const [, socket] of io.of('/').sockets) {
+      if (socket.accountId === req.account.id && socket.deviceId === target.id) {
+        socket.emit('key:approved', { deviceId: target.id, requestId: id });
+      }
+    }
+  } else {
+    DB.resolveSystemMessage(req.account.id, id, 'declined');
+  }
   io.to(`user:${req.account.id}`).emit('sys:updated', { id, status: action });
-  res.json({ ok: true, message: updated });
+  res.json({ ok: true });
 });
 
 app.get('/api/aliases', authMiddleware, (req, res) => {
   res.json(DB.getAliases(req.account.id));
 });
 app.put('/api/aliases', authMiddleware, (req, res) => {
-  const { targetNumber, alias } = req.body;
-  if (!targetNumber || !alias) return res.status(400).json({ error: 'Missing fields' });
-  DB.setAlias(req.account.id, targetNumber.replace(/-/g,''), alias);
+  const { targetNumber, alias } = req.body || {};
+  if (!targetNumber || !alias || String(alias).length > 1024) return res.status(400).json({ error: 'Missing fields' });
+  DB.setAlias(req.account.id, String(targetNumber).replace(/-/g, ''), alias);
   res.json({ ok: true });
 });
 app.delete('/api/aliases/:number', authMiddleware, (req, res) => {
@@ -590,805 +874,797 @@ app.delete('/api/aliases/:number', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-const GIPHY_API_KEY = process.env.GIPHY_KEY || '';
-const GIPHY_CONFIGURED = !!process.env.GIPHY_KEY;
+app.get('/api/blocks', authMiddleware, (req, res) => {
+  res.json(DB.getBlocks(req.account.id));
+});
+app.post('/api/blocks', authMiddleware, (req, res) => {
+  const peer = DB.getAccountByChatNumber(req.body?.number || '');
+  if (!peer) return res.status(404).json({ error: 'Not found' });
+  if (peer.id === req.account.id) return res.status(400).json({ error: 'Cannot block yourself' });
+  DB.blockAccount(req.account.id, peer.id);
+  res.json({ ok: true });
+});
+app.delete('/api/blocks/:number', authMiddleware, (req, res) => {
+  const peer = DB.getAccountByChatNumber(req.params.number || '');
+  if (!peer) return res.status(404).json({ error: 'Not found' });
+  DB.unblockAccount(req.account.id, peer.id);
+  res.json({ ok: true });
+});
 
-const GIPHY_MEDIA_RE = /^https:\/\/([a-z0-9-]+\.)*giphy\.com\/[^\s"'<>]+$/i;
-
+const giphyKey = process.env.giphy_key || '';
+const giphyMediaRe = /^https:\/\/([a-z0-9-]+\.)*giphy\.com\/[^\s"'<>]+$/i;
 app.get('/api/gifs', authMiddleware, gifLimiter, async (req, res) => {
-  if (!GIPHY_CONFIGURED) return res.json({ gifs: [] });
-  const q = req.query.q || 'speed';
-  const offset = parseInt(req.query.offset) || 0;
-  const url = `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(GIPHY_API_KEY)}&q=${encodeURIComponent(q)}&limit=30&rating=pg-13&offset=${offset}`;
-
+  if (req.account.gif_enabled !== 1) return res.status(403).json({ error: 'GIF search is opt-in in settings' });
+  if (!giphyKey) return res.json({ gifs: [] });
+  const q = String(req.query.q || 'speed').slice(0, 100);
+  const offset = parseInt(req.query.offset, 10) || 0;
+  const url = `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(giphyKey)}&q=${encodeURIComponent(q)}&limit=30&rating=pg-13&offset=${offset}`;
   try {
     const apiRes = await fetch(url, { signal: AbortSignal.timeout(8000) });
     const parsed = await apiRes.json();
-
-    if (parsed.meta && parsed.meta.status !== 200) {
-      console.error('[giphy Error]', parsed.meta.msg, 'status:', parsed.meta.status);
-      return res.status(500).json({ error: parsed.meta.msg || 'giphy API error' });
-    }
-
+    if (parsed.meta && parsed.meta.status !== 200) return res.status(502).json({ error: 'GIF provider error' });
     const gifs = (parsed.data || [])
       .map(g => g.images?.fixed_height_small?.url)
-      .filter(u => u && GIPHY_MEDIA_RE.test(u))
+      .filter(u => u && giphyMediaRe.test(u))
       .map(u => '/api/gifs/media?u=' + encodeURIComponent(u));
     res.json({ gifs });
   } catch (e) {
-    console.error('[giphy request error]', e.message);
-    res.status(500).json({ error: e.message });
+    console.error('[giphy]', e.message);
+    res.status(502).json({ error: 'GIF provider error: ' + e.message });
   }
 });
 
 app.get('/api/gifs/media', authMiddleware, gifLimiter, async (req, res) => {
-  const u = String(req.query.u || '');
-  if (!GIPHY_MEDIA_RE.test(u)) return res.status(400).json({ error: 'Invalid media URL' });
-  const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), 10000);
+  if (req.account.gif_enabled !== 1) return res.status(403).json({ error: 'GIF search is opt-in in settings' });
+  const url = String(req.query.u || '');
+  if (!giphyMediaRe.test(url)) return res.status(400).json({ error: 'Invalid media URL' });
   try {
-    const upstream = await fetch(u, { redirect: 'error', signal: abort.signal });
-    if (!upstream.ok) { clearTimeout(timer); return res.status(502).json({ error: 'Upstream error' }); }
+    const upstream = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(10000) });
+    if (!upstream.ok) return res.status(502).json({ error: 'Upstream error' });
     const type = upstream.headers.get('content-type') || 'image/gif';
-    if (!/^image\//.test(type)) { clearTimeout(timer); return res.status(502).json({ error: 'Not an image' }); }
+    if (!/^image\//.test(type)) return res.status(502).json({ error: 'Not an image' });
+    const reader = upstream.body.getReader();
+    let total = 0;
     res.set('Content-Type', type);
     res.set('Cache-Control', 'public, max-age=86400');
     res.set('X-Content-Type-Options', 'nosniff');
-
-    clearTimeout(timer);
-    const reader = upstream.body.getReader();
-    let aborted = false;
-    res.on('close', () => {
-      aborted = true;
-      try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {}
-    });
-    (async () => {
-      try {
-        while (!aborted && !res.destroyed && !res.writableEnded) {
-          const { done, value } = await reader.read();
-          if (done || aborted) break;
-          if (!res.write(Buffer.from(value))) {
-            await new Promise(resolve => {
-              const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
-              res.once('drain', done);
-              res.once('close', done);
-            });
-          }
-        }
-        if (!aborted && !res.destroyed && !res.writableEnded) res.end();
-      } catch {
-        try { if (!res.writableEnded) res.destroy(); } catch {}
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > 8 * 1024 * 1024) { try { await reader.cancel(); } catch (e) {} break; }
+      if (!res.write(Buffer.from(value))) {
+        await new Promise(resolve => { res.once('drain', resolve); res.once('close', resolve); });
       }
-    })();
+      if (res.destroyed) break;
+    }
+    if (!res.writableEnded) res.end();
   } catch (e) {
-    clearTimeout(timer);
-    console.error('[giphy media]', e.message);
     if (!res.headersSent) res.status(502).json({ error: 'Fetch failed' });
   }
 });
 
 app.get('/api/lookup/:query', authMiddleware, lookupLimiter, (req, res) => {
   const q = req.params.query;
-  let acct;
-  if (q.startsWith('@')) {
-    acct = DB.getAccountByUsername(q.slice(1));
-  } else {
-    const clean = q.replace(/-/g, '');
-    acct = clean.length === 8 ? DB.getAccountByChatNumber(clean) : null;
+  let account = null;
+  if (q.startsWith('@')) account = DB.getAccountByUsername(q.slice(1));
+  else {
+    const clean = q.replace(/\D/g, '');
+    account = clean.length >= 8 ? DB.getAccountByChatNumber(clean) : null;
   }
-  if (!acct) return res.status(404).json({ error: 'Not found' });
-  res.json({ number: acct.chat_number, username: acct.username_public ? acct.username : null, avatarPath: acct.avatar_path });
+  if (!account || account.id === req.account.id) return res.status(404).json({ error: 'Not found' });
+  if (DB.isBlocked(account.id, req.account.id) || DB.isBlocked(req.account.id, account.id)) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  res.json({
+    number: account.chat_number,
+    username: account.username_public ? account.username : null,
+    avatarPath: account.avatar_path,
+  });
 });
 
 app.get('/api/chats', authMiddleware, (req, res) => {
-  const chats = DB.getChatsForAccount(req.account.id);
+  const chats = DB.getChatsForAccount(req.account.id).filter(chat =>
+    !DB.isBlocked(chat.initiator_id, chat.peer_id) && !DB.isBlocked(chat.peer_id, chat.initiator_id)
+  );
   const aliases = DB.getAliases(req.account.id);
   const aliasMap = {};
-  aliases.forEach(a => aliasMap[a.target_number] = a.alias);
-  chats.forEach(c => {
-    const myId = req.account.id;
-    const peerChatNum = c.initiator_id === myId ? c.peer_chat_number : c.initiator_chat_number;
-    c.peer_alias = aliasMap[peerChatNum] || null;
-  });
+  for (const alias of aliases) aliasMap[alias.target_number] = alias.alias;
+  for (const chat of chats) {
+    const mine = chat.initiator_id === req.account.id;
+    const peerNumber = mine ? chat.peer_chat_number : chat.initiator_chat_number;
+    chat.peer_alias = aliasMap[peerNumber] || null;
+  }
   res.json(chats);
 });
 
-app.post('/api/chats', authMiddleware, (req, res) => {
-  const { peerNumber, label, chatNumber, burnMode, burnCustom } = req.body;
+app.post('/api/chats', authMiddleware, chatLimiter, (req, res) => {
+  const { peerNumber, label, chatNumber, burnMode, burnCustom } = req.body || {};
   if (!peerNumber) return res.status(400).json({ error: 'peerNumber required' });
-  let peer;
-  if (peerNumber.startsWith('@')) {
-    peer = DB.getAccountByUsername(peerNumber.slice(1));
-  } else {
-    const clean = peerNumber.replace(/-/g, '');
-    peer = DB.getAccountByChatNumber(clean);
+  let peer = null;
+  if (String(peerNumber).startsWith('@')) peer = DB.getAccountByUsername(String(peerNumber).slice(1));
+  else peer = DB.getAccountByChatNumber(String(peerNumber).replace(/\D/g, ''));
+  if (!peer || peer.id === req.account.id) return res.status(404).json({ error: 'Chat request unavailable' });
+  if (DB.isBlocked(peer.id, req.account.id) || DB.isBlocked(req.account.id, peer.id)) {
+    return res.status(404).json({ error: 'Chat request unavailable' });
   }
-  if (!peer) return res.status(404).json({ error: 'Peer not found' });
-  if (peer.id === req.account.id) return res.status(400).json({ error: 'Cannot chat with yourself' });
-  const chat = DB.createChat(req.account.id, peer.id, label, chatNumber, burnMode, burnCustom);
-
+  const id = rateLimit(`chat-create:${req.account.id}`, 10, 60);
+  if (id !== null) return res.status(429).json({ error: 'Too many chat requests' });
+  const burn = ['baf', 'never', '1min', '5min', '10min'].includes(burnMode) ? burnMode : 'baf';
+  const chat = DB.createChat(req.account.id, peer.id, label, chatNumber, burn, null);
+  if (chat.status === 'pending') {
+    const sys = DB.addSystemMessage(peer.id, 'chat_request', {
+      chatUid: chat.uid,
+      from: req.account.chat_number,
+      fromId: req.account.id,
+    }, 'pending');
+    if (sys) io.to(`user:${peer.id}`).emit('sys:new', { message: sys });
+    io.to(`user:${peer.id}`).emit('chat:request', { chatUid: chat.uid, fromNumber: req.account.chat_number });
+  }
   const fullChat = DB.getChatsForAccount(req.account.id).find(c => c.uid === chat.uid);
   const peerChat = DB.getChatsForAccount(peer.id).find(c => c.uid === chat.uid);
-
-  for (const [sid, sock] of io.of('/').sockets) {
-    if (sock.accountId === req.account.id || sock.accountId === peer.id) {
-      sock.join(roomForChat(chat.uid));
-    }
+  for (const [, socket] of io.of('/').sockets) {
+    if (socket.accountId === req.account.id || socket.accountId === peer.id) socket.join(roomForChat(chat.uid));
   }
+  if (peerChat) io.to(`user:${peer.id}`).emit('chat:new', { chat: peerChat });
+  if (fullChat) io.to(`user:${req.account.id}`).emit('chat:new', { chat: fullChat });
+  res.json(fullChat || chat);
+});
 
-  io.to(`user:${peer.id}`).emit('chat:new', { chat: peerChat });
-  io.to(`user:${req.account.id}`).emit('chat:new', { chat: fullChat });
+app.post('/api/chats/:uid/accept', authMiddleware, (req, res) => {
+  const chat = DB.getChatByUid(req.params.uid);
+  if (!chat || chat.status !== 'pending') return res.status(404).json({ error: 'Not found' });
+  if (chat.peer_id !== req.account.id) return res.status(403).json({ error: 'Forbidden' });
+  if (!DB.acceptChat(chat.id, req.account.id)) return res.status(500).json({ error: 'Failed' });
+  const updated = DB.getChatById(chat.id);
+  for (const [, socket] of io.of('/').sockets) {
+    if (socket.accountId === chat.initiator_id || socket.accountId === chat.peer_id) socket.join(roomForChat(chat.uid));
+  }
+  io.to(roomForChat(chat.uid)).emit('chat:accepted', { chatUid: chat.uid, by: req.account.id });
+  res.json({ ok: true, chat: updated });
+});
 
-  res.json(chat);
+app.post('/api/chats/:uid/decline', authMiddleware, (req, res) => {
+  const chat = DB.getChatByUid(req.params.uid);
+  if (!chat || chat.status !== 'pending') return res.status(404).json({ error: 'Not found' });
+  if (chat.peer_id !== req.account.id && chat.initiator_id !== req.account.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  DB.hardDeleteChat(chat.id);
+  io.to(`user:${chat.initiator_id}`).emit('chat:declined', { chatUid: chat.uid });
+  res.json({ ok: true });
 });
 
 app.get('/api/chats/:uid/messages', authMiddleware, (req, res) => {
   const chat = DB.getChatByUid(req.params.uid);
-  if (!chat) return res.status(404).json({ error: 'Not found' });
-  const isMember = chat.initiator_id === req.account.id || chat.peer_id === req.account.id;
-  if (!isMember) return res.status(403).json({ error: 'Forbidden' });
-
-  const beforeId = req.query.beforeId ? parseInt(req.query.beforeId) : null;
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  if (DB.isBlocked(chat.initiator_id, chat.peer_id) || DB.isBlocked(chat.peer_id, chat.initiator_id)) return res.status(404).json({ error: 'Not found' });
+  if (chat.status !== 'accepted') return res.status(403).json({ error: 'Chat request is not accepted' });
+  if ((chat.initiator_id === req.account.id && chat.deleted_by_initiator) ||
+      (chat.peer_id === req.account.id && chat.deleted_by_peer)) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const beforeId = req.query.beforeId ? parseInt(req.query.beforeId, 10) : null;
   res.json(DB.getMessages(chat.id, req.account.id, { beforeId }));
 });
 
 app.get('/api/messages/:id', authMiddleware, (req, res) => {
-  try {
-    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(parseInt(req.params.id));
-    if (!msg) return res.status(404).json({ error: 'Not found' });
-
-    const chat = DB.getChatById(msg.chat_id);
-    if (!chat || (chat.initiator_id !== req.account.id && chat.peer_id !== req.account.id)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    res.json(msg);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+  const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
+  if (!msg) return res.status(404).json({ error: 'Not found' });
+  const chat = DB.getChatById(msg.chat_id);
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(403).json({ error: 'Forbidden' });
+  if (DB.isBlocked(chat.initiator_id, chat.peer_id) || DB.isBlocked(chat.peer_id, chat.initiator_id)) return res.status(404).json({ error: 'Not found' });
+  const role = chat.initiator_id === req.account.id ? 'initiator' : 'peer';
+  const deletedFor = String(msg.deleted_for || '');
+  if (deletedFor === 'both' || deletedFor.includes(role)) return res.status(404).json({ error: 'Not found' });
+  if ((chat.initiator_id === req.account.id && chat.deleted_by_initiator) ||
+      (chat.peer_id === req.account.id && chat.deleted_by_peer)) {
+    return res.status(404).json({ error: 'Not found' });
   }
+  res.json(msg);
 });
 
 app.patch('/api/chats/:uid/label', authMiddleware, (req, res) => {
   const chat = DB.getChatByUid(req.params.uid);
-  if (!chat) return res.status(404).json({ error: 'Not found' });
-  if (!isChatMember(chat, req.account.id)) return res.status(403).json({ error: 'Forbidden' });
-  DB.setChatLabel(chat.id, req.account.id, req.body.label);
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  if (chat.status !== 'accepted') return res.status(403).json({ error: 'Chat not accepted' });
+  const label = req.body?.label;
+  if (label != null && (typeof label !== 'string' || label.length > 1024)) return res.status(400).json({ error: 'Invalid label' });
+  DB.setChatLabel(chat.id, req.account.id, label || null);
   res.json({ ok: true });
 });
 
 app.patch('/api/chats/:uid/burn', authMiddleware, (req, res) => {
   const chat = DB.getChatByUid(req.params.uid);
-  if (!chat) return res.status(404).json({ error: 'Not found' });
-  if (!isChatMember(chat, req.account.id)) return res.status(403).json({ error: 'Forbidden' });
-  DB.setBurnMode(chat.id, req.body.mode, req.body.customMin);
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  if (chat.status !== 'accepted') return res.status(403).json({ error: 'Chat not accepted' });
+  const mode = String(req.body?.mode || '');
+  if (!['never', 'baf', '1min', '5min', '10min', 'custom'].includes(mode)) return res.status(400).json({ error: 'Invalid burn mode' });
+  let custom = null;
+  if (mode === 'custom') {
+    custom = parseInt(req.body?.customMin, 10);
+    if (!Number.isInteger(custom) || custom < 5 || custom > 1440) return res.status(400).json({ error: 'Invalid custom burn range' });
+  }
+  DB.setBurnMode(chat.id, req.account.id, mode, custom);
+  io.to(roomForChat(chat.uid)).emit('chat:burn:pending', { chatUid: chat.uid, mode, customMin: custom, by: req.account.id });
   res.json({ ok: true });
 });
 
 app.post('/api/chats/:uid/burn-confirm', authMiddleware, (req, res) => {
   const chat = DB.getChatByUid(req.params.uid);
-  if (!chat) return res.status(404).json({ error: 'Not found' });
-  if (!isChatMember(chat, req.account.id)) return res.status(403).json({ error: 'Forbidden' });
-  DB.confirmBurn(chat.id);
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  if (!DB.confirmBurn(chat.id, req.account.id)) return res.status(400).json({ error: 'Nothing to confirm' });
+  const updated = DB.getChatById(chat.id);
+  if (['1min', '5min', '10min', 'custom'].includes(updated.burn_mode)) activeTimedBurns.add(chat.uid);
+  else activeTimedBurns.delete(chat.uid);
+  io.to(roomForChat(chat.uid)).emit('chat:burn:confirmed', { chatUid: chat.uid });
+  res.json({ ok: true });
+});
+
+app.post('/api/chats/:uid/history', authMiddleware, (req, res) => {
+  const chat = DB.getChatByUid(req.params.uid);
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  if (chat.status !== 'accepted') return res.status(403).json({ error: 'Chat not accepted' });
+  const max = parseInt(req.body?.max, 10);
+  if (!Number.isInteger(max) || max === 0 || max < -1 || max > 100000) return res.status(400).json({ error: 'Invalid history limit' });
+  DB.setMaxMessages(chat.id, req.account.id, max);
+  io.to(roomForChat(chat.uid)).emit('chat:history:pending', { chatUid: chat.uid, max, by: req.account.id });
+  res.json({ ok: true });
+});
+
+app.post('/api/chats/:uid/history-confirm', authMiddleware, (req, res) => {
+  const chat = DB.getChatByUid(req.params.uid);
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  if (!DB.confirmMaxMessages(chat.id, req.account.id)) return res.status(400).json({ error: 'Nothing to confirm' });
+  const trimmed = DB.enforceMaxMessages(chat.id);
+  io.to(roomForChat(chat.uid)).emit('chat:history:changed', { chatUid: chat.uid, max: DB.getChatById(chat.id).max_messages });
+  if (trimmed.length) io.to(roomForChat(chat.uid)).emit('msg:burned', { chatUid: chat.uid, ids: trimmed, preview: '' });
   res.json({ ok: true });
 });
 
 app.delete('/api/chats/:uid', authMiddleware, (req, res) => {
   const chat = DB.getChatByUid(req.params.uid);
-  if (!chat) return res.status(404).json({ error: 'Not found' });
-  if (!isChatMember(chat, req.account.id)) return res.status(403).json({ error: 'Forbidden' });
-  DB.deleteChat(chat.id, req.account.id, req.body.forWhom || 'self');
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  const forWhom = req.body?.forWhom === 'both' ? 'both' : 'self';
+  DB.deleteChat(chat.id, req.account.id, forWhom);
+  io.to(roomForChat(chat.uid)).emit('chat:deleted', { chatUid: chat.uid, forWhom, by: req.account.id });
   res.json({ ok: true });
 });
 
 app.delete('/api/messages/:id', authMiddleware, (req, res) => {
-  const msgId = parseInt(req.params.id);
-  if (!Number.isInteger(msgId)) return res.status(400).json({ error: 'Invalid message id' });
-  const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid message id' });
+  const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
   if (!msg) return res.status(404).json({ error: 'Not found' });
   const chat = DB.getChatById(msg.chat_id);
-  if (!isChatMember(chat, req.account.id)) return res.status(403).json({ error: 'Forbidden' });
-  DB.deleteMessage(msgId, req.account.id, req.body.forWhom || 'self');
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(403).json({ error: 'Forbidden' });
+  const forWhom = req.body?.forWhom === 'both' ? 'both' : 'self';
+  if (forWhom === 'both' && msg.sender_id !== req.account.id) return res.status(403).json({ error: 'Only the sender can delete for everyone' });
+  if (!DB.deleteMessage(id, req.account.id, forWhom)) return res.status(403).json({ error: 'Forbidden' });
+  io.to(roomForChat(chat.uid)).emit('msg:deleted', { msgId: id, forWhom, by: req.account.id, chatUid: chat.uid });
   res.json({ ok: true });
 });
 
-app.post('/api/upload', authMiddleware, upload.single('file'), async (req, res) => {
+app.post('/api/upload', authMiddleware, uploadLimiter, chatUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
-
-  const quotaMb = parseInt(process.env.UPLOAD_QUOTA_MB) || 2048;
-  if (quotaMb > 0) {
-    const usage = DB.getUploadUsageBytes(req.account.id);
-    if (usage + req.file.size > quotaMb * 1024 * 1024) {
-      try { fs.unlinkSync(req.file.path); } catch {}
-      return res.status(413).json({ error: 'Upload quota exceeded' });
-    }
+  if (!req.file.originalname.toLowerCase().endsWith('.bin')) {
+    try { fs.unlinkSync(req.file.path); } catch (e) {}
+    return res.status(400).json({ error: 'Chat attachments must be encrypted .bin files' });
   }
-
-  const isEncrypted = req.file.originalname.endsWith('.bin');
-  const mime = isEncrypted ? 'application/octet-stream' : req.file.mimetype;
-  const isImage = !isEncrypted && mime.startsWith('image/');
-
-  if (isImage && !validateFileMagic(req.file.path, mime)) {
-    try { fs.unlinkSync(req.file.path); } catch {}
-    return res.status(400).json({ error: 'Invalid image format' });
+  if (uploadQuotaMb > 0 && DB.getUploadUsageBytes(req.account.id) + req.file.size > uploadQuotaMb * 1024 * 1024) {
+    try { fs.unlinkSync(req.file.path); } catch (e) {}
+    return res.status(413).json({ error: 'Upload quota exceeded' });
   }
-  const isAnimated = !isEncrypted && (mime === 'image/gif' || mime === 'image/webp');
-  let filePath = req.file.path;
-  let fileName = req.file.originalname;
-
-  if (isImage && !isAnimated && !isEncrypted && sharp) {
-    const outPath = filePath.replace(/\.[^.]+$/, '.webp');
-    await sharp(filePath)
-      .resize({ width: 2048, height: 2048, fit: 'inside', withoutEnlargement: true })
-      .webp({ quality: 82 })
-      .toFile(outPath);
-    fs.unlinkSync(filePath);
-    filePath = outPath;
-    fileName = fileName.replace(/\.[^.]+$/, '.webp');
+  if (globalUploadGb > 0 && DB.getGlobalUploadUsageBytes() + req.file.size > globalUploadGb * 1024 * 1024 * 1024) {
+    try { fs.unlinkSync(req.file.path); } catch (e) {}
+    return res.status(507).json({ error: 'Server storage is full' });
   }
+  const rel = '/uploads/' + path.basename(req.file.path);
+  DB.recordUpload(req.account.id, rel, req.file.size);
+  res.json({ url: rel, name: path.basename(req.file.path), type: 'file' });
+});
 
-  res.json({
-    url: '/uploads/' + path.basename(filePath),
-    name: fileName,
-    type: isImage ? 'image' : 'file',
-  });
+app.use('/uploads', authMiddleware, (req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+  const rel = req.path.replace(/^\/+/, '');
+  const safe = path.resolve(uploadsDir, rel);
+  if (!safe.startsWith(uploadsDir + path.sep)) return res.status(403).json({ error: 'Forbidden' });
+  res.set('X-Content-Type-Options', 'nosniff');
+  if (rel.startsWith('avatars/')) {
+    return res.sendFile(safe, err => { if (err && !res.headersSent) res.status(404).json({ error: 'Not found' }); });
+  }
+  const fileUrl = '/uploads/' + rel;
+  const msg = DB.db.prepare(`
+    SELECT m.id, m.deleted_for, c.initiator_id, c.peer_id, c.status
+    FROM messages m JOIN chats c ON c.id = m.chat_id
+    WHERE m.file_path = ? LIMIT 1
+  `).get(fileUrl);
+  if (!msg || msg.status !== 'accepted' ||
+      (msg.initiator_id !== req.account.id && msg.peer_id !== req.account.id)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  if (DB.isBlocked(msg.initiator_id, msg.peer_id) || DB.isBlocked(msg.peer_id, msg.initiator_id)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const role = msg.initiator_id === req.account.id ? 'initiator' : 'peer';
+  const deletedFor = String(msg.deleted_for || '');
+  if (deletedFor === 'both' || deletedFor.includes(role)) return res.status(404).json({ error: 'Not found' });
+  res.set('Content-Type', 'application/octet-stream');
+  res.set('Content-Disposition', 'attachment; filename="' + path.basename(safe).replace(/[^\x20-\x7e]/g, '_') + '"');
+  res.set('Content-Security-Policy', 'sandbox');
+  res.sendFile(safe, err => { if (err && !res.headersSent) res.status(404).json({ error: 'Not found' }); });
 });
 
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
-    if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch {} }
-    const msg = err.code === 'LIMIT_FILE_SIZE'
-      ? (req.originalUrl.includes('/me/avatar') ? 'Image too large (max 5 MB)' : 'File too large (max 25 MB)')
-      : err.message;
+    if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch (e) {} }
+    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File too large' : err.message;
     return res.status(413).json({ error: msg });
   }
-  console.error('[error]', err);
-  if (res.headersSent) return;
-  res.status(err.status || 500).json({ error: err.message || 'Server error' });
+  if (err) {
+    if (/encrypted \.bin|Only images|Video not allowed/.test(String(err.message))) {
+      if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch (e) {} }
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('[error]', err.message);
+    if (!res.headersSent) res.status(err.status || 500).json({ error: 'Server error' });
+  }
 });
 
 const httpsServer = https.createServer(tlsOptions, app);
-const httpServer  = http.createServer(app);
-const io = new Server(httpsServer, {
-  pingInterval: 10000,
-  pingTimeout: 10000,
-});
-io.attach(httpServer);
+const io = new Server(httpsServer, { pingInterval: 10000, pingTimeout: 10000 });
+let httpServer = null;
+if (httpPort) {
+  httpServer = http.createServer(app);
+  io.attach(httpServer);
+}
+
+function roomForChat(uid) { return `chat:${uid}`; }
 
 io.use((socket, next) => {
   const cookieToken = socket.handshake.headers?.cookie?.match(/(?:^|;\s*)token=([^;]*)/)?.[1];
   const raw = socket.handshake.auth?.token || cookieToken;
-
   if (!raw) return next(new Error('Unauthorized'));
   try {
-    const { dt } = jwt.verify(raw, JWT_SECRET);
+    const { dt } = verifyToken(raw);
     const device = DB.getDeviceByToken(dt);
     if (!device) return next(new Error('Device not found'));
     socket.accountId = device.account_id;
-    socket.deviceId  = device.id;
+    socket.deviceId = device.id;
     next();
-  } catch { next(new Error('Bad token')); }
+  } catch (e) {
+    next(new Error('Bad token'));
+  }
 });
 
 const online = new Map();
 const activeTimedBurns = new Set();
+try {
+  const timed = DB.db.prepare("SELECT uid FROM chats WHERE burn_mode IN ('1min','5min','10min','custom')").all();
+  for (const row of timed) activeTimedBurns.add(row.uid);
+} catch (e) {}
 const presenceShown = new Map();
-function roomForChat(uid) { return `chat:${uid}`; }
+const floodBuckets = new Map();
 
-function isOnline(aid) {
-  const set = online.get(aid);
-  if (!set || !set.size) return false;
-  for (const sid of set) {
-    const sock = io.sockets.sockets.get(sid);
+function floodLimited(accountId) {
+  const now = Date.now();
+  let bucket = floodBuckets.get(accountId);
+  if (!bucket || now > bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + 10000 };
+    floodBuckets.set(accountId, bucket);
+  }
+  bucket.count++;
+  return bucket.count > 30;
+}
+function isOnline(accountId) {
+  const sockets = online.get(accountId);
+  if (!sockets || !sockets.size) return false;
+  for (const id of sockets) {
+    const sock = io.sockets.sockets.get(id);
     if (sock && sock.presenceHidden !== true) return true;
   }
   return false;
 }
-
-function presenceVisibleToPeers(acct) {
-  return !!acct && acct.show_presence !== 0;
+function presenceVisibleToPeers(account) {
+  return !!account && account.show_presence === 1;
 }
-
-function broadcastPresence(aid) {
-  const acct = DB.getAccountById(aid);
-  if (!acct) return;
-  if (isOnline(aid)) {
-    notifyPresence(aid, true, null);
-  } else {
-    notifyPresence(aid, false, acct.last_seen || null);
-  }
-}
-
-function recomputePresence(aid) {
-  const now = isOnline(aid);
-  if (presenceShown.get(aid) === now) return;
-  presenceShown.set(aid, now);
-  if (!now) touchAccountLastSeen(aid, Math.floor(Date.now() / 1000));
-  broadcastPresence(aid);
-}
-
-function touchAccountLastSeen(accountId, unixSec) {
-  try {
-    DB.db.prepare('UPDATE accounts SET last_seen=? WHERE id=?').run(unixSec, accountId);
-  } catch (e) {
-    console.error('[presence] last_seen update failed:', e.message);
-  }
-}
-
 function notifyPresence(accountId, isOnlineNow, lastSeenSec) {
-  const acct = DB.getAccountById(accountId);
-  if (!acct) return;
-  const visible = presenceVisibleToPeers(acct);
+  const account = DB.getAccountById(accountId);
+  if (!account) return;
+  const visible = presenceVisibleToPeers(account);
   const chats = DB.getChatsForAccount(accountId);
-  for (const c of chats) {
-    const peerId = c.initiator_id === accountId ? c.peer_id : c.initiator_id;
+  for (const chat of chats) {
+    const peerId = chat.initiator_id === accountId ? chat.peer_id : chat.initiator_id;
     io.to(`user:${peerId}`).emit('peer:presence', {
-      chatUid: c.uid,
-      number: acct.chat_number,
+      chatUid: chat.uid,
+      number: account.chat_number,
       online: visible && isOnlineNow,
       lastSeen: visible ? (lastSeenSec || null) : null,
     });
   }
 }
-
-function getChatUidBetween(a, b) {
-  return DB.db.prepare(
-    'SELECT uid FROM chats WHERE (initiator_id=? AND peer_id=?) OR (initiator_id=? AND peer_id=?) LIMIT 1'
-  ).get(a, b, b, a)?.uid || null;
+function broadcastPresence(accountId) {
+  const account = DB.getAccountById(accountId);
+  if (!account) return;
+  if (isOnline(accountId)) notifyPresence(accountId, true, null);
+  else notifyPresence(accountId, false, account.last_seen || null);
 }
-
-function isChatMember(chat, accountId) {
-  return !!chat && (chat.initiator_id === accountId || chat.peer_id === accountId);
-}
-
-function isPrivateAddress(ip, family) {
-  if (family === 6) {
-    const v6 = ip.toLowerCase();
-    if (v6 === '::1' || v6 === '::' || v6 === '::ffff:127.0.0.1') return true;
-    if (v6.startsWith('fe80:') || v6.startsWith('fc') || v6.startsWith('fd')) return true;
-    if (v6.startsWith('ff')) return true;
-    return false;
+function recomputePresence(accountId) {
+  const now = isOnline(accountId);
+  if (presenceShown.get(accountId) === now) return;
+  presenceShown.set(accountId, now);
+  if (!now) {
+    DB.db.prepare('UPDATE accounts SET last_seen=? WHERE id=?').run(Math.floor(Date.now() / 1000), accountId);
   }
-  if (!net.isIPv4(ip)) return true;
-  const parts = ip.split('.').map(Number);
-  const [a, b] = parts;
-  if (a === 0 || a === 10 || a === 127) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
-  if (a >= 224) return true;
-  return false;
+  broadcastPresence(accountId);
 }
-
-async function validatePushEndpoint(rawUrl) {
-  let u;
-  try { u = new URL(rawUrl); } catch { return false; }
-  if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
-  const host = u.hostname.toLowerCase().replace(/\.$/, '');
-  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return false;
-  if (net.isIP(host)) {
-    return !isPrivateAddress(host, net.isIP(host));
-  }
-  let addrs;
-  try {
-    addrs = await dns.lookup(host, { all: true, verbatim: true });
-  } catch { return false; }
-  if (!addrs || !addrs.length) return false;
-  return addrs.every(a => !isPrivateAddress(a.address, a.family));
+function requireChatMember(chatUid, accountId) {
+  const chat = DB.getChatByUid(chatUid);
+  if (!chat || !DB.isChatMember(chat, accountId)) return null;
+  if (chat.status !== 'accepted') return null;
+  if (DB.isBlocked(chat.initiator_id, chat.peer_id) || DB.isBlocked(chat.peer_id, chat.initiator_id)) return null;
+  if ((chat.initiator_id === accountId && chat.deleted_by_initiator) ||
+      (chat.peer_id === accountId && chat.deleted_by_peer)) return null;
+  return chat;
 }
-
-async function pushWakeup(accountId, chatUid, preview, burn) {
-  if (online.has(accountId)) return;
-  const devices = DB.getPushableDevices(accountId);
-  for (const d of devices) {
-    try {
-      if (!d.push_endpoint || !(await validatePushEndpoint(d.push_endpoint))) continue;
-      await fetch(d.push_endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: JSON.stringify({ t: 'new_message', chatUid, preview: preview || '', burn: !!burn }),
-        redirect: 'manual',
-        signal: AbortSignal.timeout(5000),
-      });
-    } catch (e) {
-      console.error('[push] failed for device', d.id, e.message);
-    }
-  }
-}
-
-function isValidPeerKeyPayload(s) {
-  if (typeof s !== 'string') return false;
-  const t = s.trim();
-  if (!t.length || t.length > 512) return false;
-  try {
-    if (t.startsWith('{')) {
-      const j = JSON.parse(t);
-      return j && j.kty === 'EC' && typeof j.x === 'string' && j.x.length > 0 &&
-        typeof j.y === 'string' && j.y.length > 0;
-    }
-    const raw = Buffer.from(t, 'base64');
-    if (raw.length === 65 && raw[0] === 0x04) return true;
-    if (raw.length > 65 && raw[raw.length - 65] === 0x04) return true;
-    return false;
-  } catch {
-    return false;
-  }
+function validString(value, max) {
+  return typeof value === 'string' && value.length > 0 && value.length <= max;
 }
 
 io.on('connection', socket => {
-  const aid = socket.accountId;
-  if (!online.has(aid)) online.set(aid, new Set());
-  online.get(aid).add(socket.id);
+  const accountId = socket.accountId;
+  if (!online.has(accountId)) online.set(accountId, new Set());
+  online.get(accountId).add(socket.id);
+  socket.join(`user:${accountId}`);
 
-  socket.join(`user:${aid}`);
-
-  const chats = DB.getChatsForAccount(aid);
-  chats.forEach(c => socket.join(roomForChat(c.uid)));
+  const chats = DB.getChatsForAccount(accountId);
+  for (const chat of chats) socket.join(roomForChat(chat.uid));
 
   try {
-    for (const m of DB.takeKeySyncInbox(socket.deviceId)) {
-      socket.emit('key:sync', { fromPublicKey: m.from_public_key, encryptedKey: m.encrypted_key });
+    for (const message of DB.takeKeySyncInbox(socket.deviceId)) {
+      socket.emit('key:sync', { fromPublicKey: message.from_public_key, encryptedKey: message.encrypted_key });
     }
-  } catch (e) { console.error('[key inbox]', e.message); }
+  } catch (e) {}
 
-  recomputePresence(aid);
+  recomputePresence(accountId);
 
-  for (const c of chats) {
-    const peerId = c.initiator_id === aid ? c.peer_id : c.initiator_id;
-    const peerAcct = DB.getAccountById(peerId);
-    if (!peerAcct) continue;
+  for (const chat of chats) {
+    const peerId = chat.initiator_id === accountId ? chat.peer_id : chat.initiator_id;
+    const peer = DB.getAccountById(peerId);
+    if (!peer) continue;
     const peerOnline = isOnline(peerId);
-    const peerVisible = presenceVisibleToPeers(peerAcct);
+    const visible = presenceVisibleToPeers(peer);
     socket.emit('peer:presence', {
-      chatUid: c.uid,
-      number: peerAcct.chat_number,
-      online: peerVisible && peerOnline,
-      lastSeen: peerVisible && !peerOnline ? (peerAcct.last_seen || null) : null,
+      chatUid: chat.uid,
+      number: peer.chat_number,
+      online: visible && peerOnline,
+      lastSeen: visible && !peerOnline ? (peer.last_seen || null) : null,
     });
   }
 
-  socket.on('presence:report', ({ online: reported }) => {
-    socket.presenceHidden = reported === false;
-    recomputePresence(aid);
+  const revalidate = setInterval(() => {
+    const device = DB.getDeviceById(socket.deviceId);
+    if (!device || device.account_id !== accountId) {
+      socket.disconnect(true);
+      return;
+    }
+    if (online.get(accountId)?.size) DB.touchDeviceById(socket.deviceId);
+  }, 60000);
+  if (revalidate.unref) revalidate.unref();
+
+  socket.on('presence:report', payload => {
+    if (!payload || typeof payload !== 'object') return;
+    socket.presenceHidden = payload.online === false;
+    recomputePresence(accountId);
   });
 
-  socket.on('presence:get', ({ number }) => {
-    if (!number) return;
-    const peer = DB.getAccountByChatNumber(String(number));
-    if (!peer || peer.id === aid) return;
-    const sharedUid = getChatUidBetween(aid, peer.id);
-    if (!sharedUid) return;
+  socket.on('presence:get', payload => {
+    if (!payload || typeof payload.number !== 'string') return;
+    const peer = DB.getAccountByChatNumber(payload.number);
+    if (!peer || peer.id === accountId) return;
+    const uid = DB.getChatUidBetween(accountId, peer.id);
+    if (!uid) return;
     const peerOnline = isOnline(peer.id);
-    const peerVisible = presenceVisibleToPeers(peer);
+    const visible = presenceVisibleToPeers(peer);
     socket.emit('peer:presence', {
-      chatUid: sharedUid,
+      chatUid: uid,
       number: peer.chat_number,
-      online: peerVisible && peerOnline,
-      lastSeen: peerVisible && !peerOnline ? (peer.last_seen || null) : null,
+      online: visible && peerOnline,
+      lastSeen: visible && !peerOnline ? (peer.last_seen || null) : null,
     });
   });
 
   socket.on('disconnect', () => {
-    const s = online.get(aid);
-    if (s) {
-      s.delete(socket.id);
-      if (!s.size) online.delete(aid);
+    const sockets = online.get(accountId);
+    if (sockets) {
+      sockets.delete(socket.id);
+      if (!sockets.size) online.delete(accountId);
     }
-    recomputePresence(aid);
+    recomputePresence(accountId);
   });
 
-  const MSG_FLOOD = { count: 0, resetAt: Date.now() + 10000 };
-  function floodLimited() {
-    const now = Date.now();
-    if (now > MSG_FLOOD.resetAt) { MSG_FLOOD.count = 0; MSG_FLOOD.resetAt = now + 10000; }
-    return ++MSG_FLOOD.count > 30;
-  }
-  const ALLOW_PLAINTEXT = process.env.ALLOW_PLAINTEXT === 'true';
-  const MSG_FILE_URL_RE = /^\/uploads\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
-  const MSG_FILE_TYPES = new Set(['image', 'file', 'audio']);
-
-  socket.on('msg:send', ({ chatUid, content, fileUrl, fileType, fileName, burnSeconds, replyToId, preview }) => {
-    if (typeof chatUid !== 'string' || !chatUid) return;
-    if (floodLimited()) {
+  socket.on('msg:send', payload => {
+    if (!payload || typeof payload !== 'object') return;
+    const chatUid = payload.chatUid;
+    if (!validString(chatUid, 64)) return;
+    if (floodLimited(accountId)) {
       socket.emit('msg:error', { chatUid, error: 'Sending too fast' });
       return;
     }
-    const chat = DB.getChatByUid(chatUid);
-    if (!isChatMember(chat, aid)) return;
-    if (chat.initiator_id === aid && chat.deleted_by_initiator) return;
-    if (chat.peer_id === aid && chat.deleted_by_peer) return;
-
-    if (content !== undefined && content !== null && typeof content !== 'string') {
-      socket.emit('msg:error', { chatUid, error: 'Invalid content' });
+    const chat = requireChatMember(chatUid, accountId);
+    if (!chat) return;
+    const content = payload.content;
+    if (!content && !payload.fileUrl) return;
+    if (content != null && !validateChatContent(content)) {
+      socket.emit('msg:error', { chatUid, error: 'Plaintext messages are rejected' });
       return;
     }
-    if (content && content.length > 65536) {
-      socket.emit('msg:error', { chatUid, error: 'Message too long' });
-      return;
-    }
-    if (content && !ALLOW_PLAINTEXT && !content.startsWith('e2e:')) {
-      socket.emit('msg:error', { chatUid, error: 'Plaintext messages are rejected (must be encrypted)' });
-      return;
-    }
-    if (fileUrl !== undefined && fileUrl !== null) {
-      if (typeof fileUrl !== 'string' || !MSG_FILE_URL_RE.test(fileUrl) || fileUrl.includes('..')) {
+    let fileType = payload.fileType ?? null;
+    let fileUrl = payload.fileUrl ?? null;
+    let fileName = payload.fileName ?? null;
+    if (fileUrl != null) {
+      if (!isValidChatAttachmentUrl(fileUrl)) {
         socket.emit('msg:error', { chatUid, error: 'Invalid fileUrl' });
         return;
       }
-    }
-    if (fileType !== undefined && fileType !== null && !MSG_FILE_TYPES.has(fileType)) {
+      if (!['image', 'file', 'audio'].includes(fileType)) {
+        socket.emit('msg:error', { chatUid, error: 'Invalid fileType' });
+        return;
+      }
+      const upload = DB.getUploadByPath(fileUrl);
+      if (!upload || upload.account_id !== accountId || upload.message_id != null) {
+        socket.emit('msg:error', { chatUid, error: 'Unknown attachment' });
+        return;
+      }
+      if (fileName != null && (typeof fileName !== 'string' || fileName.length > 255)) fileName = null;
+    } else if (fileType != null) {
       socket.emit('msg:error', { chatUid, error: 'Invalid fileType' });
       return;
     }
-    if (fileName !== undefined && fileName !== null) {
-      if (typeof fileName !== 'string' || fileName.length > 255) {
-        socket.emit('msg:error', { chatUid, error: 'Invalid fileName' });
-        return;
-      }
-      fileName = fileName.replace(/[\u0000-\u001f\u007f]/g, '');
+    let burnSeconds = null;
+    if (payload.burnSeconds != null) {
+      const parsed = parseInt(payload.burnSeconds, 10);
+      if (Number.isInteger(parsed) && parsed > 0) burnSeconds = Math.max(5, Math.min(3600, parsed));
     }
-    if (preview !== undefined && preview !== null) {
-      if (typeof preview !== 'string' || preview.length > 4096) preview = null;
-    }
-    if (replyToId !== undefined && replyToId !== null && replyToId !== 0) {
-      const rid = parseInt(replyToId);
-      if (!Number.isInteger(rid)) {
-        socket.emit('msg:error', { chatUid, error: 'Invalid replyToId' });
-        return;
-      }
+    let replyToId = null;
+    if (payload.replyToId != null) {
+      const rid = parseInt(payload.replyToId, 10);
+      if (!Number.isInteger(rid)) return;
       const target = DB.db.prepare('SELECT chat_id FROM messages WHERE id=?').get(rid);
-      if (!target || target.chat_id !== chat.id) {
-        socket.emit('msg:error', { chatUid, error: 'Invalid replyToId' });
-        return;
-      }
+      if (!target || target.chat_id !== chat.id) return;
       replyToId = rid;
-    } else {
-      replyToId = null;
     }
-
-    const secs = burnSeconds > 0 ? Math.max(5, Math.min(3600, parseInt(burnSeconds) || 0)) : null;
-    const finalPreview = preview || (secs ? '[burns after read]' : (content ? content.slice(0,60) : (fileType==='image'?'📷 Image':(fileType==='audio'?'ᯤ Voice':'📎 File'))));
-    const msg = DB.addMessage(chat.id, aid, content, fileUrl||null, fileType||null, fileName||null, secs, replyToId, finalPreview);
-    io.to(roomForChat(chatUid)).emit('msg:new', { chatUid, msg, preview: finalPreview });
-    const trimmed = DB.enforceMaxMessages(chat.id);
-    if (trimmed.length) {
-      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: trimmed, preview: finalPreview });
+    const msg = DB.addMessage(chat.id, accountId, content || null, fileUrl, fileType, fileName, burnSeconds, replyToId, '[encrypted]');
+    if (fileUrl) DB.attachUpload(fileUrl, accountId, msg.id);
+    const safeMsg = { ...msg, content: content || null };
+    io.to(roomForChat(chatUid)).emit('msg:new', { chatUid, msg: safeMsg, preview: '[encrypted]' });
+    if (chat.burn_mode === 'baf') {
+      const trimmed = DB.applyBurnBaf(chat.id);
+      if (trimmed.length) io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: trimmed, preview: '[encrypted]' });
     }
-    const recipientId = chat.initiator_id === aid ? chat.peer_id : chat.initiator_id;
-    pushWakeup(recipientId, chatUid, finalPreview, !!secs).catch(e => console.error('[push] wakeup error', e.message));
+    const recipientId = chat.initiator_id === accountId ? chat.peer_id : chat.initiator_id;
+    pushWakeup(recipientId, chatUid).catch(() => {});
   });
 
-  socket.on('msg:read', ({ chatUid }) => {
-    const chat = DB.getChatByUid(chatUid);
-    if (!isChatMember(chat, aid)) return;
-    DB.markRead(chat.id, aid);
-    io.to(roomForChat(chatUid)).emit('msg:read:ack', { chatUid, by: aid });
+  socket.on('msg:read', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
+    if (!chat) return;
+    DB.markRead(chat.id, accountId);
+    io.to(roomForChat(payload.chatUid)).emit('msg:read:ack', { chatUid: payload.chatUid, by: accountId });
   });
 
-  socket.on('msg:spoiler:open', ({ msgId }) => {
-    const id = parseInt(msgId);
+  socket.on('msg:spoiler:open', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.msgId, 10);
     if (!Number.isInteger(id)) return;
     const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
     if (!msg || !msg.burn_seconds) return;
     const chat = DB.getChatById(msg.chat_id);
-    if (!isChatMember(chat, aid)) return;
-    const chatUid = chat.uid;
+    if (!chat || !DB.isChatMember(chat, accountId) || chat.status !== 'accepted') return;
     if (msg.burn_at) {
-
       socket.emit('msg:burn:countdown', {
-        msgId: id, chatUid,
-        burnAt: msg.burn_at, burnSeconds: msg.burn_seconds,
-        content: msg.content, filePath: msg.file_path,
-        fileType: msg.file_type, fileName: msg.file_name,
+        msgId: id, chatUid: chat.uid, burnAt: msg.burn_at, burnSeconds: msg.burn_seconds,
+        content: msg.content, filePath: msg.file_path, fileType: msg.file_type, fileName: msg.file_name,
       });
       return;
     }
     const burnAt = Math.floor(Date.now() / 1000) + msg.burn_seconds;
     DB.setBurnAt(id, burnAt);
-
-    io.to(roomForChat(chatUid)).emit('msg:burn:countdown', {
-      msgId: id, chatUid, burnAt, burnSeconds: msg.burn_seconds,
-      content: msg.content, filePath: msg.file_path,
-      fileType: msg.file_type, fileName: msg.file_name,
+    io.to(roomForChat(chat.uid)).emit('msg:burn:countdown', {
+      msgId: id, chatUid: chat.uid, burnAt, burnSeconds: msg.burn_seconds,
+      content: msg.content, filePath: msg.file_path, fileType: msg.file_type, fileName: msg.file_name,
     });
   });
 
-  socket.on('msg:burn:done', ({ msgId, chatUid }) => {
-    const id = parseInt(msgId);
-    if (!Number.isInteger(id) || typeof chatUid !== 'string') return;
+  socket.on('msg:burn:done', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.msgId, 10);
+    if (!Number.isInteger(id) || typeof payload.chatUid !== 'string') return;
     const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
     if (!msg) return;
-    const chat = DB.getChatByUid(chatUid);
-    if (!isChatMember(chat, aid)) return;
+    const chat = DB.getChatByUid(payload.chatUid);
+    if (!chat || !DB.isChatMember(chat, accountId)) return;
     if (msg.chat_id !== chat.id) return;
     DB.hardDeleteMessage(id);
-
-    const last = DB.db.prepare(`SELECT content,file_type,burn_seconds FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chat.id);
-    const preview = last ? (last.burn_seconds ? '[burns after read]' : (last.content ? last.content : (last.file_type==='image'?'[image]':'[file]'))) : '';
-    DB.updateChatPreview(chat.id, preview);
-    io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: [id], preview });
+    DB.refreshChatPreview(chat.id);
+    io.to(roomForChat(chat.uid)).emit('msg:burned', { chatUid: chat.uid, ids: [id], preview: '' });
   });
 
-  socket.on('msg:delete', ({ msgId, forWhom }) => {
-    const id = parseInt(msgId);
+  socket.on('msg:delete', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.msgId, 10);
     if (!Number.isInteger(id)) return;
     const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
     if (!msg) return;
     const chat = DB.getChatById(msg.chat_id);
-    if (!isChatMember(chat, aid)) return;
-    DB.deleteMessage(id, aid, forWhom);
-    const last = DB.db.prepare(`SELECT content,file_type,burn_seconds FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chat.id);
-    const preview = last ? (last.burn_seconds ? '[burns after read]' : (last.content ? last.content : (last.file_type==='image'?'📷 Image':(last.file_type==='audio'?'ᯤ Voice':'📎 File')))) : '';
-    io.to(roomForChat(chat.uid)).emit('msg:deleted', { msgId: id, forWhom, by: aid, chatUid: chat.uid, preview });
-  });
-
-  socket.on('msg:react', ({ msgId, emoji }) => {
-    if (!emoji || emoji.length > 500) return;
-    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
-    if (!msg) return;
-
-    const chat = DB.getChatById(msg.chat_id);
-    if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
-
-    const existing = DB.db.prepare('SELECT 1 FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').get(msgId, aid, emoji);
-
-    if (existing) {
-      DB.db.prepare('DELETE FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').run(msgId, aid, emoji);
-    } else {
-      DB.db.prepare('INSERT INTO reactions (message_id, account_id, emoji) VALUES (?,?,?)').run(msgId, aid, emoji);
+    if (!chat || !DB.isChatMember(chat, accountId)) return;
+    const forWhom = payload.forWhom === 'both' ? 'both' : 'self';
+    if (forWhom === 'both' && msg.sender_id !== accountId) {
+      socket.emit('msg:error', { chatUid: chat.uid, error: 'Only the sender can delete for everyone' });
+      return;
     }
-
-    const reactions = DB.db.prepare('SELECT account_id, emoji FROM reactions WHERE message_id=?').all(msgId);
-    io.to(roomForChat(chat.uid)).emit('msg:reaction', { msgId, reactions });
+    if (!DB.deleteMessage(id, accountId, forWhom)) return;
+    io.to(roomForChat(chat.uid)).emit('msg:deleted', { msgId: id, forWhom, by: accountId, chatUid: chat.uid });
   });
 
-  socket.on('msg:played', ({ msgId }) => {
-    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
+  socket.on('msg:react', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.msgId, 10);
+    const emoji = payload.emoji;
+    if (!Number.isInteger(id) || typeof emoji !== 'string' || !emoji.length || emoji.length > 1024) return;
+    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
     if (!msg) return;
     const chat = DB.getChatById(msg.chat_id);
-    if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
-
-    DB.db.prepare('UPDATE messages SET is_played=1 WHERE id=?').run(msgId);
-    io.to(roomForChat(chat.uid)).emit('msg:played', { msgId });
+    if (!chat || !DB.isChatMember(chat, accountId) || chat.status !== 'accepted') return;
+    const existing = DB.db.prepare('SELECT 1 FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').get(id, accountId, emoji);
+    if (existing) DB.db.prepare('DELETE FROM reactions WHERE message_id=? AND account_id=? AND emoji=?').run(id, accountId, emoji);
+    else DB.db.prepare('INSERT INTO reactions (message_id, account_id, emoji) VALUES (?,?,?)').run(id, accountId, emoji);
+    const reactions = DB.db.prepare('SELECT account_id, emoji FROM reactions WHERE message_id=?').all(id);
+    io.to(roomForChat(chat.uid)).emit('msg:reaction', { msgId: id, reactions });
   });
 
-  socket.on('chat:join', ({ chatUid }) => {
-    const chat = DB.getChatByUid(chatUid);
+  socket.on('msg:played', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.msgId, 10);
+    if (!Number.isInteger(id)) return;
+    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
+    if (!msg) return;
+    const chat = DB.getChatById(msg.chat_id);
+    if (!chat || !DB.isChatMember(chat, accountId) || chat.status !== 'accepted') return;
+    DB.db.prepare('UPDATE messages SET is_played=1 WHERE id=?').run(id);
+    io.to(roomForChat(chat.uid)).emit('msg:played', { msgId: id });
+  });
+
+  socket.on('chat:join', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
+    if (chat) socket.join(roomForChat(chat.uid));
+  });
+
+  socket.on('chat:delete', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = DB.getChatByUid(payload.chatUid);
+    if (!chat || !DB.isChatMember(chat, accountId)) return;
+    const forWhom = payload.forWhom === 'both' ? 'both' : 'self';
+    DB.deleteChat(chat.id, accountId, forWhom);
+    io.to(roomForChat(chat.uid)).emit('chat:deleted', { chatUid: chat.uid, forWhom, by: accountId });
+  });
+
+  socket.on('chat:burn', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
     if (!chat) return;
-    if (chat.initiator_id === aid || chat.peer_id === aid) socket.join(roomForChat(chatUid));
-  });
-
-  socket.on('chat:delete', ({ chatUid, forWhom }) => {
-    const chat = DB.getChatByUid(chatUid);
-    if (!isChatMember(chat, aid)) return;
-    DB.deleteChat(chat.id, aid, forWhom);
-    io.to(roomForChat(chatUid)).emit('chat:deleted', { chatUid, forWhom, by: aid });
-  });
-
-  socket.on('chat:burn', ({ chatUid, mode, customMin }) => {
-    const chat = DB.getChatByUid(chatUid);
-    if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
-    DB.setBurnMode(chat.id, mode, customMin);
-    if (mode !== 'never' && mode !== 'baf') {
-      activeTimedBurns.add(chatUid);
-    } else {
-      activeTimedBurns.delete(chatUid);
+    const mode = String(payload.mode || '');
+    if (!['never', 'baf', '1min', '5min', '10min', 'custom'].includes(mode)) return;
+    let custom = null;
+    if (mode === 'custom') {
+      custom = parseInt(payload.customMin, 10);
+      if (!Number.isInteger(custom) || custom < 5 || custom > 1440) return;
     }
-    io.to(roomForChat(chatUid)).emit('chat:burn:changed', { chatUid, mode, customMin, by: aid });
+    DB.setBurnMode(chat.id, accountId, mode, custom);
+    io.to(roomForChat(chat.uid)).emit('chat:burn:pending', { chatUid: chat.uid, mode, customMin: custom, by: accountId });
   });
 
-  socket.on('chat:history', ({ chatUid, max }) => {
-    const chat = DB.getChatByUid(chatUid);
-    if (!chat || (chat.initiator_id !== aid && chat.peer_id !== aid)) return;
-    const n = parseInt(max);
-    if (isNaN(n) || n < -1) return;
-    DB.setMaxMessages(chat.id, n);
-    const label = n === -1 ? 'Unlimited' : `${n} messages max`;
-    const sysMsg = { system: true, text: `History limit set to: ${label}` };
-    io.to(roomForChat(chatUid)).emit('chat:history:changed', { chatUid, max: n, sysMsg });
+  socket.on('chat:history', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
+    if (!chat) return;
+    const max = parseInt(payload.max, 10);
+    if (!Number.isInteger(max) || max === 0 || max < -1 || max > 100000) return;
+    DB.setMaxMessages(chat.id, accountId, max);
+    io.to(roomForChat(chat.uid)).emit('chat:history:pending', { chatUid: chat.uid, max, by: accountId });
+  });
 
+  socket.on('chat:burn:confirm', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
+    if (!chat || !DB.confirmBurn(chat.id, accountId)) return;
+    const updated = DB.getChatById(chat.id);
+    if (['1min', '5min', '10min', 'custom'].includes(updated.burn_mode)) activeTimedBurns.add(chat.uid);
+    else activeTimedBurns.delete(chat.uid);
+    io.to(roomForChat(chat.uid)).emit('chat:burn:confirmed', { chatUid: chat.uid });
+  });
+
+  socket.on('chat:history:confirm', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
+    if (!chat || !DB.confirmMaxMessages(chat.id, accountId)) return;
     const trimmed = DB.enforceMaxMessages(chat.id);
-    if (trimmed.length) {
-      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids: trimmed, preview: '' });
-    }
+    io.to(roomForChat(chat.uid)).emit('chat:history:changed', { chatUid: chat.uid, max: DB.getChatById(chat.id).max_messages });
+    if (trimmed.length) io.to(roomForChat(chat.uid)).emit('msg:burned', { chatUid: chat.uid, ids: trimmed, preview: '' });
   });
 
-  socket.on('chat:burn:confirm', ({ chatUid }) => {
-    const chat = DB.getChatByUid(chatUid);
-    if (!isChatMember(chat, aid)) return;
-    DB.confirmBurn(chat.id);
-    io.to(roomForChat(chatUid)).emit('chat:burn:confirmed', { chatUid });
+  socket.on('typing:start', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
+    if (!chat) return;
+    socket.to(roomForChat(chat.uid)).emit('typing:start', { chatUid: chat.uid, accountId });
+  });
+  socket.on('typing:stop', payload => {
+    if (!payload || typeof payload.chatUid !== 'string') return;
+    const chat = requireChatMember(payload.chatUid, accountId);
+    if (!chat) return;
+    socket.to(roomForChat(chat.uid)).emit('typing:stop', { chatUid: chat.uid, accountId });
   });
 
-  socket.on('typing:start', ({ chatUid }) => {
-    socket.to(roomForChat(chatUid)).emit('typing:start', { chatUid, accountId: aid });
-  });
-  socket.on('typing:stop', ({ chatUid }) => {
-    socket.to(roomForChat(chatUid)).emit('typing:stop', { chatUid, accountId: aid });
-  });
-
-  socket.on('key:request', ({ myPublicKey }) => {
-    if (!isValidPeerKeyPayload(myPublicKey)) return;
-
-    try {
-      const pending = DB.pendingKeyRequestsFor(aid);
-      let reusable = null;
-      for (const p of pending) {
-        if (Number(p.payload && p.payload.deviceId) === Number(socket.deviceId)) {
-          if (!reusable && p.payload && p.payload.publicKey === myPublicKey) reusable = p;
-          else {
-            const upd = DB.resolveSystemMessage(aid, p.id, 'declined');
-            if (upd) io.to(`user:${aid}`).emit('sys:updated', { id: p.id, status: 'declined' });
-          }
-        } else {
-          const upd = DB.resolveSystemMessage(aid, p.id, 'declined');
-          if (upd) io.to(`user:${aid}`).emit('sys:updated', { id: p.id, status: 'declined' });
-        }
-      }
-      if (!reusable) {
-        const dev = DB.db.prepare('SELECT device_name FROM devices WHERE id=?').get(socket.deviceId);
-        const msg = DB.addSystemMessage(aid, 'key_request', {
-          deviceId: socket.deviceId,
-          deviceName: (dev && dev.device_name) || 'New device',
-          publicKey: myPublicKey,
-        }, 'pending');
-        if (msg) io.to(`user:${aid}`).emit('sys:new', { message: msg });
-      }
-    } catch (e) { console.error('[key request]', e.message); }
-
-    for (const [sid, sock] of io.of('/').sockets) {
-      if (sock.accountId === aid && sock.id !== socket.id) {
-        sock.emit('key:request', { fromDeviceId: socket.deviceId, fromPublicKey: myPublicKey });
-      }
-    }
+  socket.on('key:request', () => {
+    const device = DB.getDeviceById(socket.deviceId);
+    if (!device || !device.public_key || !device.identity_key || !device.key_sig) return;
+    if (device.key_approved) return;
+    const message = ensureKeyRequest({ account: DB.getAccountById(accountId), device, ip: socket.handshake.address, headers: socket.handshake.headers || {} }, device.public_key, device.identity_key, device.key_sig);
+    if (message) socket.emit('sys:new', { message });
   });
 
-  socket.on('key:sync', ({ targetDeviceId, encryptedKey }) => {
-    const tid = parseInt(targetDeviceId);
-    if (!Number.isInteger(tid)) return;
-    if (tid === socket.deviceId) return;
-    if (typeof encryptedKey !== 'string' || !encryptedKey.length || encryptedKey.length > 16384) return;
-    const senderDevice = DB.db.prepare('SELECT public_key FROM devices WHERE id=?').get(socket.deviceId);
-    if (!senderDevice || !senderDevice.public_key) return;
-
-    const target = DB.db.prepare('SELECT id, account_id FROM devices WHERE id=?').get(tid);
-    if (!target || target.account_id !== aid) return;
-
-    DB.queueKeySync(target.id, senderDevice.public_key, encryptedKey);
-
+  socket.on('key:sync', payload => {
+    if (!payload) return;
+    const targetDeviceId = parseInt(payload.targetDeviceId, 10);
+    const requestId = parseInt(payload.requestId, 10);
+    if (!Number.isInteger(targetDeviceId) || !Number.isInteger(requestId)) return;
+    if (targetDeviceId === socket.deviceId) return;
+    if (typeof payload.encryptedKey !== 'string' || !payload.encryptedKey.length || payload.encryptedKey.length > 262144) return;
+    const request = DB.getSystemMessage(accountId, requestId);
+    if (!request || request.type !== 'key_request' || !['approved'].includes(request.status)) return;
+    if (Number(request.payload?.deviceId) !== targetDeviceId) return;
+    const sender = DB.getDeviceById(socket.deviceId);
+    const target = DB.getDeviceById(targetDeviceId);
+    if (!sender || !target || target.account_id !== accountId || sender.account_id !== accountId) return;
+    if (request.payload?.publicKey !== target.public_key) return;
+    if (!sender.key_approved) return;
+    DB.queueKeySync(target.id, sender.public_key, payload.encryptedKey, requestId);
     for (const [, sock] of io.of('/').sockets) {
-      if (sock.accountId === aid && sock.deviceId === target.id) {
-        sock.emit('key:sync', { fromPublicKey: senderDevice.public_key, encryptedKey });
+      if (sock.accountId === accountId && sock.deviceId === target.id) {
+        sock.emit('key:sync', { fromPublicKey: sender.public_key, encryptedKey: payload.encryptedKey });
         DB.takeKeySyncInbox(target.id);
       }
     }
   });
 
-  socket.on('key:sync:done', ({ id }) => {
-    const mid = parseInt(id);
-    if (!Number.isInteger(mid)) return;
-    const msg = DB.getSystemMessage(aid, mid);
-    if (!msg || msg.type !== 'key_request') return;
-    if (!DB.completeKeyRequest(aid, mid)) return;
-    let devName = 'device';
-    try {
-      const dev = DB.db.prepare('SELECT device_name FROM devices WHERE id=?').get(msg.payload.deviceId);
-      if (dev && dev.device_name) devName = dev.device_name;
-    } catch {}
-    const done = DB.addSystemMessage(aid, 'key_transfer_done', { deviceId: msg.payload.deviceId, deviceName: devName });
-    io.to(`user:${aid}`).emit('sys:updated', { id: mid, status: 'completed' });
-    if (done) io.to(`user:${aid}`).emit('sys:new', { message: done });
+  socket.on('key:sync:done', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.id, 10);
+    if (!Number.isInteger(id)) return;
+    const message = DB.getSystemMessage(accountId, id);
+    if (!message || message.type !== 'key_request') return;
+    if (!DB.completeKeyRequest(accountId, id)) return;
+    const done = DB.addSystemMessage(accountId, 'key_transfer_done', {
+      deviceId: message.payload.deviceId,
+      deviceName: message.payload.deviceName,
+    });
+    io.to(`user:${accountId}`).emit('sys:updated', { id, status: 'completed' });
+    if (done) io.to(`user:${accountId}`).emit('sys:new', { message: done });
   });
 });
 
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
-
   if (activeTimedBurns.size > 0) {
     const placeholders = Array.from(activeTimedBurns).map(() => '?').join(',');
     const activeChats = DB.db.prepare(`SELECT * FROM chats WHERE uid IN (${placeholders})`).all(...activeTimedBurns);
-
     for (const chat of activeChats) {
-      let minutes = { '1min':1, '5min':5, '10min':10 }[chat.burn_mode];
+      let minutes = { '1min': 1, '5min': 5, '10min': 10 }[chat.burn_mode];
       if (chat.burn_mode === 'custom' && chat.burn_custom_minutes) minutes = chat.burn_custom_minutes;
       if (!minutes) {
         activeTimedBurns.delete(chat.uid);
@@ -1398,32 +1674,55 @@ setInterval(() => {
       if (ids.length) io.to(roomForChat(chat.uid)).emit('msg:burned', { chatUid: chat.uid, ids });
     }
   }
-
   const expired = DB.collectExpiredBurns();
   if (expired.length) {
     const byChat = new Map();
-    for (const { id, chat_uid } of expired) {
-      if (!byChat.has(chat_uid)) byChat.set(chat_uid, []);
-      byChat.get(chat_uid).push(id);
+    for (const item of expired) {
+      if (!byChat.has(item.chat_uid)) byChat.set(item.chat_uid, []);
+      byChat.get(item.chat_uid).push(item.id);
     }
     for (const [chatUid, ids] of byChat) {
       const chat = DB.getChatByUid(chatUid);
-      const last = DB.db.prepare(`SELECT content,file_type,burn_seconds FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chat.id);
-      const preview = last ? (last.burn_seconds ? '[burns after read]' : (last.content ? last.content : (last.file_type==='image'?'[image]':'[file]'))) : '';
-      DB.updateChatPreview(chat.id, preview);
-      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids, preview });
+      if (!chat) continue;
+      DB.refreshChatPreview(chat.id);
+      io.to(roomForChat(chatUid)).emit('msg:burned', { chatUid, ids, preview: '' });
     }
   }
-}, 15_000);
+}, 15000);
 
-process.on('uncaughtException', (err) => {
-  console.error('[taupe] uncaught exception (server kept alive):', err);
+setInterval(() => {
+  DB.cleanupRateLimits();
+  DB.expireSystemRequests();
+  DB.purgeOrphanUploads(orphanUploadHours * 3600);
+}, 10 * 60 * 1000);
+
+setInterval(() => {
+  DB.purgeDeletedRows();
+  DB.checkpoint();
+}, 6 * 60 * 60 * 1000);
+
+setInterval(() => {
+  DB.purgeDeletedRows();
+  DB.checkpoint();
+  DB.vacuum();
+}, 24 * 60 * 60 * 1000);
+
+process.on('uncaughtException', err => {
+  console.error('[taupe] uncaught exception', err);
+  process.exit(1);
 });
-process.on('unhandledRejection', (err) => {
-  console.error('[taupe] unhandled rejection (server kept alive):', err);
+process.on('unhandledRejection', err => {
+  console.error('[taupe] unhandled rejection', err);
+  process.exit(1);
 });
 
-httpsServer.listen(PORT, BIND_HOST, () => console.log(`https://localhost:${PORT} (bound to ${BIND_HOST})`));
-httpServer.listen(HTTP_PORT, BIND_HOST, () => {
-  console.log(`http://localhost:${HTTP_PORT} (bound to ${BIND_HOST})`);
+httpsServer.listen(port, bindHost, () => {
+  console.log(`https://localhost:${port} (bound to ${bindHost})`);
+  if (bindHost === '0.0.0.0') console.warn('[taupe] binding all interfaces, prefer a reverse proxy and 127.0.0.1');
 });
+if (httpServer) {
+  httpServer.listen(httpPort, bindHost, () => {
+    console.log(`http://localhost:${httpPort} (bound to ${bindHost})`);
+    if (secureCookie) console.warn('[taupe] plain HTTP is enabled while secure cookies are on');
+  });
+}
