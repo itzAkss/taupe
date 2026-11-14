@@ -144,30 +144,40 @@ async function withButtonLoading(button, label, task) {
  $('btn-register').onclick = () => withButtonLoading($('btn-register'), 'Creating account...', async () => {
   $('auth-error').textContent = '';
   localStorage.removeItem('taupe_active_chat');
-  let pow;
-  try {
+
+  async function solveChallenge() {
     const challenge = await api('GET', '/api/register/challenge');
-    if (challenge.error) { $('auth-error').textContent = challenge.error; return; }
+    if (challenge.error) throw new Error(challenge.error);
     const prefix = '0'.repeat(challenge.difficulty);
     let nonce = 0;
     while (true) {
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(challenge.challenge + nonce));
       const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
-      if (hex.startsWith(prefix)) { pow = { challenge: challenge.challenge, nonce }; break; }
+      if (hex.startsWith(prefix)) return { challenge: challenge.challenge, nonce };
       nonce++;
       if (nonce % 4096 === 0) await new Promise(resolve => setTimeout(resolve, 0));
     }
-  } catch (e) {
-    $('auth-error').textContent = 'Registration proof failed';
+  }
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let pow;
+    try {
+      pow = await solveChallenge();
+    } catch (e) {
+      $('auth-error').textContent = e.message || 'Registration proof failed';
+      return;
+    }
+    const d = await api('POST', '/api/register', pow);
+    if (!d.error) {
+      pendingAccountData = d;
+      $('save-number-text').textContent = fmtPrivate(d.accountNumber);
+      show($('modal-save-number'));
+      return;
+    }
+    if (attempt === 0 && /proof invalid or expired/i.test(d.error)) continue;
+    $('auth-error').textContent = d.error;
     return;
   }
-  const d = await api('POST', '/api/register', pow);
-  if (d.error) { $('auth-error').textContent = d.error; return; }
-
-
-  pendingAccountData = d;
-  $('save-number-text').textContent = fmtPrivate(d.accountNumber);
-  show($('modal-save-number'));
 });
 
  $('btn-login').onclick = () => withButtonLoading($('btn-login'), 'Signing in...', async () => {
