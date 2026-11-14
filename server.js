@@ -806,7 +806,7 @@ app.post('/api/me/avatar', authMiddleware, uploadLimiter, avatarUpload.single('a
   }
   try {
     const output = input.replace(/\.webp$/, '_out.webp');
-    await sharp(input).resize(128, 128, { fit: 'cover' }).webp({ quality: 85 }).toFile(output);
+    await sharp(input).resize(512, 512, { fit: 'cover' }).webp({ quality: 90 }).toFile(output);
     try { fs.unlinkSync(input); } catch (e) {}
     const rel = '/uploads/avatars/' + path.basename(output);
     const avatars = DB.setAvatar(req.account.id, rel);
