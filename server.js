@@ -176,17 +176,31 @@ const chatLimiter = limitByIp('chat', 20, 60);
 const uploadLimiter = limitByIp('upload', 60, 60);
 
 const powChallenges = new Map();
+const powChallengeTtl = 30 * 60 * 1000;
 function issueChallenge() {
   const challenge = crypto.randomBytes(16).toString('hex');
-  powChallenges.set(challenge, Date.now() + 10 * 60 * 1000);
+  powChallenges.set(challenge, Date.now() + powChallengeTtl);
   return challenge;
 }
 function verifyChallenge(challenge, nonce) {
-  const expires = powChallenges.get(String(challenge));
-  if (!expires || expires < Date.now()) return false;
-  powChallenges.delete(String(challenge));
-  const hash = crypto.createHash('sha256').update(String(challenge) + String(nonce)).digest('hex');
-  return hash.startsWith('0'.repeat(powDifficulty));
+  const key = String(challenge);
+  const expires = powChallenges.get(key);
+  if (!expires) {
+    console.warn('[pow] unknown challenge, server may have restarted');
+    return false;
+  }
+  if (expires < Date.now()) {
+    powChallenges.delete(key);
+    console.warn('[pow] challenge expired');
+    return false;
+  }
+  const hash = crypto.createHash('sha256').update(key + String(nonce)).digest('hex');
+  if (!hash.startsWith('0'.repeat(powDifficulty))) {
+    console.warn('[pow] invalid nonce');
+    return false;
+  }
+  powChallenges.delete(key);
+  return true;
 }
 setInterval(() => {
   const now = Date.now();
@@ -453,6 +467,7 @@ function accountPublic(account) {
     username: account.username,
     usernamePublic: account.username_public,
     avatarPath: account.avatar_path,
+    bio: account.bio || null,
     showPresence: account.show_presence === 1,
     gifEnabled: account.gif_enabled === 1,
     identityKey: account.identity_key || null,
@@ -586,6 +601,7 @@ app.get('/api/me', authMiddleware, (req, res) => {
     deviceApproved: req.device.key_approved === 1,
     devices,
     aliases: DB.getAliases(req.account.id),
+    avatars: DB.getAccountAvatars(req.account.id),
   });
 });
 
@@ -755,6 +771,19 @@ app.patch('/api/me/username', authMiddleware, (req, res) => {
   res.json({ ok: true, username: username || null });
 });
 
+app.patch('/api/me/bio', authMiddleware, (req, res) => {
+  const bio = String(req.body?.bio || '').trim().slice(0, 120);
+  DB.setBio(req.account.id, bio || null);
+  for (const chat of DB.getChatsForAccount(req.account.id)) {
+    io.to(roomForChat(chat.uid)).emit('peer:profile_update', {
+      chatUid: chat.uid,
+      accountId: req.account.id,
+      bio: bio || null,
+    });
+  }
+  res.json({ ok: true, bio: bio || null });
+});
+
 app.patch('/api/me/presence', authMiddleware, (req, res) => {
   const show = req.body?.show === true;
   DB.db.prepare('UPDATE accounts SET show_presence=? WHERE id=?').run(show ? 1 : 0, req.account.id);
@@ -780,9 +809,7 @@ app.post('/api/me/avatar', authMiddleware, uploadLimiter, avatarUpload.single('a
     await sharp(input).resize(128, 128, { fit: 'cover' }).webp({ quality: 85 }).toFile(output);
     try { fs.unlinkSync(input); } catch (e) {}
     const rel = '/uploads/avatars/' + path.basename(output);
-    const old = req.account.avatar_path;
-    DB.setAvatar(req.account.id, rel);
-    if (old) DB.unlinkUploadIfUnreferenced(old, -1);
+    const avatars = DB.setAvatar(req.account.id, rel);
     const chats = DB.getChatsForAccount(req.account.id);
     for (const chat of chats) {
       io.to(roomForChat(chat.uid)).emit('peer:profile_update', {
@@ -793,12 +820,27 @@ app.post('/api/me/avatar', authMiddleware, uploadLimiter, avatarUpload.single('a
         avatarPath: rel,
       });
     }
-    res.json({ avatarPath: rel });
+    res.json({ avatarPath: rel, avatars });
   } catch (e) {
     try { fs.unlinkSync(input); } catch (e2) {}
     console.error('[avatar]', e.message);
     res.status(500).json({ error: 'Image processing failed' });
   }
+});
+
+app.delete('/api/me/avatars/:id', authMiddleware, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid avatar' });
+  const result = DB.deleteAccountAvatar(req.account.id, id);
+  if (!result) return res.status(404).json({ error: 'Avatar not found' });
+  for (const chat of DB.getChatsForAccount(req.account.id)) {
+    io.to(roomForChat(chat.uid)).emit('peer:profile_update', {
+      chatUid: chat.uid,
+      accountId: req.account.id,
+      avatarPath: result.avatarPath,
+    });
+  }
+  res.json(result);
 });
 
 app.get('/api/system/messages', authMiddleware, (req, res) => {

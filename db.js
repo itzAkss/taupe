@@ -49,12 +49,22 @@ db.exec(`
     username TEXT UNIQUE,
     username_public INTEGER NOT NULL DEFAULT 0,
     avatar_path TEXT,
+    bio TEXT,
     identity_key TEXT,
     gif_enabled INTEGER NOT NULL DEFAULT 0,
     last_seen INTEGER,
     show_presence INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
+
+  CREATE TABLE IF NOT EXISTS account_avatars (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_account_avatars_account ON account_avatars(account_id, id);
 
   CREATE TABLE IF NOT EXISTS devices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,6 +238,7 @@ addColumn('messages', 'burn_at', 'INTEGER');
 addColumn('messages', 'reply_to_id', 'INTEGER');
 addColumn('messages', 'is_played', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('key_sync_inbox', 'request_id', 'INTEGER');
+addColumn('accounts', 'bio', 'TEXT');
 
 try {
   const rateCols = tableColumns('rate_limits');
@@ -245,6 +256,15 @@ try {
   }
 } catch (e) {
   console.error('[migration] accounts public_key drop failed:', e.message);
+}
+
+try {
+  db.prepare(`INSERT INTO account_avatars (account_id, path)
+    SELECT a.id, a.avatar_path FROM accounts a
+    WHERE a.avatar_path IS NOT NULL AND a.avatar_path != ''
+      AND NOT EXISTS (SELECT 1 FROM account_avatars aa WHERE aa.account_id = a.id)`).run();
+} catch (e) {
+  console.error('[migration] avatar history backfill failed:', e.message);
 }
 
 function sha256Hex(value) {
@@ -381,7 +401,38 @@ function setUsername(accountId, username, isPublic) {
   db.prepare('UPDATE accounts SET username=?,username_public=? WHERE id=?').run(username || null, isPublic ? 1 : 0, accountId);
 }
 function setAvatar(accountId, filePath) {
+  if (!filePath) {
+    db.prepare('UPDATE accounts SET avatar_path=NULL WHERE id=?').run(accountId);
+    return [];
+  }
+  db.prepare('INSERT INTO account_avatars (account_id,path) VALUES (?,?)').run(accountId, filePath);
   db.prepare('UPDATE accounts SET avatar_path=? WHERE id=?').run(filePath, accountId);
+  const extra = db.prepare(`SELECT id,path FROM account_avatars WHERE account_id=? ORDER BY id DESC LIMIT -1 OFFSET 30`).all(accountId);
+  for (const row of extra) {
+    db.prepare('DELETE FROM account_avatars WHERE id=?').run(row.id);
+    safeUnlinkUpload(row.path);
+  }
+  return getAccountAvatars(accountId);
+}
+function getAccountAvatars(accountId) {
+  return db.prepare('SELECT id,path,created_at FROM account_avatars WHERE account_id=? ORDER BY id ASC').all(accountId);
+}
+function deleteAccountAvatar(accountId, avatarId) {
+  const row = db.prepare('SELECT id,path FROM account_avatars WHERE id=? AND account_id=?').get(avatarId, accountId);
+  if (!row) return null;
+  db.prepare('DELETE FROM account_avatars WHERE id=?').run(row.id);
+  const acct = getAccountById(accountId);
+  let current = acct?.avatar_path || null;
+  if (current === row.path) {
+    const next = db.prepare('SELECT path FROM account_avatars WHERE account_id=? ORDER BY id DESC LIMIT 1').get(accountId);
+    current = next?.path || null;
+    db.prepare('UPDATE accounts SET avatar_path=? WHERE id=?').run(current, accountId);
+  }
+  safeUnlinkUpload(row.path);
+  return { avatarPath: current, avatars: getAccountAvatars(accountId) };
+}
+function setBio(accountId, bio) {
+  db.prepare('UPDATE accounts SET bio=? WHERE id=?').run(bio || null, accountId);
 }
 function setAccountIdentity(accountId, identityKey) {
   const acct = getAccountById(accountId);
@@ -428,8 +479,10 @@ function unlinkUploadIfUnreferenced(relPath, exceptMessageId) {
 function deleteAccount(accountId) {
   const acct = db.prepare('SELECT avatar_path FROM accounts WHERE id=?').get(accountId);
   const uploads = db.prepare('SELECT path FROM uploads WHERE account_id=?').all(accountId);
+  const avatars = db.prepare('SELECT path FROM account_avatars WHERE account_id=?').all(accountId);
   const files = [];
   if (acct?.avatar_path) files.push(acct.avatar_path);
+  for (const a of avatars) if (!files.includes(a.path)) files.push(a.path);
   for (const u of uploads) files.push(u.path);
   db.prepare('DELETE FROM accounts WHERE id=?').run(accountId);
   for (const filePath of files) {
@@ -904,7 +957,7 @@ function vacuum() {
 module.exports = {
   db,
   createAccount, getAccountByNumber, getAccountByChatNumber, getAccountByUsername, getAccountById,
-  setUsername, setAvatar, deleteAccount, setAccountIdentity, getAccountIdentity, setGifEnabled,
+  setUsername, setAvatar, getAccountAvatars, deleteAccountAvatar, setBio, deleteAccount, setAccountIdentity, getAccountIdentity, setGifEnabled,
   setAlias, getAlias, getAliases, deleteAlias,
   isBlocked, blockAccount, unblockAccount, getBlocks,
   addDevice, countDevices, getDeviceByToken, getDeviceById, getDevices, getApprovedDevices,
