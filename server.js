@@ -1578,6 +1578,26 @@ io.on('connection', socket => {
     io.to(roomForChat(chat.uid)).emit('msg:pinned', { chatUid: chat.uid, message: msg });
   });
 
+  socket.on('msg:edit', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.msgId, 10);
+    if (!Number.isInteger(id)) return;
+    const content = payload.content;
+    if (typeof content !== 'string' || !content.startsWith('e2e:') || !validateChatContent(content)) return;
+    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
+    if (!msg) return;
+    const chat = DB.getChatById(msg.chat_id);
+    if (!chat || !DB.isChatMember(chat, accountId) || chat.status !== 'accepted') return;
+    if (msg.sender_id !== accountId) return;
+    const updated = DB.editMessage(id, content);
+    io.to(roomForChat(chat.uid)).emit('msg:edited', {
+      chatUid: chat.uid,
+      msgId: id,
+      content,
+      editedAt: updated?.edited_at || null,
+    });
+  });
+
   socket.on('msg:react', payload => {
     if (!payload) return;
     const id = parseInt(payload.msgId, 10);

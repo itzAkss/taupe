@@ -141,6 +141,7 @@ db.exec(`
     burn_at INTEGER,
     reply_to_id INTEGER,
     is_played INTEGER NOT NULL DEFAULT 0,
+    edited_at INTEGER,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
@@ -241,6 +242,7 @@ addColumn('messages', 'is_played', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('key_sync_inbox', 'request_id', 'INTEGER');
 addColumn('accounts', 'bio', 'TEXT');
 addColumn('chats', 'pinned_message_id', 'INTEGER');
+addColumn('messages', 'edited_at', 'INTEGER');
 
 try {
   const rateCols = tableColumns('rate_limits');
@@ -783,6 +785,10 @@ function applyBurnBaf(chatId) {
   refreshChatPreview(chatId);
   return ids;
 }
+function editMessage(msgId, content) {
+  db.prepare('UPDATE messages SET content=?, edited_at=unixepoch() WHERE id=?').run(content, msgId);
+  return db.prepare('SELECT * FROM messages WHERE id=?').get(msgId);
+}
 function setBurnAt(msgId, burnAt) {
   db.prepare('UPDATE messages SET burn_at=? WHERE id=?').run(burnAt, msgId);
 }
@@ -976,7 +982,7 @@ module.exports = {
   setPushEndpoint, getPushableDevices,
   getChatsForAccount, getChatByUid, getChatById, getChatUidBetween, createChat, acceptChat, isChatMember,
   setBurnMode, confirmBurn, setChatLabel, deleteChat, hardDeleteChat, updateChatPreview,
-  getMessages, addMessage, markRead, deleteMessage, refreshChatPreview,
+  getMessages, addMessage, markRead, deleteMessage, editMessage, refreshChatPreview,
   setPinnedMessage, getPinnedMessage,
   applyBurnBaf, applyBurnTimed, setBurnAt, collectExpiredBurns, hardDeleteMessage,
   setMaxMessages, confirmMaxMessages, enforceMaxMessages,
