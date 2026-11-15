@@ -1092,6 +1092,13 @@ app.get('/api/chats/:uid/messages', authMiddleware, (req, res) => {
   res.json(DB.getMessages(chat.id, req.account.id, { beforeId }));
 });
 
+app.get('/api/chats/:uid/pinned', authMiddleware, (req, res) => {
+  const chat = DB.getChatByUid(req.params.uid);
+  if (!chat || !DB.isChatMember(chat, req.account.id)) return res.status(404).json({ error: 'Not found' });
+  if (chat.status !== 'accepted') return res.status(403).json({ error: 'Chat request is not accepted' });
+  res.json({ message: DB.getPinnedMessage(chat.id) });
+});
+
 app.get('/api/messages/:id', authMiddleware, (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -1552,6 +1559,23 @@ io.on('connection', socket => {
     }
     if (!DB.deleteMessage(id, accountId, forWhom)) return;
     io.to(roomForChat(chat.uid)).emit('msg:deleted', { msgId: id, forWhom, by: accountId, chatUid: chat.uid });
+  });
+
+  socket.on('msg:pin', payload => {
+    if (!payload) return;
+    const id = parseInt(payload.msgId, 10);
+    if (!Number.isInteger(id)) return;
+    const msg = DB.db.prepare('SELECT * FROM messages WHERE id=?').get(id);
+    if (!msg) return;
+    const chat = DB.getChatById(msg.chat_id);
+    if (!chat || !DB.isChatMember(chat, accountId) || chat.status !== 'accepted') return;
+    if (payload.pin === false) {
+      DB.setPinnedMessage(chat.id, null);
+      io.to(roomForChat(chat.uid)).emit('msg:pinned', { chatUid: chat.uid, message: null });
+      return;
+    }
+    DB.setPinnedMessage(chat.id, id);
+    io.to(roomForChat(chat.uid)).emit('msg:pinned', { chatUid: chat.uid, message: msg });
   });
 
   socket.on('msg:react', payload => {

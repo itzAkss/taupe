@@ -119,6 +119,7 @@ db.exec(`
     pending_burn_by INTEGER,
     pending_max_messages INTEGER,
     pending_max_by INTEGER,
+    pinned_message_id INTEGER,
     deleted_by_initiator INTEGER NOT NULL DEFAULT 0,
     deleted_by_peer INTEGER NOT NULL DEFAULT 0,
     last_message_preview TEXT,
@@ -239,6 +240,7 @@ addColumn('messages', 'reply_to_id', 'INTEGER');
 addColumn('messages', 'is_played', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('key_sync_inbox', 'request_id', 'INTEGER');
 addColumn('accounts', 'bio', 'TEXT');
+addColumn('chats', 'pinned_message_id', 'INTEGER');
 
 try {
   const rateCols = tableColumns('rate_limits');
@@ -749,6 +751,14 @@ function deleteMessage(msgId, accountId, forWhom) {
   refreshChatPreview(m.chat_id);
   return true;
 }
+function setPinnedMessage(chatId, msgId) {
+  db.prepare('UPDATE chats SET pinned_message_id=? WHERE id=?').run(msgId || null, chatId);
+}
+function getPinnedMessage(chatId) {
+  const chat = getChatById(chatId);
+  if (!chat?.pinned_message_id) return null;
+  return db.prepare('SELECT * FROM messages WHERE id=?').get(chat.pinned_message_id) || null;
+}
 function refreshChatPreview(chatId) {
   const last = db.prepare(`SELECT content,file_type,burn_seconds FROM messages WHERE chat_id=? AND deleted_for!='both' ORDER BY id DESC LIMIT 1`).get(chatId);
   const preview = last ? (last.burn_seconds ? '[burns after read]' : (last.content ? '[encrypted]' : (last.file_type === 'image' ? '[image]' : '[file]'))) : '';
@@ -757,6 +767,7 @@ function refreshChatPreview(chatId) {
 function hardDeleteMessage(msgId) {
   const msg = db.prepare('SELECT file_path FROM messages WHERE id=?').get(msgId);
   if (!msg) return;
+  db.prepare('UPDATE chats SET pinned_message_id=NULL WHERE pinned_message_id=?').run(msgId);
   db.prepare('DELETE FROM messages WHERE id=?').run(msgId);
   if (msg.file_path) {
     unlinkUploadIfUnreferenced(msg.file_path, msgId);
@@ -966,6 +977,7 @@ module.exports = {
   getChatsForAccount, getChatByUid, getChatById, getChatUidBetween, createChat, acceptChat, isChatMember,
   setBurnMode, confirmBurn, setChatLabel, deleteChat, hardDeleteChat, updateChatPreview,
   getMessages, addMessage, markRead, deleteMessage, refreshChatPreview,
+  setPinnedMessage, getPinnedMessage,
   applyBurnBaf, applyBurnTimed, setBurnAt, collectExpiredBurns, hardDeleteMessage,
   setMaxMessages, confirmMaxMessages, enforceMaxMessages,
   getRateLimit, recordFailure, isRateLimited, cleanupRateLimits,

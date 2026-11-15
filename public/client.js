@@ -2049,8 +2049,8 @@ function showMsgCtx(e, msgId, isMe) {
   menu.appendChild(reactBar);
 
   const items = isMe
-    ? [['Reply', 'reply', false], ['Delete for me', 'self', false], ['Delete for both', 'both', true]]
-    : [['Reply', 'reply', false], ['Delete for me', 'self', false]];
+    ? [['Reply', 'reply', false], ['Pin', 'pin', false], ['Delete for me', 'self', false], ['Delete for both', 'both', true]]
+    : [['Reply', 'reply', false], ['Pin', 'pin', false], ['Delete for me', 'self', false]];
 
   items.forEach(([lbl, action, danger]) => {
     const d = document.createElement('div');
@@ -2058,6 +2058,7 @@ function showMsgCtx(e, msgId, isMe) {
     d.textContent = lbl;
     d.onclick = () => {
       if (action === 'reply') setReplyTo(msgId);
+      else if (action === 'pin') state.socket.emit('msg:pin', { msgId, pin: true });
       else state.socket.emit('msg:delete', { msgId, forWhom: action });
       removeCtx();
     };
