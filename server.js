@@ -729,11 +729,13 @@ function ensureKeyRequest(req, publicKey, identityPub, keySig) {
 
 app.get('/api/pubkey/:chatNumber', authMiddleware, (req, res) => {
   const peer = DB.getAccountByChatNumber(req.params.chatNumber);
-  if (!peer || peer.id === req.account.id) return res.status(404).json({ error: 'Not available' });
-  if (DB.isBlocked(peer.id, req.account.id) || DB.isBlocked(req.account.id, peer.id)) {
-    return res.status(404).json({ error: 'Not available' });
+  if (!peer) return res.status(404).json({ error: 'Not available' });
+  if (peer.id !== req.account.id) {
+    if (DB.isBlocked(peer.id, req.account.id) || DB.isBlocked(req.account.id, peer.id)) {
+      return res.status(404).json({ error: 'Not available' });
+    }
+    if (!DB.getChatUidBetween(req.account.id, peer.id)) return res.status(404).json({ error: 'Not available' });
   }
-  if (!DB.getChatUidBetween(req.account.id, peer.id)) return res.status(404).json({ error: 'Not available' });
   const devices = DB.getApprovedDevices(peer.id);
   res.json({
     identityKey: peer.identity_key || null,
